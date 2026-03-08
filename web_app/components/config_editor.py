@@ -9,8 +9,13 @@ import pandas as pd
 import numpy as np
 from typing import Optional, Dict
 from pathlib import Path
+import sys
 
-from utils.file_handler import (
+# 添加项目根目录到路径
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+from web_app.utils.file_handler import (
     save_config_to_excel,
     read_file_from_path,
     create_default_config,

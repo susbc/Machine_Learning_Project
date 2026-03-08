@@ -26,6 +26,11 @@
 ```
 Machine_Learning_Project/
 ├── README.md                    # 项目说明
+├── requirements.txt             # Python 依赖
+├── Dockerfile                   # Docker 镜像构建
+├── docker-compose.yml           # Docker Compose 配置
+├── .dockerignore                # Docker 忽略文件
+├── logging_config.py            # 日志配置模块
 ├── input_data/                  # 输入数据目录
 │   ├── train_data.csv          # 训练数据 (pipe 分隔)
 │   └── field_config.xlsx       # 字段配置表
@@ -43,6 +48,21 @@ Machine_Learning_Project/
 │   └── saved/                  # 模型保存目录
 │       ├── best_lgbm_model.joblib
 │       └── train_summary.joblib
+├── web_app/                     # Web 应用
+│   ├── app.py                  # 主应用入口
+│   ├── pages/                  # 多页面应用
+│   ├── components/             # 可复用组件
+│   └── utils/                  # 工具函数
+├── tests/                       # 测试套件 🧪
+│   ├── conftest.py             # Pytest 配置
+│   ├── test_utils.py           # 预处理测试
+│   ├── test_train.py           # 训练测试
+│   ├── test_predict.py         # 预测测试
+│   └── test_web/               # Web 组件测试
+├── .github/workflows/           # CI/CD 配置 🚀
+│   ├── tests.yml               # 测试工作流
+│   ├── lint.yml                # 代码检查
+│   └── docker.yml              # Docker 构建
 └── logs/                        # 日志目录
 ```
 
@@ -261,12 +281,58 @@ X_test = preprocessor.transform(X_test)   # 使用训练集统计量
 
 ## 🧪 测试
 
+### 运行测试
+
 ```bash
-# 运行测试
+# 安装测试依赖
+pip install pytest pytest-cov
+
+# 运行所有测试
 pytest tests/
 
-# 运行数据探索
-python model_code/data_explore.py
+# 运行测试并生成覆盖率报告
+pytest tests/ --cov=model_code --cov=web_app --cov-report=html
+
+# 运行特定测试文件
+pytest tests/test_utils.py -v
+
+# 运行特定测试类
+pytest tests/test_utils.py::TestSmartSampling -v
+```
+
+### 测试覆盖率
+
+项目要求测试覆盖率 > 80%。查看覆盖率报告：
+
+```bash
+# 终端报告
+pytest tests/ --cov=model_code --cov=web_app --cov-report=term-missing
+
+# HTML 报告 (在浏览器中查看)
+pytest tests/ --cov=model_code --cov=web_app --cov-report=html
+open htmlcov/index.html
+```
+
+### 测试结构
+
+```
+tests/
+├── conftest.py              # Pytest 配置和 fixtures
+├── test_utils.py            # 预处理函数测试
+│   ├── TestSmartSampling
+│   ├── TestHandleOutliers
+│   ├── TestHandleMissingValues
+│   └── TestConfigDrivenPreprocessor
+├── test_train.py            # 训练函数测试
+│   ├── TestLGBMTrainWithRandomSearch
+│   └── TestFindOptimalThreshold
+├── test_predict.py          # 预测函数测试
+│   └── TestLoadAndPredict
+└── test_web/
+    └── test_components.py   # Web 组件测试
+        ├── TestDistributionChart
+        ├── TestROCCurve
+        └── TestFileHandler
 ```
 
 ---
@@ -285,6 +351,173 @@ scipy>=1.7.0
 
 ---
 
+## 🐳 Docker 部署
+
+### 构建镜像
+
+```bash
+# 构建 Docker 镜像
+docker build -t ml-project:latest .
+
+# 多平台构建 (支持 M1/M2 和 Intel)
+docker buildx build --platform linux/amd64,linux/arm64 -t ml-project:latest .
+```
+
+### 运行容器
+
+```bash
+# 基本运行
+docker run -p 8501:8501 ml-project:latest
+
+# 挂载数据目录 (持久化)
+docker run -p 8501:8501 \
+  -v $(pwd)/input_data:/app/input_data \
+  -v $(pwd)/output:/app/output \
+  -v $(pwd)/model_code/saved:/app/model_code/saved \
+  -v $(pwd)/logs:/app/logs \
+  ml-project:latest
+
+# 开发模式 (挂载代码)
+docker run -p 8501:8501 \
+  -v $(pwd)/web_app:/app/web_app:ro \
+  -v $(pwd)/model_code:/app/model_code:ro \
+  ml-project:latest
+```
+
+### Docker Compose
+
+```bash
+# 启动所有服务
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f
+
+# 运行训练任务
+docker-compose --profile training up trainer
+
+# 停止服务
+docker-compose down
+```
+
+### 健康检查
+
+```bash
+# 检查容器健康状态
+docker inspect --format='{{.State.Health.Status}}' ml-project-web
+
+# 访问健康检查端点
+curl http://localhost:8501/_stcore/health
+```
+
+---
+
+## 🚀 CI/CD
+
+### GitHub Actions
+
+项目配置了自动化的 CI/CD 流程：
+
+#### 1. 测试工作流 (`.github/workflows/tests.yml`)
+
+- **触发条件**: push 到 main/develop 分支，PR，手动触发
+- **Python 版本**: 3.9, 3.10, 3.11, 3.12
+- **功能**:
+  - 运行单元测试
+  - 生成覆盖率报告
+  - 上传到 Codecov
+  - 覆盖率阈值检查 (80%)
+
+#### 2. 代码检查工作流 (`.github/workflows/lint.yml`)
+
+- **工具**: Black, isort, Flake8, Pylint, mypy
+- **功能**:
+  - 代码格式化检查
+  - 导入顺序检查
+  - 静态代码分析
+  - 类型检查
+  - 依赖安全扫描
+
+#### 3. Docker 工作流 (`.github/workflows/docker.yml`)
+
+- **触发条件**: push 到 main/develop，tag，PR
+- **功能**:
+  - 构建多平台镜像
+  - 推送到 Docker Hub
+  - 推送到 GitHub Container Registry
+  - 安全漏洞扫描 (Trivy)
+
+### 配置 Secrets
+
+在 GitHub 仓库设置中添加以下 Secrets：
+
+```
+DOCKERHUB_USERNAME    # Docker Hub 用户名
+DOCKERHUB_TOKEN       # Docker Hub 访问令牌
+GITHUB_TOKEN          # 自动提供，用于 GHCR
+```
+
+### 手动触发
+
+```bash
+# 使用 GitHub CLI 触发工作流
+gh workflow run tests.yml
+gh workflow run lint.yml
+gh workflow run docker.yml
+```
+
+---
+
+## 📝 日志系统
+
+### 配置
+
+```python
+from logging_config import get_logger, log_training_progress
+
+logger = get_logger(__name__)
+
+# 记录训练进度
+log_training_progress(
+    logger,
+    stage='train',
+    progress=50.0,
+    message='训练进行中',
+    metrics={'auc': 0.85, 'f1': 0.82}
+)
+
+# 记录错误
+try:
+    # ... 代码 ...
+except Exception as e:
+    log_error_with_context(logger, e, context={'stage': 'predict'})
+```
+
+### 环境变量
+
+```bash
+# 日志级别
+export LOG_LEVEL=INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# 日志格式
+export LOG_FORMAT=json  # json, text
+
+# 日志目录
+export LOG_DIR=/path/to/logs
+```
+
+### 日志文件
+
+```
+logs/
+├── app.log              # 主日志 (轮转，10MB)
+├── app_daily.log        # 每日日志 (轮转，每天)
+├── error.log            # 错误日志专用
+└── training_progress.log # 训练进度日志
+```
+
+---
+
 ## 📄 License
 
 MIT License
@@ -297,8 +530,8 @@ MIT License
 
 ---
 
-*最后更新：2026-03-08*
-*优化版本：v2.0*
+*最后更新：2026-03-09*
+*优化版本：v3.0 - 添加测试、Docker、CI/CD 和日志系统*
 
 ---
 

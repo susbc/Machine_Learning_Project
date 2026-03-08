@@ -65,6 +65,13 @@ with st.sidebar:
     
     st.markdown("---")
     
+    # 高级功能
+    st.page_link("pages/8_数据源管理.py", label="🗄️ 数据源管理", icon="🗄️")
+    st.page_link("pages/9_模型对比.py", label="⚖️ 模型对比", icon="⚖️")
+    st.page_link("pages/10_自动迭代.py", label="🔄 自动迭代", icon="🔄")
+    
+    st.markdown("---")
+    
     # 状态信息
     st.subheader("📌 状态")
     

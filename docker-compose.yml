@@ -1,0 +1,91 @@
+# =============================================================================
+# Machine Learning Project - Docker Compose 配置
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # Web 应用服务
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ml-project-web
+    ports:
+      - "8501:8501"
+    volumes:
+      # 挂载数据目录 (持久化)
+      - ./input_data:/app/input_data
+      - ./output:/app/output
+      - ./model_code/saved:/app/model_code/saved
+      - ./logs:/app/logs
+      # 挂载代码目录 (开发模式)
+      - ./web_app:/app/web_app:ro
+      - ./model_code:/app/model_code:ro
+    environment:
+      # Streamlit 配置
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_HEADLESS=true
+      # 应用配置
+      - ML_DATA_PATH=/app/input_data
+      - ML_CONFIG_PATH=/app/input_data/field_config.xlsx
+      - ML_OUTPUT_DIR=/app/output
+      - ML_MODEL_DIR=/app/model_code/saved
+      # 日志配置
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+    restart: unless-stopped
+    networks:
+      - ml-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # 训练服务 (可选，用于后台训练任务)
+  # ---------------------------------------------------------------------------
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ml-project-trainer
+    volumes:
+      # 挂载数据目录
+      - ./input_data:/app/input_data
+      - ./output:/app/output
+      - ./model_code/saved:/app/model_code/saved
+      - ./logs:/app/logs
+      - ./model_code:/app/model_code:ro
+    environment:
+      - ML_DATA_PATH=/app/input_data
+      - ML_CONFIG_PATH=/app/input_data/field_config.xlsx
+      - ML_OUTPUT_DIR=/app/output
+      - ML_MODEL_DIR=/app/model_code/saved
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+    command: >
+      python -c "
+      from model_code.main_model import BuildingModel;
+      model = BuildingModel(data_month='202401');
+      model.run_pipeline()
+      "
+    networks:
+      - ml-network
+    profiles:
+      - training
+
+networks:
+  ml-network:
+    driver: bridge
+
+volumes:
+  input_data:
+  output:
+  models:
+  logs:

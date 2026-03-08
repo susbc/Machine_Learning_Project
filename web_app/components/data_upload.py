@@ -11,7 +11,14 @@ import plotly.graph_objects as go
 from typing import Optional
 from pathlib import Path
 
-from utils.file_handler import (
+import sys
+from pathlib import Path
+
+# 添加项目根目录到路径
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+from web_app.utils.file_handler import (
     read_uploaded_file,
     read_file_from_path,
     calculate_data_statistics,
