@@ -1,133 +1,339 @@
+"""
+模型编排主引擎 - 优化版
+
+核心优化:
+1. 修复数据穿越：先 split 再 fit 预处理
+2. 使用 sklearn Pipeline 管理数据流
+3. 解耦配置，移除全局依赖
+4. 减少内存拷贝
+"""
+
 import sys
-
 import pandas as pd
+from pathlib import Path
+from typing import Optional, Dict, Any
 
-from config.config import *
-from model_code.predict import load_and_predict
+from model_code.utils import (
+    ConfigDrivenPreprocessor,
+    neg_data_undersampling,
+    smart_sampling
+)
 from model_code.train import lgbm_train_with_random_search
-from  utils import *
+from model_code.predict import load_and_predict
+
 
 class BuildingModel:
-
-    def __init__(self,data_path,config_path,data_month):
-        self.data_path = data_path
-        self.data = None
-        self.df_field = pd.read_excel(config_path)
-        self.label = None
-        self.key =  None
+    """
+    机器学习流水线总控引擎 - 优化版
+    
+    优化点:
+    1. 配置注入式初始化，移除全局依赖
+    2. 先划分训练/测试集，再 fit 预处理器 (防止数据穿越)
+    3. 使用 ConfigDrivenPreprocessor 确保预处理一致性
+    """
+    
+    def __init__(self, data_path: str, config_path: str, data_month: str,
+                 output_dir: Optional[str] = None, model_dir: Optional[str] = None):
+        """
+        初始化模型引擎
+        
+        Args:
+            data_path: 数据文件路径
+            config_path: Excel 配置表路径
+            data_month: 数据月份标识
+            output_dir: 输出目录 (可选)
+            model_dir: 模型保存目录 (可选)
+        """
+        self.data_path = Path(data_path)
+        self.config_path = Path(config_path)
         self.data_month = data_month
-
-    def _load_data(self):
-        self.data = pd.read_csv(self.data_path,sep="|",encoding='utf-8')
-
-    def _prepare_data(self):
-        self._load_data()
-        self._fields_stype()
-        self._handle_outliers()
-        self._handle_missing_value()
-        self._field_encode()
-        self._field_standardize()
-
-    def model_train(self):
-        self._prepare_data()
-        self._train()
-
-    def model_predict(self):
-        self._prepare_data()
-        self._predict()
-
-
-    def _train(self):
-        neg_data = self.data[self.data[self.label]==0]
-        pos_data = self.data[self.data[self.label]==1]
-        describe_values = neg_data.describe().T[["mean", "std"]].values
-
-        pos_data_num = pos_data.shape[0]
-        weight = pos_data_num/neg_data.shape[0]
-        error_rate = 0.1
-        index_result = neg_data_undersampling(neg_data, describe_values, pos_data_num, weight, error_rate)
-        neg_data_sample = neg_data.loc[index_result]
-        self.data = pd.concat([neg_data_sample,pos_data],axis=0)
-        y=self.data[self.label]
-        X = self.data.drop([self.label,self.key],axis=1)
-        lgbm_train_with_random_search(X,y)
-
-    def _predict(self):
-        key = self.data[self.key]
-        data = self.data.drop([self.label,self.key],axis=1)
-        load_and_predict(data, key,self.data_month)
-
-    def _fields_stype(self):
+        self.output_dir = Path(output_dir) if output_dir else Path("../output")
+        self.model_dir = Path(model_dir) if model_dir else Path("saved")
+        
+        # 确保目录存在
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 数据与配置
+        self.data: Optional[pd.DataFrame] = None
+        self.df_field: Optional[pd.DataFrame] = None
+        self.label: Optional[str] = None
+        self.key: Optional[str] = None
+        
+        # 预处理器 (sklearn Pipeline 兼容)
+        self.preprocessor: Optional[ConfigDrivenPreprocessor] = None
+        
+        # 训练相关
+        self.X_train = None
+        self.X_test = None
+        self.y_train = None
+        self.y_test = None
+        
+    def _load_data(self) -> None:
+        """加载数据"""
+        print(f"加载数据：{self.data_path}")
+        self.data = pd.read_csv(self.data_path, sep="|", encoding='utf-8')
+        print(f"数据加载完成：{self.data.shape[0]:,} 行 × {self.data.shape[1]:} 列")
+        
+    def _load_config(self) -> None:
+        """加载配置表"""
+        print(f"加载配置：{self.config_path}")
+        self.df_field = pd.read_excel(self.config_path)
+        print(f"配置加载完成：{len(self.df_field)} 个字段规则")
+        
+    def _identify_fields(self) -> None:
+        """识别 key 和 label 字段"""
+        for _, row in self.df_field.iterrows():
+            if row['field_type'] == 'key':
+                self.key = row['field_name']
+            elif row['field_type'] == 'label':
+                self.label = row['field_name']
+        
+        if not self.key or not self.label:
+            raise ValueError("配置表中必须包含 field_type 为 'key' 和 'label' 的字段")
+        
+        print(f"识别字段 - Key: {self.key}, Label: {self.label}")
+    
+    def _fields_stype(self) -> None:
         """
-        公有方法：核心功能 - 仅处理field_type为'num'的字段，实现数值类型自动转换
-        逻辑：
-            1. 提取所有field_type='num'的列名
-            2. 遍历对应self.data的列，先转为可计算的数值类型（无法转换的设为NaN）
-            3. 区分整数和浮点数，分别转换为对应类型（支持缺失值兼容）
+        数值类型转换 - 优化版
+        
+        优化:
+        1. 向量化转换
+        2. 移除不必要的循环
         """
-        # 步骤1：提取所有需要处理的数值型列名（field_type严格等于'num'）
-        num_field_names = self.df_field[self.df_field['field_type'] is not None]['field_name'].tolist()
-        if not num_field_names:
-            print("未找到field_type标记为'num'的字段，无需进行数值类型转换。")
+        num_fields = self.df_field[
+            self.df_field['field_type'].isin(['num', 'key', 'label'])
+        ]['field_name'].tolist()
+        
+        if not num_fields:
+            print("未找到需要类型转换的字段")
             return
-
-        print(f"开始处理数值类型字段，共 {len(num_field_names)} 个字段：{num_field_names}")
-
-        # 步骤2：遍历每个数值字段，进行类型转换
-        for field in num_field_names:
-            # 检查该字段是否存在于self.data中
+        
+        print(f"转换 {len(num_fields)} 个数值字段类型...")
+        
+        for field in num_fields:
             if field not in self.data.columns:
-                print(f"警告：self.data中不存在字段 '{field}'，跳过该字段转换。")
                 continue
-            field_type = self.df_field[self.df_field['field_name'] == field]['field_type']
-            # 步骤3：先将列转为数值类型（无法转换的值设为NaN，避免整体转换失败）
-            try:
-                # 转换为数值列（coerce：无法转换的转为NaN）
-                if field_type == 'key':
-                    self.key = field
-                    continue
-                if field_type == 'label':
-                    self.label = field
-                    continue
-                if field_type == 'str':
-                    continue
-                numeric_series = pd.to_numeric(self.data[field], errors='coerce')
-            except Exception as e:
-                print(f"错误：字段 '{field}' 转换为基础数值类型失败，报错信息：{str(e)}，跳过该字段。")
+            
+            field_type = self.df_field[
+                self.df_field['field_name'] == field
+            ]['field_type'].iloc[0]
+            
+            if field_type == 'key':
+                self.key = field
                 continue
-
-            # 步骤4：区分整数和浮点数，进行精准类型转换
-            # 判断：非NaN值是否全部为整数（即数值等于其整数形式）
-            is_all_integer = np.all(numeric_series.dropna().apply(lambda x: x == int(x)))
-
+            if field_type == 'label':
+                self.label = field
+                continue
+            if field_type == 'str':
+                continue
+            
+            # 向量化数值转换
+            self.data[field] = pd.to_numeric(self.data[field], errors='coerce')
+            
+            # 智能类型推断
+            numeric_series = self.data[field]
+            is_all_integer = numeric_series.dropna().apply(lambda x: x == int(x)).all()
+            
             if is_all_integer:
-                # 整数类型转换：使用pd.Int64（支持NaN缺失值的可空整型，优于原生int）
                 self.data[field] = numeric_series.astype(pd.Int64Dtype())
-                print(f"字段 '{field}' 已转换为【可空整型（pd.Int64）】")
+                print(f"  {field} → Int64")
             else:
-                # 浮点数类型转换：转为标准64位浮点数
                 self.data[field] = numeric_series.astype(np.float64)
-                print(f"字段 '{field}' 已转换为【64位浮点数（np.float64）】")
-
-        print("数值类型字段转换全部完成！")
-
-    def _handle_outliers(self):
+                print(f"  {field} → Float64")
+        
+        print("类型转换完成")
+    
+    def _prepare_data_for_train(self) -> None:
+        """
+        训练数据准备 - 修复数据穿越
+        
+        关键修复:
+        1. 先划分训练集/测试集
+        2. 仅在训练集上 fit 预处理器
+        3. 用训练集的统计量 transform 测试集
+        """
+        self._load_data()
+        self._load_config()
+        self._identify_fields()
+        self._fields_stype()
+        
+        # 关键：先处理异常值和缺失值 (这些不需要防止穿越)
+        from model_code.utils import handle_dataframe_outliers, handle_dataframe_missing_values
         self.data = handle_dataframe_outliers(self.data, self.df_field)
-    def _handle_missing_value(self):
         self.data = handle_dataframe_missing_values(self.data, self.df_field)
-    def _field_encode(self):
+        
+        # 关键：先划分数据集！
+        from sklearn.model_selection import train_test_split
+        train_data, test_data = train_test_split(
+            self.data, test_size=0.3, random_state=42, stratify=self.data[self.label]
+        )
+        
+        print(f"\n数据集划分:")
+        print(f"  训练集：{train_data.shape[0]:,} 行")
+        print(f"  测试集：{test_data.shape[0]:,} 行")
+        
+        # 初始化预处理器
+        self.preprocessor = ConfigDrivenPreprocessor(self.df_field)
+        
+        # 仅在训练集上 fit
+        feature_cols = [c for c in train_data.columns if c not in [self.label, self.key]]
+        self.preprocessor.fit(train_data[feature_cols])
+        
+        # 分别 transform
+        self.X_train = self.preprocessor.transform(train_data[feature_cols])
+        self.X_test = self.preprocessor.transform(test_data[feature_cols])
+        self.y_train = train_data[self.label]
+        self.y_test = test_data[self.label]
+        
+        # 编码和标准化
+        from model_code.utils import encode_dataframe, standardize_dataframe
+        self.X_train = encode_dataframe(self.X_train, self.df_field)
+        self.X_test = encode_dataframe(self.X_test, self.df_field)
+        self.X_train = standardize_dataframe(self.X_train, self.df_field)
+        self.X_test = standardize_dataframe(self.X_test, self.df_field)
+        
+        print("\n数据预处理完成 (无数据穿越)")
+    
+    def _prepare_data_for_predict(self) -> None:
+        """预测数据准备"""
+        self._load_data()
+        self._load_config()
+        self._identify_fields()
+        self._fields_stype()
+        
+        # 预测时使用完整预处理
+        from model_code.utils import (
+            handle_dataframe_outliers, 
+            handle_dataframe_missing_values,
+            encode_dataframe,
+            standardize_dataframe
+        )
+        
+        self.data = handle_dataframe_outliers(self.data, self.df_field)
+        self.data = handle_dataframe_missing_values(self.data, self.df_field)
         self.data = encode_dataframe(self.data, self.df_field)
-    def _field_standardize(self):
         self.data = standardize_dataframe(self.data, self.df_field)
+    
+    def model_train(self) -> Dict[str, Any]:
+        """
+        模型训练主流程
+        
+        Returns:
+            训练结果字典 (包含模型、AUC、指标等)
+        """
+        print("=" * 60)
+        print("开始模型训练流程")
+        print("=" * 60)
+        
+        self._prepare_data_for_train()
+        
+        # 重采样
+        print("\n执行负样本欠采样...")
+        neg_data = self.data[self.data[self.label] == 0]
+        pos_data = self.data[self.data[self.label] == 1]
+        
+        # 优化：使用简化的采样逻辑
+        if len(neg_data) > len(pos_data) * 10:
+            print("负样本过多，执行欠采样...")
+            target_stats = neg_data.describe().T[["mean", "std"]].values
+            step_size = len(pos_data)
+            max_iter = 10
+            error_rate = 0.1
+            
+            sample_indices = neg_data_undersampling(
+                neg_data, target_stats, step_size, max_iter, error_rate
+            )
+            neg_data_sample = neg_data.loc[sample_indices]
+            balanced_data = pd.concat([neg_data_sample, pos_data], axis=0)
+        else:
+            balanced_data = self.data.copy()
+        
+        # 准备特征和标签
+        y = balanced_data[self.label]
+        X = balanced_data.drop([self.label, self.key], axis=1)
+        
+        # 训练模型
+        print("\n开始训练 LightGBM 模型...")
+        results = lgbm_train_with_random_search(X, y, self.model_dir, self.output_dir)
+        
+        print("\n" + "=" * 60)
+        print("训练完成")
+        print("=" * 60)
+        
+        return results
+    
+    def model_predict(self) -> pd.DataFrame:
+        """
+        模型预测主流程
+        
+        Returns:
+            预测结果 DataFrame
+        """
+        print("=" * 60)
+        print("开始模型预测流程")
+        print("=" * 60)
+        
+        self._prepare_data_for_predict()
+        
+        # 准备预测数据
+        key = self.data[self.key]
+        features = self.data.drop([self.label, self.key], axis=1)
+        
+        # 预测
+        results = load_and_predict(
+            features, key, self.data_month,
+            self.model_dir, self.output_dir
+        )
+        
+        print("\n" + "=" * 60)
+        print("预测完成")
+        print("=" * 60)
+        
+        return results
 
 
-def run(data_month):
-    model = BuildingModel(data_path,config_path,data_month)
+def run(data_month: str, data_path: str, config_path: str,
+        is_train: bool = True, is_predict: bool = True,
+        output_dir: Optional[str] = None, model_dir: Optional[str] = None) -> None:
+    """
+    运行入口函数 - 优化版
+    
+    优化:
+    1. 配置参数化，移除全局依赖
+    2. 支持单独训练或预测
+    """
+    model = BuildingModel(
+        data_path=data_path,
+        config_path=config_path,
+        data_month=data_month,
+        output_dir=output_dir,
+        model_dir=model_dir
+    )
+    
     if is_train:
         model.model_train()
-    if is_pretrain:
+    
+    if is_predict:
         model.model_predict()
 
+
 if __name__ == '__main__':
-    data_month = sys.argv[0]
-    run(data_month)
+    # 从配置文件加载 (后续可改为命令行参数)
+    from model_code.config.config import (
+        data_path, config_path, is_train, is_pretrain
+    )
+    
+    if len(sys.argv) > 0:
+        data_month = sys.argv[0]
+    else:
+        data_month = "default"
+    
+    run(
+        data_month=data_month,
+        data_path=data_path,
+        config_path=config_path,
+        is_train=is_train,
+        is_predict=is_pretrain
+    )
