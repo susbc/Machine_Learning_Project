@@ -45,6 +45,13 @@ Machine_Learning_Project/
 │   ├── train.py                # 模型训练
 │   ├── predict.py              # 模型预测
 │   └── data_explore.py         # 数据探索
+│   ├── database/               # 🆕 数据库模块
+│   │   ├── db_connector.py     # 数据库连接器
+│   │   ├── query_builder.py    # SQL 查询构建器
+│   │   └── connection_manager.py # 连接管理器
+│   ├── llm/                    # 🆕 AI 智能分析模块
+│   │   ├── llm_connector.py    # 大模型连接器（OpenAI/Claude/Qwen/Zhipu/Baidu）
+│   │   └── intelligent_analyzer.py # 智能分析器
 │   └── saved/                  # 模型保存目录
 │       ├── best_lgbm_model.joblib
 │       └── train_summary.joblib
@@ -589,7 +596,13 @@ web_app/
 │   ├── 4_模型训练.py           # 模型训练界面
 │   ├── 5_模型管理.py           # 模型查看/下载
 │   ├── 6_模型预测.py           # 预测功能
-│   └── 7_结果分析.py           # 结果分析和报告
+│   ├── 7_结果分析.py           # 结果分析和报告
+│   ├── 8_数据源管理.py         # 数据库连接管理
+│   ├── 9_模型对比.py           # 多模型对比分析
+│   ├── 10_自动迭代.py          # 自动化模型迭代
+│   ├── 11_数据库连接管理.py    # 数据库连接配置管理
+│   ├── 12_大模型配置管理.py    # 🆕 大模型 API 配置
+│   └── 13_AI_智能分析.py       # 🆕 AI 智能分析（数据/训练/调参建议）
 ├── components/                 # 可复用组件
 │   ├── data_upload.py          # 数据上传组件
 │   ├── config_editor.py        # 配置编辑器
@@ -603,13 +616,15 @@ web_app/
 ### 使用流程
 
 1. **启动应用**: `streamlit run app.py`
-2. **上传数据**: 在【数据管理】页面上传训练数据
-3. **配置字段**: 在【配置管理】页面编辑字段配置
-4. **分析数据**: 在【数据分析】页面探索数据特征
-5. **训练模型**: 在【模型训练】页面调整参数并训练
-6. **管理模型**: 在【模型管理】页面查看已训练模型
-7. **进行预测**: 在【模型预测】页面上传数据进行预测
-8. **分析结果**: 在【结果分析】页面查看和导出结果
+2. **配置数据库** (可选): 在【数据库连接管理】页面添加数据库连接 🆕
+3. **上传数据**: 在【数据管理】页面上传训练数据（或从数据库导入）
+4. **配置字段**: 在【配置管理】页面编辑字段配置
+5. **分析数据**: 在【数据分析】页面探索数据特征
+6. **训练模型**: 在【模型训练】页面调整参数并训练
+7. **管理模型**: 在【模型管理】页面查看已训练模型
+8. **进行预测**: 在【模型预测】页面上传数据进行预测
+9. **分析结果**: 在【结果分析】页面查看和导出结果
+10. **模型对比**: 在【模型对比】页面比较不同模型性能
 
 ### 特性
 
@@ -618,5 +633,40 @@ web_app/
 - ✅ **交互式图表**: 使用 Plotly 创建可交互可视化
 - ✅ **跨平台**: 支持 Windows、macOS、Linux
 - ✅ **响应式设计**: 自适应不同屏幕尺寸
+
+---
+
+## 🆕 新增功能：数据库连接管理
+
+### 功能概述
+
+支持多种数据库的连接管理，包括 MySQL、PostgreSQL、SQLite、SQL Server。
+
+- 🔗 **保存历史连接**: 配置一次，重复使用
+- 🧪 **测试连接**: 实时验证数据库连接
+- 🔄 **灵活切换**: 一键激活不同数据库连接
+- 🔍 **搜索筛选**: 按名称、标签、类型快速查找
+- 📦 **导入导出**: 备份和分享连接配置
+
+### 使用方式
+
+**Web UI** (推荐):
+```bash
+streamlit run web_app/app.py
+# 访问 "11_数据库连接管理" 页面
+```
+
+**代码方式**:
+```python
+from model_code.database import ConnectionManager
+
+manager = ConnectionManager()
+manager.add_connection("MySQL", config)
+manager.set_active_connection(conn_id)
+```
+
+### 详细说明
+
+查看完整文档：[CONNECTION_MANAGER_README.md](CONNECTION_MANAGER_README.md)
 
 ---
