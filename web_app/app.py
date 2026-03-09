@@ -72,6 +72,17 @@ with st.sidebar:
     
     st.markdown("---")
     
+    # 数据库连接
+    st.page_link("pages/11_数据库连接管理.py", label="🔗 数据库连接", icon="🔗")
+    
+    st.markdown("---")
+    
+    # AI 智能分析
+    st.page_link("pages/12_大模型配置管理.py", label="🤖 大模型配置", icon="🤖")
+    st.page_link("pages/13_AI_智能分析.py", label="🧠 AI 智能分析", icon="🧠")
+    
+    st.markdown("---")
+    
     # 状态信息
     st.subheader("📌 状态")
     
@@ -137,15 +148,37 @@ st.markdown("""
 - 阈值分析
 - 历史对比
 
+#### 🔗 数据库连接 (新增 🆕)
+- 多数据库连接管理（MySQL/PostgreSQL/SQLite/SQL Server）
+- 连接配置保存和切换
+- 一键测试连接
+
+#### 🤖 大模型配置 (新增 🆕)
+- 配置各大模型 API（OpenAI/Claude/通义千问/智谱 AI/百度）
+- 多模型管理和切换
+- 连接测试
+
+#### 🧠 AI 智能分析 (新增 🆕)
+- 数据集智能分析 + 模型推荐
+- 训练结果诊断 + 调参建议
+- 预测结果分析 + 业务洞察
+- 超参数智能调优
+
 ---
 
 ### 快速开始
 
+#### 基础流程
 1. 前往 **📊 数据管理** 上传您的数据
 2. 在 **⚙️ 配置管理** 配置字段规则
 3. 在 **📈 数据分析** 探索数据特征
 4. 在 **🚀 模型训练** 训练模型
 5. 在 **🔮 模型预测** 使用模型进行预测
+
+#### 高级功能 (新增)
+- 🔗 **数据库连接**: 直接连接数据库读取数据
+- 🤖 **大模型配置**: 配置 AI 分析所需的 LLM API
+- 🧠 **AI 智能分析**: 获取 AI 驱动的数据分析和调参建议
 
 """)
 
@@ -169,7 +202,12 @@ with col3:
 # 项目信息
 st.markdown("---")
 st.markdown("""
-**技术栈**: Streamlit | Plotly | LightGBM | scikit-learn
+**技术栈**: Streamlit | Plotly | LightGBM | scikit-learn | OpenAI | Anthropic
 
-**版本**: 1.0.0 | **最后更新**: 2024
+**版本**: 2.0.0 | **最后更新**: 2026-03-09
+
+**新增功能**:
+- 🔗 数据库连接管理（支持 MySQL/PostgreSQL/SQLite/SQL Server）
+- 🤖 大模型集成（OpenAI/Claude/通义千问/智谱 AI/百度）
+- 🧠 AI 智能分析（数据诊断/模型推荐/调参建议）
 """)

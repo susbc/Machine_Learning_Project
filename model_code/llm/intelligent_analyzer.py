@@ -1,0 +1,590 @@
+"""
+AI 智能分析模块
+
+使用大模型对机器学习流程进行智能分析和建议：
+- 数据集分析 + 业务场景 → 模型推荐
+- 训练结果分析 → 调参建议
+- 预测结果分析 → 优化方向
+"""
+
+import json
+import logging
+from typing import Optional, Dict, Any, List
+from pathlib import Path
+from datetime import datetime
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+try:
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    pd = None
+    np = None
+
+
+class IntelligentAnalyzer:
+    """智能分析器"""
+    
+    def __init__(self, llm_manager=None):
+        """
+        初始化智能分析器
+        
+        Args:
+            llm_manager: 大模型管理器实例
+        """
+        from model_code.llm.llm_connector import get_llm_manager
+        
+        self.llm_manager = llm_manager or get_llm_manager()
+        
+        # 分析模板
+        self.prompts = {
+            'data_analysis': self._get_data_analysis_prompt(),
+            'model_recommendation': self._get_model_recommendation_prompt(),
+            'training_analysis': self._get_training_analysis_prompt(),
+            'prediction_analysis': self._get_prediction_analysis_prompt(),
+            'hyperparameter_tuning': self._get_hyperparameter_tuning_prompt()
+        }
+    
+    def _get_data_analysis_prompt(self) -> str:
+        """数据分析提示词模板"""
+        return """
+你是一位资深的数据科学家和机器学习专家。请分析以下数据集的统计信息，并给出专业的分析建议。
+
+## 数据集基本信息
+- 样本数量：{n_samples}
+- 特征数量：{n_features}
+- 目标变量：{target_info}
+
+## 特征统计信息
+{feature_stats}
+
+## 数据质量信息
+- 缺失值比例：{missing_rate}
+- 重复值比例：{duplicate_rate}
+- 类别不平衡情况：{imbalance_info}
+
+## 业务场景
+{business_context}
+
+请从以下角度进行分析：
+1. **数据质量评估**：数据是否适合建模？存在哪些潜在问题？
+2. **特征工程建议**：哪些特征可能需要特殊处理？是否需要创建新特征？
+3. **建模风险提示**：基于数据特征，建模可能遇到哪些挑战？
+4. **采样建议**：是否需要特殊采样策略？
+
+请用简洁专业的语言回答，给出可操作的建议。
+"""
+    
+    def _get_model_recommendation_prompt(self) -> str:
+        """模型推荐提示词模板"""
+        return """
+你是一位机器学习架构师。请根据以下数据集特征和业务需求，推荐最适合的模型方案。
+
+## 数据集特征
+- 样本量：{n_samples} ({size_category})
+- 特征类型：{feature_types}
+- 特征数量：{n_features}
+- 目标类型：{target_type}
+- 类别分布：{class_distribution}
+
+## 业务场景
+{business_context}
+
+## 业务需求
+- 预测速度要求：{speed_requirement}
+- 模型可解释性要求：{interpretability_requirement}
+- 准确率要求：{accuracy_requirement}
+
+## 可用模型选项
+- LightGBM：快速、高效、适合表格数据
+- XGBoost：精度高、可调参空间大
+- Random Forest：稳定、可解释性好
+- Logistic Regression：基线模型、可解释性最好
+- Neural Network：适合复杂非线性关系、需要大量数据
+
+请推荐：
+1. **首选模型**及理由
+2. **备选模型**及适用场景
+3. **不推荐的模型**及原因
+4. **模型组合建议**（如适用）
+
+请给出具体、可操作的建议。
+"""
+    
+    def _get_training_analysis_prompt(self) -> str:
+        """训练结果分析提示词模板"""
+        return """
+你是一位机器学习专家。请分析以下模型训练结果，给出专业的诊断和优化建议。
+
+## 模型信息
+- 模型类型：{model_type}
+- 训练样本数：{train_size}
+- 验证样本数：{val_size}
+- 特征数量：{n_features}
+
+## 训练结果
+- 训练集 AUC：{train_auc}
+- 验证集 AUC：{val_auc}
+- 训练集 F1：{train_f1}
+- 验证集 F1：{val_f1}
+- AUC 差距：{auc_gap}
+- F1 差距：{f1_gap}
+
+## 模型参数
+{model_params}
+
+## 特征重要性（Top 10）
+{feature_importance}
+
+请分析：
+1. **模型状态诊断**：
+   - 是否过拟合？（训练 - 验证差距）
+   - 是否欠拟合？（训练集表现）
+   - 模型收敛是否正常？
+
+2. **问题定位**：
+   - 如果过拟合：可能的原因和建议
+   - 如果欠拟合：可能的原因和建议
+
+3. **优化建议**（按优先级排序）：
+   - 最应该尝试的 3 个优化方向
+   - 每个方向的预期效果和风险
+
+4. **下一步行动**：
+   - 具体应该调整哪些参数？
+   - 是否需要更多数据或特征？
+
+请给出具体、可量化的建议。
+"""
+    
+    def _get_prediction_analysis_prompt(self) -> str:
+        """预测结果分析提示词模板"""
+        return """
+你是一位数据科学家。请分析以下模型预测结果，给出业务洞察和优化方向。
+
+## 预测结果统计
+- 总样本数：{total_samples}
+- 预测正例数：{predicted_positive}
+- 预测正例比例：{positive_rate}
+- 使用阈值：{threshold}
+
+## 预测分布
+{prediction_distribution}
+
+## 高置信度预测
+- 高置信度正例（>0.8）：{high_conf_positive}
+- 高置信度负例（<0.2）：{high_conf_negative}
+- 低置信度预测（0.4-0.6）：{low_confidence}
+
+## 与历史模型对比
+{historical_comparison}
+
+请分析：
+1. **预测质量评估**：
+   - 预测分布是否合理？
+   - 是否存在预测偏差？
+
+2. **业务洞察**：
+   - 高置信度正例的特征模式
+   - 低置信度样本的特点
+   - 是否需要调整阈值？
+
+3. **优化方向**：
+   - 模型层面的改进建议
+   - 特征层面的改进建议
+   - 数据层面的改进建议
+
+4. **风险提示**：
+   - 预测结果中需要人工复核的部分
+   - 业务应用中的注意事项
+
+请结合业务场景给出具体建议。
+"""
+    
+    def _get_hyperparameter_tuning_prompt(self) -> str:
+        """超参数调优提示词模板"""
+        return """
+你是一位机器学习调参专家。请根据以下模型训练历史，给出下一步调参建议。
+
+## 当前模型配置
+- 模型类型：{model_type}
+- 当前参数：{current_params}
+
+## 历史调参记录
+{history_records}
+
+## 性能指标变化
+{performance_history}
+
+## 资源约束
+- 最大训练时间：{max_train_time}
+- 可用计算资源：{compute_resources}
+
+请给出：
+1. **参数敏感性分析**：
+   - 哪些参数对性能影响最大？
+   - 哪些参数已经接近最优？
+
+2. **下一步调参建议**（按优先级）：
+   - 应该调整哪些参数？
+   - 建议的取值范围？
+   - 预期提升幅度？
+
+3. **调参策略**：
+   - 推荐使用什么搜索方法？（网格/随机/贝叶斯）
+   - 建议的搜索空间？
+
+4. **早停建议**：
+   - 是否应该停止调参？
+   - 当前是否已达到性能瓶颈？
+
+请给出具体、可执行的调参计划。
+"""
+    
+    def analyze_dataset(self, df: 'pd.DataFrame', target_col: str,
+                       business_context: str = "") -> str:
+        """
+        分析数据集并给出建议
+        
+        Args:
+            df: 数据框
+            target_col: 目标列名
+            business_context: 业务场景描述
+        
+        Returns:
+            AI 分析建议
+        """
+        if pd is None:
+            return "错误：需要安装 pandas"
+        
+        # 收集统计信息
+        n_samples, n_features = df.shape
+        target_info = f"{target_col} (类型：{df[target_col].dtype})"
+        
+        # 特征统计
+        feature_stats = []
+        for col in df.columns[:10]:  # 限制前 10 个特征
+            if col == target_col:
+                continue
+            if df[col].dtype in ['int64', 'float64']:
+                stats = f"{col}: 均值={df[col].mean():.2f}, 标准差={df[col].std():.2f}, 缺失={df[col].isna().sum()}"
+            else:
+                stats = f"{col}: 唯一值={df[col].nunique()}, 缺失={df[col].isna().sum()}"
+            feature_stats.append(stats)
+        feature_stats = "\n".join(feature_stats)
+        
+        # 数据质量
+        missing_rate = df.isna().sum().sum() / (n_samples * n_features) * 100
+        duplicate_rate = df.duplicated().sum() / n_samples * 100
+        
+        # 类别不平衡
+        if df[target_col].nunique() == 2:
+            class_dist = df[target_col].value_counts(normalize=True)
+            imbalance_info = f"正例比例：{class_dist.iloc[0]*100:.1f}%"
+        else:
+            imbalance_info = "多分类问题"
+        
+        # 构建提示词
+        prompt = self.prompts['data_analysis'].format(
+            n_samples=n_samples,
+            n_features=n_features,
+            target_info=target_info,
+            feature_stats=feature_stats,
+            missing_rate=f"{missing_rate:.2f}%",
+            duplicate_rate=f"{duplicate_rate:.2f}%",
+            imbalance_info=imbalance_info,
+            business_context=business_context or "未提供"
+        )
+        
+        # 调用大模型
+        messages = [{"role": "user", "content": prompt}]
+        return self.llm_manager.chat(messages, temperature=0.3)
+    
+    def recommend_model(self, df: 'pd.DataFrame', target_col: str,
+                       business_context: str = "", requirements: Dict = None) -> str:
+        """
+        推荐模型
+        
+        Args:
+            df: 数据框
+            target_col: 目标列名
+            business_context: 业务场景
+            requirements: 需求字典
+        
+        Returns:
+            模型推荐建议
+        """
+        if pd is None:
+            return "错误：需要安装 pandas"
+        
+        n_samples, n_features = df.shape
+        
+        # 数据规模分类
+        if n_samples < 1000:
+            size_category = "小"
+        elif n_samples < 100000:
+            size_category = "中"
+        else:
+            size_category = "大"
+        
+        # 特征类型
+        numeric_features = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+        categorical_features = df.select_dtypes(include=['object', 'category']).columns.tolist()
+        feature_types = f"数值特征：{len(numeric_features)}, 类别特征：{len(categorical_features)}"
+        
+        # 目标类型
+        target_type = "二分类" if df[target_col].nunique() == 2 else "多分类"
+        
+        # 类别分布
+        if df[target_col].nunique() == 2:
+            class_dist = df[target_col].value_counts(normalize=True)
+            class_distribution = f"类别 0: {class_dist.iloc[1]*100:.1f}%, 类别 1: {class_dist.iloc[0]*100:.1f}%"
+        else:
+            class_distribution = f"{df[target_col].nunique()} 个类别"
+        
+        # 默认需求
+        default_requirements = {
+            'speed_requirement': '中等',
+            'interpretability_requirement': '中等',
+            'accuracy_requirement': '高'
+        }
+        requirements = requirements or default_requirements
+        
+        # 构建提示词
+        prompt = self.prompts['model_recommendation'].format(
+            n_samples=n_samples,
+            size_category=size_category,
+            feature_types=feature_types,
+            n_features=n_features,
+            target_type=target_type,
+            class_distribution=class_distribution,
+            business_context=business_context or "未提供",
+            speed_requirement=requirements.get('speed_requirement', '中等'),
+            interpretability_requirement=requirements.get('interpretability_requirement', '中等'),
+            accuracy_requirement=requirements.get('accuracy_requirement', '高')
+        )
+        
+        messages = [{"role": "user", "content": prompt}]
+        return self.llm_manager.chat(messages, temperature=0.3)
+    
+    def analyze_training_results(self, metrics: Dict, params: Dict,
+                                 feature_importance: List = None) -> str:
+        """
+        分析训练结果
+        
+        Args:
+            metrics: 指标字典
+            params: 参数字典
+            feature_importance: 特征重要性列表
+        
+        Returns:
+            分析建议
+        """
+        train_auc = metrics.get('train_auc', 0)
+        val_auc = metrics.get('val_auc', 0)
+        train_f1 = metrics.get('train_f1', 0)
+        val_f1 = metrics.get('val_f1', 0)
+        
+        auc_gap = abs(train_auc - val_auc)
+        f1_gap = abs(train_f1 - val_f1)
+        
+        # 特征重要性
+        if feature_importance:
+            fi_text = "\n".join([f"{i+1}. {f}: {v:.4f}" 
+                                for i, (f, v) in enumerate(feature_importance[:10])])
+        else:
+            fi_text = "未提供"
+        
+        # 参数字符串
+        params_text = json.dumps(params, indent=2, ensure_ascii=False)
+        
+        # 构建提示词
+        prompt = self.prompts['training_analysis'].format(
+            model_type=params.get('model_type', 'Unknown'),
+            train_size=metrics.get('train_size', 0),
+            val_size=metrics.get('val_size', 0),
+            n_features=metrics.get('n_features', 0),
+            train_auc=train_auc,
+            val_auc=val_auc,
+            train_f1=train_f1,
+            val_f1=val_f1,
+            auc_gap=auc_gap,
+            f1_gap=f1_gap,
+            model_params=params_text,
+            feature_importance=fi_text
+        )
+        
+        messages = [{"role": "user", "content": prompt}]
+        return self.llm_manager.chat(messages, temperature=0.3)
+    
+    def analyze_prediction_results(self, predictions: 'pd.Series',
+                                   threshold: float = 0.5,
+                                   historical: Dict = None) -> str:
+        """
+        分析预测结果
+        
+        Args:
+            predictions: 预测概率
+            threshold: 阈值
+            historical: 历史对比数据
+        
+        Returns:
+            分析建议
+        """
+        if pd is None:
+            return "错误：需要安装 pandas"
+        
+        total = len(predictions)
+        predicted_positive = (predictions >= threshold).sum()
+        positive_rate = predicted_positive / total * 100
+        
+        # 预测分布
+        high_conf_pos = (predictions >= 0.8).sum()
+        high_conf_neg = (predictions <= 0.2).sum()
+        low_conf = ((predictions >= 0.4) & (predictions <= 0.6)).sum()
+        
+        # 分布统计
+        dist = predictions.describe()
+        dist_text = f"均值：{dist['mean']:.3f}, 标准差：{dist['std']:.3f}, " \
+                   f"最小：{dist['min']:.3f}, 最大：{dist['max']:.3f}"
+        
+        # 历史对比
+        if historical:
+            hist_text = f"历史 AUC: {historical.get('auc', 'N/A')}, " \
+                       f"历史 F1: {historical.get('f1', 'N/A')}"
+        else:
+            hist_text = "无历史数据对比"
+        
+        # 构建提示词
+        prompt = self.prompts['prediction_analysis'].format(
+            total_samples=total,
+            predicted_positive=predicted_positive,
+            positive_rate=f"{positive_rate:.1f}%",
+            threshold=threshold,
+            prediction_distribution=dist_text,
+            high_conf_positive=high_conf_pos,
+            high_conf_negative=high_conf_neg,
+            low_confidence=low_conf,
+            historical_comparison=hist_text
+        )
+        
+        messages = [{"role": "user", "content": prompt}]
+        return self.llm_manager.chat(messages, temperature=0.3)
+    
+    def suggest_hyperparameter_tuning(self, current_params: Dict,
+                                      history: List[Dict],
+                                      constraints: Dict = None) -> str:
+        """
+        建议超参数调优
+        
+        Args:
+            current_params: 当前参数
+            history: 历史调参记录
+            constraints: 约束条件
+        
+        Returns:
+            调优建议
+        """
+        # 历史记录格式化
+        if history:
+            history_text = "\n".join([
+                f"试验{i+1}: {json.dumps(h.get('params', {}))} → AUC: {h.get('auc', 'N/A')}"
+                for i, h in enumerate(history[-5:])  # 最近 5 次
+            ])
+        else:
+            history_text = "无历史记录"
+        
+        # 性能历史
+        if history:
+            perf_text = "\n".join([
+                f"试验{i+1}: AUC={h.get('auc', 0):.4f}, F1={h.get('f1', 0):.4f}"
+                for i, h in enumerate(history)
+            ])
+        else:
+            perf_text = "无数据"
+        
+        # 默认约束
+        default_constraints = {
+            'max_train_time': '30 分钟',
+            'compute_resources': '单 CPU'
+        }
+        constraints = constraints or default_constraints
+        
+        # 构建提示词
+        prompt = self.prompts['hyperparameter_tuning'].format(
+            model_type=current_params.get('model_type', 'Unknown'),
+            current_params=json.dumps(current_params, indent=2),
+            history_records=history_text,
+            performance_history=perf_text,
+            max_train_time=constraints.get('max_train_time', '30 分钟'),
+            compute_resources=constraints.get('compute_resources', '单 CPU')
+        )
+        
+        messages = [{"role": "user", "content": prompt}]
+        return self.llm_manager.chat(messages, temperature=0.3)
+    
+    def save_analysis(self, analysis_type: str, content: str,
+                     metadata: Dict = None) -> str:
+        """
+        保存分析结果
+        
+        Args:
+            analysis_type: 分析类型
+            content: 分析内容
+            metadata: 元数据
+        
+        Returns:
+            保存的文件路径
+        """
+        from pathlib import Path
+        
+        output_dir = Path(__file__).parent.parent / "analysis_reports"
+        output_dir.mkdir(exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{analysis_type}_{timestamp}.md"
+        filepath = output_dir / filename
+        
+        # 构建报告
+        report = f"""# AI 智能分析报告
+
+## 分析类型
+{analysis_type}
+
+## 生成时间
+{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+## 元数据
+{json.dumps(metadata or {}, indent=2, ensure_ascii=False)}
+
+---
+
+## 分析结果
+
+{content}
+
+---
+
+*本报告由 AI 智能分析模块自动生成*
+"""
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(report)
+        
+        logger.info(f"分析报告已保存：{filepath}")
+        return str(filepath)
+
+
+# 单例模式
+_analyzer_instance: Optional[IntelligentAnalyzer] = None
+
+
+def get_intelligent_analyzer() -> IntelligentAnalyzer:
+    """获取智能分析器单例"""
+    global _analyzer_instance
+    if _analyzer_instance is None:
+        _analyzer_instance = IntelligentAnalyzer()
+    return _analyzer_instance
