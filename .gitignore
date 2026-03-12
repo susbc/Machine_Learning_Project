@@ -4,60 +4,33 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual Environment
-.venv/
 venv/
 ENV/
-env/
+*.egg-info/
+
+# 环境变量
+.env
+.env.local
+*.env
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
 *.swo
-*~
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Machine Learning
-*.joblib
-*.pkl
-*.h5
-
-# Logs
-logs/
-*.log
-
-# OS
+# 系统文件
 .DS_Store
 Thumbs.db
 
-# Config (optional - remove if you want to track configs)
-# config/llm_providers.json
-# config/saved_connections.json
+# 日志
+*.log
+logs/
 
-# Test coverage
-htmlcov/
-.coverage
-.coveragerc
-
-# Temporary files
-*.tmp
+# 临时文件
+tmp/
 temp/
+*.tmp
+
+# 测试数据
+generated_data/
