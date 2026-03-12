@@ -1,0 +1,69 @@
+# =============================================================================
+# Coverage 配置文件
+# =============================================================================
+
+[run]
+# 源代码目录
+source = 
+    model_code
+    web_app
+
+# 省略的文件
+omit = 
+    */tests/*
+    */__init__.py
+    */conftest.py
+    */.venv/*
+    */venv/*
+    */setup.py
+    */logging_config.py
+
+# 分支覆盖率
+branch = True
+
+# 并行模式 (用于 pytest-xdist)
+parallel = True
+
+# 数据文件
+data_file = .coverage
+
+[report]
+# 排除的行
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise AssertionError
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+    @abstractmethod
+
+# 显示缺失的行
+show_missing = True
+
+# 显示覆盖率总和
+total = True
+
+# 失败阈值
+fail_under = 80
+
+# 排序方式
+sort = Cover
+
+# 输出格式
+precision = 2
+
+[html]
+# HTML 报告目录
+directory = htmlcov
+
+# HTML 报告标题
+title = Machine Learning Project Coverage Report
+
+[xml]
+# XML 报告输出 (用于 Codecov)
+output = coverage.xml
+
+[json]
+# JSON 报告输出
+output = coverage.json

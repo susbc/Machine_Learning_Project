@@ -1,0 +1,82 @@
+# =============================================================================
+# GitHub Actions - 代码检查工作流程
+# 运行代码格式化检查和静态分析
+# =============================================================================
+
+name: Lint
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Code Linting
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+      
+      - name: Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            flake8 \
+            flake8-docstrings \
+            flake8-import-order \
+            flake8-bugbear \
+            pylint \
+            black \
+            isort \
+            mypy
+      
+      - name: Run Black (format check)
+        run: |
+          black --check --diff model_code/ web_app/ tests/
+        continue-on-error: true
+      
+      - name: Run isort (import order check)
+        run: |
+          isort --check-only --diff model_code/ web_app/ tests/
+        continue-on-error: true
+      
+      - name: Run Flake8
+        run: |
+          flake8 model_code/ web_app/ tests/ \
+            --max-line-length=120 \
+            --extend-ignore=E203,W503 \
+            --exclude=.venv,venv,__pycache__,.git
+        continue-on-error: true
+      
+      - name: Run Pylint
+        run: |
+          pylint model_code/ web_app/ \
+            --max-line-length=120 \
+            --disable=C0114,C0115,C0116,R0903 \
+            --output-format=text \
+            || true
+        continue-on-error: true
+      
+      - name: Run mypy (type checking)
+        run: |
+          mypy model_code/ web_app/ \
+            --ignore-missing-imports \
+            --no-strict-optional \
+            || true
+        continue-on-error: true
+      
+      - name: Check requirements.txt
+        run: |
+          pip install safety
+          safety check -r requirements.txt || true
+        continue-on-error: true
