@@ -102,7 +102,7 @@ with tab1:
         results_df['预测概率'].values,
         st.session_state.prediction_threshold
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="tab1_dist_chart")
     
     # 分位数统计
     st.subheader("📋 分位数统计")
@@ -144,7 +144,7 @@ with tab2:
         y_scores = results_df['预测概率'].values
         
         fig = render_threshold_analysis(y_true, y_scores)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="threshold_analysis_chart")
         
         # 不同阈值的指标
         st.subheader("📊 不同阈值的性能指标")
@@ -179,16 +179,16 @@ with tab2:
             title='阈值 - 指标曲线',
             labels={'value': '分数', 'variable': '指标'}
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="threshold_metrics_chart")
         
         # ROC 曲线（如果有真实标签）
         st.subheader("📈 ROC 曲线")
         fig = render_roc_curve(y_true, y_scores)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="roc_curve_chart")
         
         st.subheader("📈 PR 曲线")
         fig = render_precision_recall_curve(y_true, y_scores)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="pr_curve_chart")
     else:
         st.info("💡 要使用阈值分析功能，请在预测结果中包含真实标签列")
         
@@ -263,7 +263,7 @@ with tab3:
             barmode='overlay'
         )
         
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="prob_comparison_chart")
     else:
         st.info("💡 要使用对比分析功能，请先进行模型训练")
         
@@ -274,7 +274,7 @@ with tab3:
             results_df['预测概率'].values,
             st.session_state.prediction_threshold
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="prediction_dist_chart")
 
 with tab4:
     st.header("📋 导出分析报告")

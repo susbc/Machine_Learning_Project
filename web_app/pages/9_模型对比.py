@@ -18,21 +18,43 @@ from pathlib import Path
 import sys
 import joblib
 from datetime import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from sklearn.compose import ColumnTransformer
 
 # 添加项目路径
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from utils.session_state import init_session_state
-from components.model_comparison import (
+from web_app.utils.session_state import init_session_state
+from web_app.components.model_comparison import (
     render_model_comparison_section,
     compare_models,
     create_metrics_comparison_chart,
-    create_roc_comparison_chart,
-    create_pr_comparison_chart,
-    create_model_summary_table,
-    export_comparison_report
 )
+
+
+def encode_test_data(X_test: pd.DataFrame) -> pd.DataFrame:
+    """
+    对测试数据进行编码转换（数值化）
+    
+    Args:
+        X_test: 测试集特征
+    
+    Returns:
+        编码后的 DataFrame
+    """
+    X_encoded = X_test.copy()
+    
+    # 对每一列进行检查和转换
+    for col in X_encoded.columns:
+        if X_encoded[col].dtype == 'object':
+            # 字符串列，使用 LabelEncoder
+            le = LabelEncoder()
+            X_encoded[col] = le.fit_transform(X_encoded[col].astype(str))
+    
+    return X_encoded
+
 
 # 初始化
 init_session_state()
@@ -149,32 +171,12 @@ st.header("📊 测试数据准备")
 if st.session_state.get('training_results') is not None:
     training_results = st.session_state.training_results
     
-    # 使用训练时的测试集
+    # 使用训练时的测试集（优先）
     if 'X_test' in training_results and 'y_test' in training_results:
-        st.info("✅ 使用当前训练会话的测试集")
+        st.info("✅ 使用训练时保存的测试集（已预处理）")
         
-        # 重建测试集
-        from sklearn.model_selection import train_test_split
-        
-        df = st.session_state.uploaded_data
-        config_df = st.session_state.field_config
-        
-        label_col = config_df[config_df['field_type'] == 'label']['field_name'].values[0]
-        key_col = config_df[config_df['field_type'] == 'key']['field_name'].values
-        
-        if key_col:
-            key_col = key_col[0]
-            feature_cols = [c for c in df.columns if c not in [label_col, key_col]]
-        else:
-            feature_cols = [c for c in df.columns if c != label_col]
-        
-        X = df[feature_cols]
-        y = df[label_col]
-        
-        # 使用相同的随机种子划分
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.3, random_state=42, stratify=y
-        )
+        X_test = training_results['X_test']
+        y_test = training_results['y_test']
         
         st.session_state.X_test = X_test
         st.session_state.y_test = y_test
@@ -183,7 +185,9 @@ if st.session_state.get('training_results') is not None:
         with col1:
             st.metric("测试集样本数", len(y_test))
         with col2:
-            st.metric("正样本比例", f"{y_test.mean():.2%}")
+            # y_test 可能是数组或 Series
+            y_mean = y_test.mean() if hasattr(y_test, 'mean') else np.mean(y_test)
+            st.metric("正样本比例", f"{y_mean:.2%}")
     
     else:
         st.warning("训练结果中未找到测试集数据")
@@ -211,6 +215,13 @@ if st.session_state.get('training_results') is not None:
         
         st.session_state.X_test = X_test
         st.session_state.y_test = y_test
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("测试集样本数", len(y_test))
+        with col2:
+            y_mean = y_test.mean() if hasattr(y_test, 'mean') else np.mean(y_test)
+            st.metric("正样本比例", f"{y_mean:.2%}")
 else:
     # 没有训练结果，使用当前数据
     st.info("使用当前上传的数据划分测试集")
@@ -244,7 +255,8 @@ else:
     with col1:
         st.metric("测试集样本数", len(y_test))
     with col2:
-        st.metric("正样本比例", f"{y_test.mean():.2%}")
+        y_mean = y_test.mean() if hasattr(y_test, 'mean') else np.mean(y_test)
+        st.metric("正样本比例", f"{y_mean:.2%}")
 
 # ============================================================================
 # 模型对比
@@ -253,10 +265,23 @@ else:
 st.markdown("---")
 
 if st.session_state.get('X_test') is not None and st.session_state.get('y_test') is not None:
+    # 使用训练时保存的测试数据（已经过相同的预处理）
+    X_test_for_compare = st.session_state.X_test
+    y_test_for_compare = st.session_state.y_test
+    
+    # 如果测试数据是 DataFrame，确保列名正确
+    if isinstance(X_test_for_compare, pd.DataFrame):
+        # 对测试数据进行编码转换
+        X_test_for_compare = encode_test_data(X_test_for_compare)
+    
+    # 如果 y_test 是字符串，进行编码
+    if isinstance(y_test_for_compare, pd.Series) and y_test_for_compare.dtype == 'object':
+        y_test_for_compare = LabelEncoder().fit_transform(y_test_for_compare)
+    
     render_model_comparison_section(
         available_models,
-        st.session_state.X_test,
-        st.session_state.y_test
+        X_test_for_compare,
+        y_test_for_compare
     )
 
 # ============================================================================

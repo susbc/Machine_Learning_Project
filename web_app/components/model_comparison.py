@@ -59,7 +59,8 @@ def evaluate_model(
     model: Any,
     X_test: pd.DataFrame,
     y_test: pd.Series,
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    feature_names: List[str] = None
 ) -> Dict[str, Any]:
     """
     评估单个模型
@@ -69,12 +70,38 @@ def evaluate_model(
         X_test: 测试集特征
         y_test: 测试集标签
         threshold: 分类阈值
+        feature_names: 训练时使用的特征列名
     
     Returns:
         评估结果字典
     """
+    # 确保测试数据的特征列与训练时一致
+    X_processed = X_test.copy()
+    
+    if feature_names and len(feature_names) > 0:
+        # 调试输出
+        print(f"[DEBUG] feature_names: {len(feature_names)}, X_test columns: {len(X_processed.columns)}")
+        
+        # 只保留训练时使用的特征列，保持相同顺序
+        missing_cols = set(feature_names) - set(X_processed.columns)
+        if missing_cols:
+            print(f"[DEBUG] Missing columns: {missing_cols}")
+            # 添加缺失的列（用 0 填充）
+            for col in missing_cols:
+                X_processed[col] = 0
+        
+        # 移除多余的列
+        extra_cols = set(X_processed.columns) - set(feature_names)
+        if extra_cols:
+            print(f"[DEBUG] Extra columns: {extra_cols}")
+            X_processed = X_processed.drop(columns=list(extra_cols))
+        
+        # 按训练时的特征顺序重新排列
+        X_processed = X_processed[feature_names]
+        print(f"[DEBUG] X_processed shape: {X_processed.shape}")
+    
     # 预测
-    y_proba = model.predict_proba(X_test)[:, 1]
+    y_proba = model.predict_proba(X_processed)[:, 1]
     y_pred = (y_proba >= threshold).astype(int)
     
     # 计算指标
@@ -120,14 +147,16 @@ def compare_models(
         if model is None:
             continue
         
-        # 评估模型
-        metrics = evaluate_model(model, X_test, y_test, threshold)
+        # 评估模型（传入特征名列表）
+        feature_names = info.get('feature_names')
+        metrics = evaluate_model(model, X_test, y_test, threshold, feature_names)
         
-        # 合并信息
+        # 合并信息（保存 X_test 用于报告导出）
         results[model_name] = {
             **metrics,
             'info': info,
-            'path': path
+            'path': path,
+            'X_test': X_test  # 保存测试集特征
         }
     
     return results
@@ -389,7 +418,7 @@ def create_model_summary_table(results: Dict[str, Dict]) -> pd.DataFrame:
 
 def export_comparison_report(results: Dict[str, Dict], X_test: pd.DataFrame, y_test: pd.Series) -> str:
     """
-    导出对比报告
+    导出对比报告（完整版）
     
     Args:
         results: 模型对比结果
@@ -407,8 +436,37 @@ def export_comparison_report(results: Dict[str, Dict], X_test: pd.DataFrame, y_t
     
     # 基本信息
     report.append(f"测试集样本数：{len(y_test):,}")
-    report.append(f"特征数：{X_test.shape[1]}")
-    report.append(f"正样本比例：{y_test.mean():.2%}")
+    if hasattr(X_test, 'shape') and len(X_test.shape) > 1:
+        report.append(f"特征数：{X_test.shape[1]}")
+    else:
+        report.append(f"特征数：N/A")
+    
+    y_mean = y_test.mean() if hasattr(y_test, 'mean') else np.mean(y_test)
+    report.append(f"正样本比例：{y_mean:.2%}")
+    report.append("")
+
+
+def export_comparison_report_simple(results: Dict[str, Dict], y_test: pd.Series) -> str:
+    """
+    导出对比报告（简化版，不需要 X_test）
+    
+    Args:
+        results: 模型对比结果
+        y_test: 测试集标签
+    
+    Returns:
+        报告文本
+    """
+    report = []
+    report.append("=" * 80)
+    report.append("模型对比分析报告")
+    report.append("=" * 80)
+    report.append("")
+    
+    # 基本信息
+    report.append(f"测试集样本数：{len(y_test):,}")
+    y_mean = y_test.mean() if hasattr(y_test, 'mean') else np.mean(y_test)
+    report.append(f"正样本比例：{y_mean:.2%}")
     report.append("")
     
     # 模型列表
@@ -480,12 +538,15 @@ def render_model_comparison_section(
         "选择要对比的模型 (至少 2 个，最多 5 个)",
         options=list(model_options.keys()),
         default=list(model_options.keys())[:2] if len(model_options) >= 2 else [],
-        max_selections=5,
-        min_selections=2
+        max_selections=5
     )
     
     if len(selected_models) < 2:
-        st.warning("请至少选择 2 个模型进行对比")
+        st.warning("⚠️ 请至少选择 2 个模型进行对比")
+        return
+    
+    if len(selected_models) > 5:
+        st.warning("⚠️ 最多选择 5 个模型进行对比")
         return
     
     # 阈值设置
@@ -561,7 +622,16 @@ def display_comparison_results(results: Dict[str, Dict], y_test: pd.Series) -> N
     col1, col2 = st.columns(2)
     
     with col1:
-        report_text = export_comparison_report(results, y_test, y_test)
+        # 从结果中获取第一个模型的 X_test 信息（所有模型使用相同的测试集）
+        first_result = list(results.values())[0]
+        X_test_info = first_result.get('X_test')
+        
+        if X_test_info is not None:
+            report_text = export_comparison_report(results, X_test_info, y_test)
+        else:
+            # 如果没有 X_test，使用简化版报告
+            report_text = export_comparison_report_simple(results, y_test)
+        
         st.download_button(
             label="📥 下载文本报告",
             data=report_text,

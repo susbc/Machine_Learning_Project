@@ -39,12 +39,57 @@ def render_data_upload_section() -> Optional[pd.DataFrame]:
     uploaded_file = st.file_uploader(
         "上传数据文件 (支持 CSV、Excel 格式)",
         type=["csv", "xlsx", "xls"],
-        help="支持的文件格式：.csv, .xlsx, .xls"
+        help="支持的文件格式：.csv, .xlsx, .xls",
+        key="data_uploader"
     )
     
     if uploaded_file is not None:
-        st.success(f"文件已上传：{uploaded_file.name}")
-        return read_uploaded_file(uploaded_file)
+        st.success(f"✅ 文件已上传：{uploaded_file.name}")
+        
+        # 智能读取文件（带识别信息）
+        df, info = read_uploaded_file(uploaded_file, return_info=True)
+        
+        if df is not None:
+            # 显示识别信息
+            with st.expander("🔍 文件识别信息", expanded=True):
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("总行数", f"{info.get('rows', 0):,}")
+                
+                with col2:
+                    st.metric("总列数", f"{info.get('columns', 0)}")
+                
+                with col3:
+                    st.metric("分隔符", info.get('delimiter_name', 'N/A'))
+                
+                with col4:
+                    st.metric("编码", info.get('encoding', 'N/A'))
+                
+                # 显示推断的列名
+                inferred_names = info.get('inferred_names', {})
+                if inferred_names:
+                    st.subheader("🏷️ 推断的列名（业务含义）")
+                    
+                    # 创建对比表格
+                    compare_data = []
+                    for col in df.columns:
+                        inferred = inferred_names.get(col, col)
+                        if inferred != col:
+                            compare_data.append({
+                                '原列名': col,
+                                '推断含义': inferred,
+                                '数据类型': str(df[col].dtype),
+                                '示例值': str(df[col].iloc[0]) if len(df) > 0 else 'N/A'
+                            })
+                    
+                    if compare_data:
+                        compare_df = pd.DataFrame(compare_data)
+                        st.dataframe(compare_df, use_container_width=True, height=200)
+                    else:
+                        st.info("列名已经很规范，无需推断")
+        
+        return df
     
     return None
 

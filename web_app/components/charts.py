@@ -154,7 +154,10 @@ def render_outlier_boxplot(df: pd.DataFrame, columns: list) -> go.Figure:
                 y=df[col].dropna(),
                 name=col,
                 boxpoints='outliers',
-                outliermarker={'color': 'red', 'size': 6}
+                marker=dict(color='red', size=6),
+                line_color='blue',
+                fillcolor='lightblue',
+                opacity=0.7
             ))
     
     fig.update_layout(

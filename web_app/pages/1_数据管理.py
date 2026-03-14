@@ -17,14 +17,14 @@ import sys
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from utils.session_state import init_session_state
-from components.data_upload import (
+from web_app.utils.session_state import init_session_state
+from web_app.components.data_upload import (
     render_data_upload_section,
     render_data_preview,
     render_data_statistics,
     render_field_names,
 )
-from utils.file_handler import (
+from web_app.utils.file_handler import (
     calculate_data_statistics,
     create_download_button,
     create_excel_download_button,

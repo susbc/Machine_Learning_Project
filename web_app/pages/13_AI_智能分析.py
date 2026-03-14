@@ -105,7 +105,7 @@ def render_data_analysis_tab(analyzer):
                 st.success("✅ 推荐完成！")
     
     with col3:
-        if st.button("📄 生成报告", use_container_width=True):
+        if st.button("📄 生成报告", use_container_width=True, key="data_analysis_report"):
             if hasattr(st.session_state, 'data_analysis'):
                 filepath = analyzer.save_analysis(
                     'data_analysis',
@@ -187,7 +187,7 @@ def render_training_analysis_tab(analyzer):
                 st.success("✅ 分析完成！")
     
     with col2:
-        if st.button("📄 生成报告", use_container_width=True):
+        if st.button("📄 生成报告", use_container_width=True, key="training_analysis_report"):
             if hasattr(st.session_state, 'training_analysis'):
                 filepath = analyzer.save_analysis(
                     'training_analysis',

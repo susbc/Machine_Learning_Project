@@ -8,52 +8,316 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import io
+import csv
+import chardet
+
+
+# ============================================================================
+# 智能文件识别
+# ============================================================================
+
+def detect_delimiter(file_content: bytes, sample_lines: int = 10) -> str:
+    """
+    自动检测 CSV 文件的分隔符
+    
+    Args:
+        file_content: 文件内容（字节）
+        sample_lines: 采样行数
+    
+    Returns:
+        检测到的分隔符
+    """
+    # 常见分隔符
+    delimiters = [',', '\t', ';', '|', ' ']
+    
+    try:
+        # 解码文件内容
+        text = file_content.decode('utf-8-sig', errors='ignore')
+        lines = text.split('\n')[:sample_lines]
+        
+        if not lines:
+            return ','
+        
+        # 统计每种分隔符的计数
+        delimiter_counts = {}
+        for delim in delimiters:
+            counts = [line.count(delim) for line in lines if line.strip()]
+            if counts:
+                # 检查是否每行分隔符数量一致
+                if len(set(counts)) == 1 and counts[0] > 0:
+                    delimiter_counts[delim] = counts[0]
+                elif counts:
+                    # 取中位数
+                    median_count = np.median(counts)
+                    if median_count > 0:
+                        delimiter_counts[delim] = median_count
+        
+        # 返回计数最多的分隔符
+        if delimiter_counts:
+            return max(delimiter_counts, key=delimiter_counts.get)
+        
+        return ','
+    
+    except Exception as e:
+        st.warning(f"分隔符检测失败，使用默认分隔符 (,)：{str(e)}")
+        return ','
+
+
+def detect_encoding(file_content: bytes) -> str:
+    """
+    自动检测文件编码
+    
+    Args:
+        file_content: 文件内容（字节）
+    
+    Returns:
+        检测到的编码
+    """
+    try:
+        # 使用 chardet 检测编码
+        result = chardet.detect(file_content)
+        encoding = result.get('encoding', 'utf-8')
+        confidence = result.get('confidence', 0)
+        
+        # 如果置信度低，尝试常见编码
+        if confidence < 0.7:
+            common_encodings = ['utf-8', 'gbk', 'gb2312', 'utf-8-sig', 'latin1']
+            for enc in common_encodings:
+                try:
+                    file_content.decode(enc)
+                    return enc
+                except:
+                    continue
+        
+        return encoding if encoding else 'utf-8'
+    
+    except Exception as e:
+        st.warning(f"编码检测失败，使用 UTF-8：{str(e)}")
+        return 'utf-8'
+
+
+def infer_column_names(df: pd.DataFrame, sample_rows: int = 5) -> Dict[str, str]:
+    """
+    推断列名（业务含义）
+    
+    Args:
+        df: DataFrame
+        sample_rows: 采样行数
+    
+    Returns:
+        列名推断结果字典 {原列名：推断的业务名称}
+    """
+    inferred_names = {}
+    
+    # 常见列名映射（中文）
+    column_mappings = {
+        # 用户相关
+        'user': '用户',
+        'usr': '用户',
+        'customer': '客户',
+        'client': '客户',
+        'buyer': '买家',
+        
+        # 订单相关
+        'order': '订单',
+        'ord': '订单',
+        'purchase': '购买',
+        
+        # 金额相关
+        'amount': '金额',
+        'money': '金额',
+        'price': '价格',
+        'cost': '成本',
+        'fee': '费用',
+        'total': '总计',
+        'sum': '合计',
+        
+        # 时间相关
+        'time': '时间',
+        'date': '日期',
+        'create': '创建',
+        'update': '更新',
+        'start': '开始',
+        'end': '结束',
+        
+        # 状态相关
+        'status': '状态',
+        'state': '状态',
+        'flag': '标志',
+        
+        # 数量相关
+        'count': '数量',
+        'num': '数量',
+        'quantity': '数量',
+        'qty': '数量',
+        
+        # ID 相关
+        'id': '编号',
+        'code': '代码',
+        'no': '编号',
+        'number': '号码',
+        
+        # 其他
+        'name': '名称',
+        'type': '类型',
+        'category': '类别',
+        'level': '等级',
+        'score': '分数',
+        'rate': '比率',
+        'ratio': '比例',
+        'age': '年龄',
+        'sex': '性别',
+        'gender': '性别',
+        'phone': '电话',
+        'mobile': '手机',
+        'email': '邮箱',
+        'address': '地址',
+        'city': '城市',
+        'region': '地区',
+        'area': '区域',
+    }
+    
+    for col in df.columns:
+        col_lower = col.lower()
+        inferred_name = None
+        
+        # 尝试匹配映射
+        for key, value in column_mappings.items():
+            if key in col_lower:
+                inferred_name = value
+                break
+        
+        # 如果没有匹配，根据数据类型推断
+        if not inferred_name:
+            if 'id' in col_lower or 'no' in col_lower or col_lower.endswith('_id'):
+                inferred_name = '编号'
+            elif 'time' in col_lower or 'date' in col_lower:
+                inferred_name = '时间'
+            elif 'amount' in col_lower or 'price' in col_lower or 'money' in col_lower:
+                inferred_name = '金额'
+            elif 'name' in col_lower:
+                inferred_name = '名称'
+            elif 'type' in col_lower or 'category' in col_lower:
+                inferred_name = '类型'
+            elif 'status' in col_lower or 'state' in col_lower:
+                inferred_name = '状态'
+        
+        # 如果还是没推断出来，使用原列名
+        inferred_names[col] = inferred_name if inferred_name else col
+    
+    return inferred_names
+
+
+def smart_read_csv(file_content: bytes) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    智能读取 CSV 文件
+    
+    Args:
+        file_content: 文件内容（字节）
+    
+    Returns:
+        (DataFrame, 识别信息字典)
+    """
+    # 检测编码
+    encoding = detect_encoding(file_content)
+    
+    # 检测分隔符
+    delimiter = detect_delimiter(file_content)
+    
+    # 读取数据
+    try:
+        df = pd.read_csv(
+            io.BytesIO(file_content),
+            encoding=encoding,
+            delimiter=delimiter,
+            skipinitialspace=True,  # 跳过空格
+            on_bad_lines='skip' if pd.__version__ >= '1.3.0' else 'warn'
+        )
+        
+        # 推断列名
+        inferred_names = infer_column_names(df)
+        
+        # 识别信息
+        info = {
+            'encoding': encoding,
+            'delimiter': delimiter,
+            'delimiter_name': {
+                ',': '逗号',
+                '\t': '制表符',
+                ';': '分号',
+                '|': '竖线',
+                ' ': '空格'
+            }.get(delimiter, delimiter),
+            'inferred_names': inferred_names,
+            'rows': len(df),
+            'columns': len(df.columns)
+        }
+        
+        return df, info
+    
+    except Exception as e:
+        st.error(f"读取 CSV 失败：{str(e)}")
+        raise
 
 
 # ============================================================================
 # 文件读取
 # ============================================================================
 
-def read_uploaded_file(uploaded_file) -> Optional[pd.DataFrame]:
+def read_uploaded_file(uploaded_file, return_info: bool = False) -> Optional[pd.DataFrame]:
     """
     读取上传的文件，支持 CSV 和 Excel 格式
     
     Args:
         uploaded_file: Streamlit UploadedFile 对象
+        return_info: 是否返回识别信息
     
     Returns:
-        DataFrame 或 None
+        DataFrame 或 None（return_info=True 时返回元组）
     """
     if uploaded_file is None:
-        return None
+        return None if not return_info else (None, {})
     
     try:
         file_extension = Path(uploaded_file.name).suffix.lower()
+        uploaded_file.seek(0)
+        file_content = uploaded_file.read()
         
         if file_extension == '.csv':
-            # 尝试不同的编码
-            for encoding in ['utf-8', 'gbk', 'gb2312', 'latin1']:
-                try:
-                    df = pd.read_csv(uploaded_file, encoding=encoding)
-                    return df
-                except UnicodeDecodeError:
-                    continue
-            # 如果都失败，尝试自动检测
-            uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, encoding='utf-8-sig')
+            # 使用智能读取
+            df, info = smart_read_csv(file_content)
+            
+            if return_info:
+                return df, info
+            return df
         
         elif file_extension in ['.xlsx', '.xls']:
-            return pd.read_excel(uploaded_file, engine='openpyxl')
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
+            
+            # Excel 文件也推断列名
+            inferred_names = infer_column_names(df)
+            info = {
+                'encoding': 'N/A (Excel)',
+                'delimiter': 'N/A (Excel)',
+                'delimiter_name': 'N/A',
+                'inferred_names': inferred_names,
+                'rows': len(df),
+                'columns': len(df.columns)
+            }
+            
+            if return_info:
+                return df, info
+            return df
         
         else:
             st.error(f"不支持的文件格式：{file_extension}")
-            return None
+            return None if not return_info else (None, {})
     
     except Exception as e:
         st.error(f"读取文件失败：{str(e)}")
-        return None
+        return None if not return_info else (None, {})
 
 
 def read_file_from_path(file_path: str) -> Optional[pd.DataFrame]:
