@@ -21,7 +21,7 @@
       "created_at": "2026-03-09T16:36:28.121288",
       "last_used": "2026-03-09T16:36:28.121482",
       "use_count": 2,
-      "is_active": true
+      "is_active": false
     },
     "a02d6117": {
       "id": "a02d6117",
@@ -42,11 +42,11 @@
       ],
       "db_type": "postgresql",
       "created_at": "2026-03-09T16:36:28.121392",
-      "last_used": "2026-03-09T16:36:28.121393",
-      "use_count": 1,
-      "is_active": false
+      "last_used": "2026-03-09T21:59:19.715549",
+      "use_count": 2,
+      "is_active": true
     }
   },
-  "current_connection": "821be84e",
-  "last_updated": "2026-03-09T16:36:28.121488"
+  "current_connection": "a02d6117",
+  "last_updated": "2026-03-09T21:59:19.715856"
 }

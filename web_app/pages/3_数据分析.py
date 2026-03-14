@@ -18,8 +18,8 @@ from datetime import datetime
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from utils.session_state import init_session_state
-from components.charts import (
+from web_app.utils.session_state import init_session_state
+from web_app.components.charts import (
     render_distribution_chart,
     render_correlation_heatmap,
     render_missing_value_heatmap,
@@ -78,17 +78,22 @@ else:
                     key="dist_num"
                 )
                 if selected_num_col:
-                    fig = render_distribution_chart(df, selected_num_col)
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # 显示统计信息
-                    st.caption(f"""
-                    均值：{df[selected_num_col].mean():.4f} | 
-                    中位数：{df[selected_num_col].median():.4f} | 
-                    标准差：{df[selected_num_col].std():.4f} | 
-                    最小值：{df[selected_num_col].min():.4f} | 
-                    最大值：{df[selected_num_col].max():.4f}
-                    """)
+                    try:
+                        fig = render_distribution_chart(df, selected_num_col)
+                        st.plotly_chart(fig, use_container_width=True, key=f"plot_{selected_num_col}")
+                        
+                        # 显示统计信息（跳过 NaN）
+                        col_series = df[selected_num_col].dropna()
+                        if len(col_series) > 0:
+                            st.caption(f"""
+                            均值：{col_series.mean():.4f} | 
+                            中位数：{col_series.median():.4f} | 
+                            标准差：{col_series.std():.4f} | 
+                            最小值：{col_series.min():.4f} | 
+                            最大值：{col_series.max():.4f}
+                            """)
+                    except Exception as e:
+                        st.warning(f"⚠️ 无法绘制 {selected_num_col} 的分布图：{str(e)}")
             else:
                 st.info("无数值字段")
         
@@ -115,11 +120,11 @@ else:
         st.subheader("📊 所有数值字段分布")
         
         if numeric_cols:
-            show_all = st.checkbox("显示所有数值字段分布（可能较慢）")
+            show_all = st.checkbox("显示所有数值字段分布（可能较慢）", key="show_all_dist")
             if show_all:
                 for col in numeric_cols[:10]:  # 最多显示 10 个
                     fig = render_distribution_chart(df, col)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key=f"dist_{col}")
     
     with tab2:
         st.header("🔥 相关性分析")
@@ -129,7 +134,7 @@ else:
         fig = render_correlation_heatmap(df)
         
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="corr_heatmap")
             
             # 显示高相关性特征对
             st.subheader("📊 高相关性特征对")
@@ -164,7 +169,7 @@ else:
         st.markdown("---")
         st.subheader("🔥 缺失值分布热力图")
         fig = render_missing_value_heatmap(df)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="missing_heatmap")
     
     with tab3:
         st.header("⚠️ 异常值检测")
@@ -183,7 +188,7 @@ else:
             
             if selected_cols:
                 fig = render_outlier_boxplot(df, selected_cols)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"boxplot_{'_'.join(selected_cols[:3])}")
                 
                 # 异常值统计
                 st.subheader("📊 异常值统计")

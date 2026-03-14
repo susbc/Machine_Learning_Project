@@ -28,10 +28,10 @@ from web_app.utils.file_handler import (
 # ============================================================================
 
 FIELD_TYPE_OPTIONS = ["num", "str", "key", "label"]
-OUTLIER_OPTIONS = [np.nan, "3std", "5std", "(0,100)", "(0,1000)"]
-MISSING_VALUE_OPTIONS = [np.nan, "mean", "median", "mode", "0", "-1"]
-ECODE_TYPE_OPTIONS = [np.nan, "one-hot", "ordinal"]
-STANDARDIZE_TYPE_OPTIONS = [np.nan, "z-score", "min-max", "robust"]
+OUTLIER_OPTIONS = [None, "3std", "5std", "(0,100)", "(0,1000)"]
+MISSING_VALUE_OPTIONS = [None, "mean", "median", "mode", "0", "-1"]
+ECODE_TYPE_OPTIONS = [None, "one-hot", "ordinal"]
+STANDARDIZE_TYPE_OPTIONS = [None, "z-score", "min-max", "robust"]
 
 
 def render_config_editor(config_df: pd.DataFrame) -> pd.DataFrame:
@@ -46,9 +46,17 @@ def render_config_editor(config_df: pd.DataFrame) -> pd.DataFrame:
     """
     st.header("⚙️ 配置编辑")
     
+    # 清理 NaN 值，替换为 None（Streamlit data_editor 要求）
+    clean_config = config_df.copy()
+    for col in clean_config.columns:
+        if clean_config[col].dtype == object:
+            clean_config[col] = clean_config[col].where(
+                pd.notna(clean_config[col]), None
+            )
+    
     # 使用 data_editor 进行在线编辑
     edited_config = st.data_editor(
-        config_df,
+        clean_config,
         num_rows="dynamic",
         use_container_width=True,
         height=400,

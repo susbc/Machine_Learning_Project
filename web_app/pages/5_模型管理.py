@@ -18,8 +18,8 @@ from datetime import datetime
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from utils.session_state import init_session_state
-from components.charts import render_feature_importance
+from web_app.utils.session_state import init_session_state
+from web_app.components.charts import render_feature_importance
 
 # 初始化
 init_session_state()

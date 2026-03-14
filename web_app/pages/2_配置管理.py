@@ -18,15 +18,15 @@ import sys
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from utils.session_state import init_session_state
-from components.config_editor import (
+from web_app.utils.session_state import init_session_state
+from web_app.components.config_editor import (
     render_config_editor,
     render_config_actions,
     render_field_type_distribution,
     render_config_summary,
     auto_infer_config,
 )
-from utils.file_handler import (
+from web_app.utils.file_handler import (
     read_file_from_path,
     save_config_to_excel,
 )

@@ -23,13 +23,13 @@ sys.path.insert(0, str(project_root))
 # 导入现有模型代码
 sys.path.insert(0, str(project_root))
 
-from utils.session_state import init_session_state, add_training_log, get_training_logs
-from components.progress import (
+from web_app.utils.session_state import init_session_state, add_training_log, get_training_logs
+from web_app.components.progress import (
     render_training_progress,
     render_cv_results,
     render_training_summary,
 )
-from components.charts import (
+from web_app.components.charts import (
     render_roc_curve,
     render_precision_recall_curve,
     render_confusion_matrix,
@@ -335,15 +335,33 @@ if start_training:
         X = train_data[feature_cols]
         y = train_data[label_col]
         
+        # 如果 label 是字符串，转换为数值（0/1）
+        if y.dtype == 'object':
+            y = (y == y.mode()[0]).astype(int)
+            add_training_log(f"Label 已编码为数值")
+        
         add_training_log(f"特征矩阵：{X.shape}")
         add_training_log(f"标签向量：{y.shape}")
-        add_training_log(f"正样本比例：{y.mean():.2%}")
+        
+        # 计算正样本比例（确保 y 是数值型）
+        if y.dtype in ['int64', 'float64']:
+            add_training_log(f"正样本比例：{y.mean():.2%}")
+        else:
+            add_training_log(f"Label 唯一值：{y.unique()}")
         
         # 训练模型
-        add_training_log("\n开始训练 LightGBM 模型...")
         st.session_state.training_progress = 0.7
         
-        import lightgbm as lgb
+        # 尝试使用 LightGBM，如果不可用则使用 RandomForest
+        try:
+            import lightgbm as lgb
+            use_lgbm = True
+            add_training_log("\n使用 LightGBM 模型训练...")
+        except:
+            use_lgbm = False
+            add_training_log("\n⚠️ LightGBM 不可用，使用 RandomForest 模型...")
+            add_training_log("💡 提示：安装 LightGBM 需要系统库支持，或使用 RandomForest")
+        
         from sklearn.model_selection import train_test_split, RandomizedSearchCV
         from sklearn.metrics import (
             roc_auc_score, precision_recall_curve,
@@ -351,53 +369,88 @@ if start_training:
         )
         
         # 划分训练测试集
+        # 只有当 y 是数值型且唯一值>1 时才能使用 stratify
+        stratify_col = y if y.dtype in ['int64', 'float64'] and y.nunique() > 1 else None
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
+            X, y, test_size=test_size, random_state=random_state, stratify=stratify_col
         )
         
         add_training_log(f"训练集：{X_train.shape[0]:,} 样本")
         add_training_log(f"测试集：{X_test.shape[0]:,} 样本")
         
         # 定义模型
-        model = lgb.LGBMClassifier(
-            objective='binary',
-            metric='auc',
-            verbose=-1,
-            random_state=random_state,
-            n_jobs=-1,
-            **st.session_state.model_params
-        )
-        
-        if use_grid_search and n_iter > 1:
-            add_training_log(f"\n执行随机网格搜索 (n_iter={n_iter}, cv={cv_folds})...")
-            
-            param_grid = {
-                'n_estimators': [100, 200, 300],
-                'learning_rate': [0.01, 0.05, 0.1],
-                'max_depth': [5, 6, 7, 8],
-                'num_leaves': [30, 50, 70],
-                'min_child_samples': [10, 20, 30],
-            }
-            
-            random_search = RandomizedSearchCV(
-                estimator=model,
-                param_distributions=param_grid,
-                n_iter=n_iter,
-                cv=cv_folds,
-                scoring='roc_auc',
+        if use_lgbm:
+            model = lgb.LGBMClassifier(
+                objective='binary',
+                metric='auc',
+                verbose=-1,
+                random_state=random_state,
                 n_jobs=-1,
-                verbose=0,
-                random_state=random_state
+                **st.session_state.model_params
             )
             
-            random_search.fit(X_train, y_train)
-            
-            model = random_search.best_estimator_
-            add_training_log(f"最佳参数：{random_search.best_params_}")
-            st.session_state.cv_results = random_search.cv_results_
+            if use_grid_search and n_iter > 1:
+                add_training_log(f"\n执行随机网格搜索 (n_iter={n_iter}, cv={cv_folds})...")
+                
+                param_grid = {
+                    'n_estimators': [100, 200, 300],
+                    'learning_rate': [0.01, 0.05, 0.1],
+                    'max_depth': [5, 6, 7, 8],
+                    'num_leaves': [30, 50, 70],
+                    'min_child_samples': [10, 20, 30],
+                }
+                
+                random_search = RandomizedSearchCV(
+                    estimator=model,
+                    param_distributions=param_grid,
+                    n_iter=n_iter,
+                    cv=cv_folds,
+                    scoring='roc_auc',
+                    n_jobs=-1,
+                    verbose=0,
+                    random_state=random_state
+                )
+                
+                random_search.fit(X_train, y_train)
+                
+                model = random_search.best_estimator_
+                add_training_log(f"最佳参数：{random_search.best_params_}")
+                st.session_state.cv_results = random_search.cv_results_
+            else:
+                add_training_log("\n使用固定参数训练...")
+                model.fit(X_train, y_train)
         else:
-            add_training_log("\n使用固定参数训练...")
-            model.fit(X_train, y_train)
+            # 使用 RandomForest
+            from sklearn.ensemble import RandomForestClassifier
+            model = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=10,
+                random_state=random_state,
+                n_jobs=-1
+            )
+            
+            if use_grid_search and n_iter > 1:
+                add_training_log(f"\n执行随机网格搜索 (n_iter={n_iter}, cv={cv_folds})...")
+                
+                random_search = RandomizedSearchCV(
+                    estimator=model,
+                    param_distributions=param_grid,
+                    n_iter=n_iter,
+                    cv=cv_folds,
+                    scoring='roc_auc',
+                    n_jobs=-1,
+                    verbose=0,
+                    random_state=random_state
+                )
+                
+                random_search.fit(X_train, y_train)
+                
+                model = random_search.best_estimator_
+                add_training_log(f"最佳参数：{random_search.best_params_}")
+                st.session_state.cv_results = random_search.cv_results_
+            else:
+                add_training_log("\n使用固定参数训练...")
+                model.fit(X_train, y_train)
         
         st.session_state.training_progress = 0.85
         add_training_log("\n模型训练完成！")
@@ -432,6 +485,7 @@ if start_training:
             'best_f1': best_f1,
             'feature_names': feature_cols,
             'feature_importances': model.feature_importances_,
+            'X_test': X_test,  # 保存测试集特征
             'y_test': y_test.values,
             'y_pred_proba': y_pred_proba,
             'y_pred': y_pred,

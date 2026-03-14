@@ -18,12 +18,13 @@ from pathlib import Path
 import sys
 import joblib
 from datetime import datetime
+from sklearn.preprocessing import LabelEncoder
 
 # 添加项目路径
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from utils.session_state import init_session_state
+from web_app.utils.session_state import init_session_state
 from model_code.auto_train import AutoTrainer
 
 # 初始化
@@ -244,6 +245,10 @@ else:
 X = df[feature_cols]
 y = df[label_col]
 
+# 编码标签列为数字 (用于计算正样本比例)
+le = LabelEncoder()
+y_encoded = le.fit_transform(y)
+
 # 显示数据信息
 col1, col2, col3 = st.columns(3)
 
@@ -254,7 +259,7 @@ with col2:
     st.metric("特征数", len(feature_cols))
 
 with col3:
-    st.metric("正样本比例", f"{y.mean():.2%}")
+    st.metric("正样本比例", f"{y_encoded.mean():.2%}")
 
 # 训练按钮
 col1, col2, col3 = st.columns([2, 1, 1])

@@ -20,9 +20,9 @@ from datetime import datetime
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from utils.session_state import init_session_state
-from utils.file_handler import read_uploaded_file, create_download_button
-from components.progress import render_prediction_progress
+from web_app.utils.session_state import init_session_state
+from web_app.utils.file_handler import read_uploaded_file, create_download_button
+from web_app.components.progress import render_prediction_progress
 
 # 初始化
 init_session_state()
@@ -251,13 +251,15 @@ if start_prediction:
         render_prediction_progress(0.85, "模型预测...")
         
         # 准备特征
+        # 先获取 key_col（在 try 块外使用）
+        key_col = config_df[config_df['field_type'] == 'key']['field_name'].values
+        
         if feature_names:
             # 确保特征列顺序一致
             X_pred = pred_data[feature_names]
         else:
             # 移除 label 和 key 列
             label_col = config_df[config_df['field_type'] == 'label']['field_name'].values
-            key_col = config_df[config_df['field_type'] == 'key']['field_name'].values
             
             exclude_cols = []
             if len(label_col) > 0:
@@ -275,7 +277,7 @@ if start_prediction:
         
         y_pred = (y_pred_proba >= threshold).astype(int)
         
-        render_prediction_progress(1.0, "预测完成！")
+        render_prediction_progress(1.0, "模型预测完成！")
         
         # 保存预测结果
         results_df = pd.DataFrame({
@@ -377,7 +379,7 @@ if st.session_state.get('prediction_completed'):
         )
     
     with col2:
-        from utils.file_handler import create_excel_download_button
+        from web_app.utils.file_handler import create_excel_download_button
         create_excel_download_button(
             results_df,
             f"predict_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
