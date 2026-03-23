@@ -382,6 +382,72 @@ class DataRetrievalAgent:
 ### 目标
 将静态 `IntelligentAnalyzer` 升级为动态 Agent 工作流，确保 LLM 输出安全
 
+### 核心设计理念
+
+**问题**: LLM 直接操作数据容易产生幻觉和内存溢出。
+
+**解决方案**: Python 负责"出苦力"算统计量，LLM 只负责"做决策"并输出结构化 JSON。
+
+### 四步走流水线 (Pipeline)
+
+```
+原始 DataFrame
+    ↓
+┌─────────────────────────────────────┐
+│ Step 1: 前置压缩 (Python 统计学诊断)  │
+│ - 计算每列的统计特征                 │
+│ - 输出 eda_summary.json (几 KB)      │
+│ - 包含：null_rate/skewness/unique 等 │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ Step 2: EDA_Agent (数据科学家角色)    │
+│ - 阅读统计特征画像                   │
+│ - 输出 EDA 诊断报告                   │
+│ - 圈出重点风险 (缺失/偏态/穿越)       │
+│ - 生成下游上下文                      │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ Step 3: Feature_Agent (特征工程师)    │
+│ - 阅读统计画像 + EDA 报告             │
+│ - 输出特征处理策略 JSON 数组           │
+│ - 严格动作枚举 (drop/fillna/encode)  │
+│ - 禁止生成 Python 代码                │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ Step 4: Python 算子工厂 (安全执行)    │
+│ - 解析 JSON 策略                      │
+│ - 映射到 Pandas/Sklearn 操作          │
+│ - 列名不存在自动跳过 (防幻觉)         │
+│ - 输出处理后的 DataFrame              │
+└─────────────────────────────────────┘
+    ↓
+处理后的 DataFrame ( ready for modeling)
+```
+
+### 核心优势
+
+| 特性 | 传统方案 | 本方案 | 提升 |
+|------|----------|--------|------|
+| **LLM 直接操作数据** | 是 (高风险) | 否 (只输出 JSON) | ✅ 零幻觉 |
+| **内存溢出风险** | 高 (喂原始数据) | 低 (统计压缩) | ✅ 安全 |
+| **可追溯性** | 低 (黑盒) | 高 (JSON 可渲染) | ✅ 白盒化 |
+| **错误处理** | 崩溃 | 优雅降级 | ✅ 鲁棒 |
+| **前端展示** | 困难 | 直接渲染表格 | ✅ 友好 |
+
+---
+
+### 新增组件
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| **EDAAgent** | `core/feature_engineering/eda_agent.py` | 探索性数据分析智能体 |
+| **FeatureAgent** | `core/feature_engineering/feature_agent.py` | 特征工程智能体 |
+| **FeatureEngineeringExecutor** | `core/feature_engineering/feature_agent.py` | 特征工程执行器 |
+| **compute_eda_summary** | `core/feature_engineering/eda_agent.py` | Python 统计压缩函数 |
+
 ### 核心改造：JSON 约束协议
 
 #### LLM 输出格式规范
