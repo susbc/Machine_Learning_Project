@@ -948,6 +948,87 @@ class AutoMLAgent:
 | **用户体验** | 卡顿/等待 | 流畅/实时 | **显著提升** |
 | **实现复杂度** | 简单 | 中等 | - |
 
+---
+
+### 测试验证方案
+
+#### 独立测试脚本
+
+**文件**: `test_optuna_sse.py`
+
+**核心机制**:
+1. ✅ CORS 跨域处理 (允许 Vue3 访问)
+2. ✅ 线程安全数据投递 (`asyncio.run_coroutine_threadsafe`)
+3. ✅ 模拟训练任务 (`mock_objective` + `time.sleep`)
+4. ✅ curl + 前端双验证
+
+**运行方法**:
+```bash
+# 启动服务
+python test_optuna_sse.py
+
+# curl 测试
+curl -N http://127.0.0.1:8000/api/optimize/stream?total_trials=10
+
+# 前端联调
+EventSource('http://127.0.0.1:8000/api/optimize/stream?total_trials=50')
+```
+
+**预期输出**:
+```
+🚀 开始执行 Optuna 寻优，总计 50 次 Trial...
+✅ 寻优完成！
+   最佳参数：{'learning_rate': 0.08, 'max_depth': 8, ...}
+   最佳分数：0.9234
+```
+
+#### curl 测试示例
+
+```bash
+$ curl -N http://127.0.0.1:8000/api/optimize/stream?total_trials=5
+
+# 输出 (每 0.2 秒一条):
+data: {"status": "RUNNING", "trial_number": 0, "value": 0.7234, "best_value": 0.7234, "progress": 20}
+
+data: {"status": "RUNNING", "trial_number": 1, "value": 0.7891, "best_value": 0.7891, "progress": 40}
+
+data: {"status": "RUNNING", "trial_number": 2, "value": 0.8123, "best_value": 0.8123, "progress": 60}
+
+data: {"status": "RUNNING", "trial_number": 3, "value": 0.7654, "best_value": 0.8123, "progress": 80}
+
+data: {"status": "RUNNING", "trial_number": 4, "value": 0.8567, "best_value": 0.8567, "progress": 100}
+
+data: {"status": "DONE", "progress": 100}
+```
+
+#### 前端联调示例
+
+```javascript
+const eventSource = new EventSource(
+  'http://127.0.0.1:8000/api/optimize/stream?total_trials=50'
+)
+
+eventSource.onmessage = (event) => {
+  const data = JSON.parse(event.data)
+  
+  if (data.status === 'DONE') {
+    console.log("✅ 调参结束！")
+    eventSource.close()
+  } else {
+    console.log(
+      `📊 进度：${data.progress}%, ` +
+      `当前 AUC: ${data.value?.toFixed(4)}, ` +
+      `最佳 AUC: ${data.best_value?.toFixed(4)}`
+    )
+  }
+}
+
+eventSource.onerror = (error) => {
+  console.error("❌ SSE 连接报错:", error)
+  eventSource.close()
+}
+```
+
 ### 可视化效果
 
 #### ECharts 动态图表
