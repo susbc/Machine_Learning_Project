@@ -716,6 +716,49 @@ class SafetyValidator:
 
 #### 问题：数据穿越 (Data Leakage)
 
+#### RESTful API 状态管理
+
+**问题**: RESTful API 是无状态的，但 ML 工作流是有状态的 (提取数据 → 生成策略 → 训练模型)。
+
+**解决方案**: `task_id` + 文件系统工作区
+
+```
+output/
+└── task_abc123/
+    ├── raw_data.parquet        # 步骤 1: 原始数据
+    ├── eda_summary.json        # 步骤 1: 统计画像
+    ├── query.sql               # 步骤 1: 执行的 SQL
+    └── feature_strategy.json   # 步骤 2: 特征策略
+
+saved/
+└── model_task_abc123.pkl       # 步骤 3: 模型 + 执行器打包
+```
+
+**API 工作流**:
+```
+POST /step1_retrieve_data
+  → 返回 task_id
+  → 保存 raw_data.parquet, eda_summary.json
+
+POST /step2_generate_features
+  → 传入 task_id
+  → 读取 eda_summary.json
+  → 保存 feature_strategy.json
+
+GET /step3_train_stream
+  → 传入 task_id
+  → 加载 raw_data.parquet + feature_strategy.json
+  → fit_transform + AutoML 寻优
+  → SSE 实时推送进度
+  → 保存 model_task_id.pkl
+
+POST /predict
+  → 传入 model_version (task_id)
+  → 加载 model_task_id.pkl
+  → transform (NOT fit_transform!)
+  → 预测返回
+```
+
 **业余做法**:
 ```python
 # ❌ 验证集用到了全量数据的中位数
