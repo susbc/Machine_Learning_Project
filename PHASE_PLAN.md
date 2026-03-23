@@ -620,6 +620,107 @@ class SafetyValidator:
 ### 目标
 打破单一 LightGBM 局限，实现智能模型选择 + 自动寻优
 
+### 核心设计理念
+
+**问题**: 传统网格搜索盲目穷举，效率低；人工选模型依赖经验。
+
+**解决方案**: Agent 智能推荐模型 + Optuna 贝叶斯优化 (TPE 算法)。
+
+### 四步走流水线 (Pipeline)
+
+```
+清洗后的 DataFrame (X_train, y_train)
+    ↓
+┌─────────────────────────────────────┐
+│ Step 1: 提取数据特征                 │
+│ - 样本量/特征数/类别占比             │
+│ - 不平衡比例 (正负样本)              │
+│ - 输出：data_features.json           │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ Step 2: AutoML_Agent (智能决策)      │
+│ - 推荐候选模型 (2-3 个)               │
+│ - 生成 Optuna 搜索空间配置 (JSON)     │
+│ - 说明推荐理由 (rationale)           │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ Step 3: AutoMLOptimizer (贝叶斯寻优) │
+│ - 动态解析 JSON 配置                  │
+│ - 工厂模式实例化模型                 │
+│ - StratifiedKFold 交叉验证           │
+│ - TPE 算法自动收敛                   │
+└─────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────┐
+│ Step 4: 结果固化与可视化             │
+│ - 保存最佳模型 (joblib)              │
+│ - Optuna 可视化图表 (Plotly)         │
+│ - 特征重要性排序                     │
+└─────────────────────────────────────┘
+    ↓
+最佳模型 + 超参数配置 (ready for deployment)
+```
+
+### 模型推荐决策规则
+
+| 数据特征 | 推荐模型 | 理由 |
+|----------|----------|------|
+| **样本量 > 50 万** | LightGBM | 训练速度快 |
+| **类别特征占比 > 30%** | CatBoost | 原生支持类别特征 |
+| **正负样本比例 < 1:10** | CatBoost/LightGBM | 支持类别权重 |
+| **特征数 > 100** | LightGBM + 正则化 | 高维特征处理 |
+| **小样本 (< 1 万)** | Random Forest | 鲁棒性强 |
+| **需要可解释性** | Logistic Regression | 线性可解释 |
+| **Kaggle 竞赛** | XGBoost + LightGBM | 稳定性好 |
+
+### 搜索空间配置示例
+
+```json
+{
+ "task_type": "binary_classification",
+ "optimization_metric": "roc_auc",
+ "candidate_models": ["lightgbm", "catboost"],
+ "n_trials": 30,
+ "rationale": "样本极度不平衡且存在较多类别特征。CatBoost 原生支持类别特征和不平衡数据处理，LightGBM 训练速度快适合做基线对比。",
+ "search_spaces": {
+  "lightgbm": {
+   "learning_rate": {"type": "loguniform", "low": 0.01, "high": 0.2},
+   "num_leaves": {"type": "int", "low": 15, "high": 127},
+   "scale_pos_weight": {"type": "categorical", "choices": [10, 50, 99]}
+  },
+  "catboost": {
+   "depth": {"type": "int", "low": 4, "high": 10},
+   "l2_leaf_reg": {"type": "int", "low": 1, "high": 10},
+   "auto_class_weights": {"type": "categorical", "choices": ["Balanced", "SqrtBalanced"]}
+  }
+ }
+}
+```
+
+### 核心优势
+
+| 特性 | 传统方案 | 本方案 | 提升 |
+|------|----------|--------|------|
+| **模型选择** | 人工经验 | Agent 智能推荐 | ✅ 更科学 |
+| **超参寻优** | 网格搜索 (穷举) | Optuna TPE (贝叶斯) | ✅ 10 倍效率 |
+| **搜索空间** | 硬编码 | Agent 动态生成 | ✅ 更灵活 |
+| **交叉验证** | ❌ 缺失 | StratifiedKFold 5 折 | ✅ 更稳定 |
+| **不平衡处理** | 手动配置 | 自动类别权重 | ✅ 更智能 |
+| **可视化** | 手动绘图 | Optuna 原生 Plotly | ✅ 更专业 |
+
+---
+
+### 新增组件
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| **AutoMLAgent** | `core/automl/automl_agent.py` | AutoML 智能体 |
+| **AutoMLOptimizer** | `core/automl/automl_optimizer.py` | Optuna 优化器 |
+| **extract_data_features** | `core/automl/automl_agent.py` | 数据特征提取 |
+| **plot_optimization_results** | `core/automl/automl_optimizer.py` | 优化结果可视化 |
+
 ### 新增组件
 
 | 组件 | 文件 | 说明 |
