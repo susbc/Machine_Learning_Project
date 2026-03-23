@@ -1,7 +1,14 @@
 """
-NL2SQL 引擎 - 自然语言转 SQL
+NL2SQL 引擎 - 自然语言转 SQL (Agentic Workflow)
 
 将用户自然语言查询转换为 SQL 语句并执行，返回 DataFrame。
+
+核心特性:
+- 强制 JSON 输出 + 思维链 (Chain of Thought)
+- is_executable 安全阻断机制
+- 方言适配 (MySQL/Hive/PostgreSQL 等)
+- XML 标签结构化上下文
+- 防幻觉严格约束
 
 功能:
 - 自然语言解析
@@ -48,91 +55,179 @@ class NL2SQLEngine:
         self.llm_provider = llm_provider
         self.database_config = database_config or {}
         
-        # SQL 生成提示词模板
+        # DataRetrieval_Agent 系统提示词模板 (强制 JSON 输出 + 思维链)
         self.prompt_template = """
-你是一个 SQL 专家。根据给定的数据库 Schema，将用户的自然语言查询转换为 SQL 语句。
+# Role
+你是一个顶级的数据库架构师和高级数据开发工程师（DataRetrieval_Agent）。你的核心任务是根据用户提供的业务需求，结合图数据库检索出的"局部表结构与血缘关联"，编写出精准、高效、无语法的 {dialect} SQL 查询语句，用于为机器学习提取训练数据集。
 
-## 数据库 Schema
+# Context (来自图谱检索的知识)
+以下是经过精准召回的数据库表结构、字段说明以及表之间的关联关系（Graph Schema）：
+<graph_schema>
+{graph_schema}
+</graph_schema>
 
-{schema_context}
+# User Request
+用户的业务需求是：
+<user_query>
+{user_query}
+</user_query>
 
-## 查询要求
+# ⚠️ Strict Rules (严格约束)
+为了保证生产环境的稳定，你必须绝对遵守以下规则，任何违背将导致系统崩溃：
+1. 【禁止幻觉】你只能使用 `<graph_schema>` 中明确提供的表名和字段名。严禁凭空捏造、猜测任何未提及的字段或表！
+2. 【严格关联】如果需要多表查询，必须严格按照 `<graph_schema>` 中提供的关联关系（如 A.id = B.id）进行 JOIN 操作。
+3. 【方言适配】你编写的 SQL 必须完全符合 {dialect} 数据库的语法规范（例如日期处理、字符串拼接等函数的差异）。
+4. 【精准选取】禁止使用 `SELECT *`。请根据用户需求，明确 SELECT 出所需的特征字段和标签字段，并使用 AS 赋予易读的英文别名（如果原字段名不够清晰）。
+5. 【安全阻断】如果用户的需求无法用 `<graph_schema>` 中的表和字段实现（即缺失关键数据），你必须拒绝生成 SQL，并在 thought_process 中说明缺失了什么。
 
-1. 只输出 SQL 语句，不要解释
-2. 使用 {dialect} 语法
-3. 确保表名和字段名正确
-4. 使用合适的 JOIN 连接相关表
-5. 如果查询模糊，选择最合理的解释
-
-## 用户查询
-
-{natural_language}
-
-## SQL
+# Output Format (输出格式)
+你必须且只能输出一个合法的 JSON 对象，不要包含任何 Markdown 标记（如 ```json），不要有任何额外的寒暄。JSON 结构如下：
+{{
+ "thought_process": "简要描述你的思考过程：你选择了哪几张表？你使用了什么字段做 JOIN？你如何处理了用户的过滤条件？如果数据不足以满足需求，请在这里说明缺失了什么概念。",
+ "is_executable": true, // 布尔值。如果数据充足可以生成完整 SQL 则为 true；如果缺失关键表/字段无法生成则为 false。
+ "sql": "具体的 SQL 语句。如果 is_executable 为 false，此字段请返回 null。"
+}}
 """
     
     def query(self, natural_language: str, 
               dialect: str = "mysql",
               top_k_tables: int = 5,
-              execute: bool = True) -> Tuple[str, Optional[pd.DataFrame]]:
+              execute: bool = True) -> Dict[str, Any]:
         """
-        自然语言查询
+        自然语言查询 (Agentic Workflow)
         
         Args:
             natural_language: 用户自然语言查询
-            dialect: SQL 方言 ("mysql", "postgresql", "sqlite")
+            dialect: SQL 方言 ("mysql", "postgresql", "hive", "oracle")
             top_k_tables: 检索 Top-K 个相关表
             execute: 是否执行 SQL
             
         Returns:
-            Tuple[str, Optional[pd.DataFrame]]: (SQL 语句，执行结果)
+            Dict[str, Any]: {
+                "thought_process": str,
+                "is_executable": bool,
+                "sql": str or None,
+                "dataframe": pd.DataFrame or None,
+                "error": str or None
+            }
         """
         logger.info(f"NL2SQL 查询：{natural_language}")
+        result = {
+            "thought_process": "",
+            "is_executable": False,
+            "sql": None,
+            "dataframe": None,
+            "error": None
+        }
         
-        # 1. 生成查询 Embedding
-        query_embedding = self.embedder.embed_text(natural_language)
+        try:
+            # 1. 生成查询 Embedding
+            query_embedding = self.embedder.embed_text(natural_language)
+            
+            # 2. FAISS 检索相关字段
+            faiss_results = self.faiss.search(query_embedding, top_k=top_k_tables * 3)
+            related_tables = set()
+            for metadata, _ in faiss_results:
+                if "table_name" in metadata:
+                    related_tables.add(metadata["table_name"])
+            
+            logger.debug(f"检索到相关表：{related_tables}")
+            
+            # 3. Neo4j 检索表关系和 Schema
+            graph_schema = self._build_graph_schema(list(related_tables))
+            
+            # 4. 构建提示词
+            prompt = self.prompt_template.format(
+                dialect=dialect,
+                graph_schema=graph_schema,
+                user_query=natural_language
+            )
+            
+            # 5. 调用 LLM 生成 SQL (JSON 格式)
+            llm_response = self._call_llm(prompt)
+            
+            # 6. 解析 JSON 输出
+            agent_result = self._parse_json_response(llm_response)
+            
+            if not agent_result:
+                result["error"] = "LLM 返回格式错误，无法解析 JSON"
+                return result
+            
+            result["thought_process"] = agent_result.get("thought_process", "")
+            result["is_executable"] = agent_result.get("is_executable", False)
+            result["sql"] = agent_result.get("sql")
+            
+            logger.info(f"Agent 思考：{result['thought_process']}")
+            logger.info(f"SQL 可执行：{result['is_executable']}")
+            
+            # 7. 安全阻断检查
+            if not result["is_executable"]:
+                logger.warning(f"数据不足，无法生成 SQL: {result['thought_process']}")
+                result["error"] = f"数据不足：{result['thought_process']}"
+                return result
+            
+            # 8. SQLFluff 验证
+            if result["sql"]:
+                is_valid = self._validate_sql(result["sql"], dialect)
+                if not is_valid:
+                    logger.warning("SQL 验证失败，尝试修复...")
+                    result["sql"] = self._fix_sql(result["sql"], dialect)
+                
+                # 9. 执行 SQL (可选)
+                if execute:
+                    result["dataframe"] = self._execute_sql(result["sql"])
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"NL2SQL 查询失败：{e}")
+            result["error"] = str(e)
+            return result
+    
+    def _build_graph_schema(self, table_names: List[str]) -> str:
+        """
+        构建图谱 Schema 文本 (用于 Prompt 上下文)
         
-        # 2. FAISS 检索相关字段
-        faiss_results = self.faiss.search(query_embedding, top_k=top_k_tables * 3)
-        related_tables = set()
-        for metadata, _ in faiss_results:
-            if "table_name" in metadata:
-                related_tables.add(metadata["table_name"])
+        Args:
+            table_names: 表名列表
+            
+        Returns:
+            str: 结构化的 Schema 文本
+        """
+        lines = []
         
-        logger.debug(f"检索到相关表：{related_tables}")
+        for table_name in table_names:
+            # 获取表信息
+            table_info = self.neo4j.get_table_node(table_name)
+            columns = self.neo4j.get_columns(table_name)
+            foreign_keys = self.neo4j.get_foreign_keys(table_name)
+            
+            if not table_info:
+                continue
+            
+            # 表头
+            lines.append(f"- 表名：{table_name}")
+            if table_info.get("description"):
+                lines.append(f"  描述：{table_info['description']}")
+            
+            # 字段列表
+            if columns:
+                col_str = ", ".join([f"{c['name']} ({c.get('type', 'UNKNOWN')})" for c in columns])
+                lines.append(f"  字段：{col_str}")
+            
+            # 外键关系
+            if foreign_keys:
+                lines.append("  关联关系 (JOINs):")
+                for fk in foreign_keys:
+                    lines.append(f"    {fk['from_table']}.{fk['from_column']} = {fk['to_table']}.{fk['to_column']}")
+            
+            lines.append("")
         
-        # 3. Neo4j 检索表关系和 Schema
-        schema_context = self._build_schema_context(list(related_tables))
-        
-        # 4. 构建提示词
-        prompt = self.prompt_template.format(
-            schema_context=schema_context,
-            dialect=dialect,
-            natural_language=natural_language
-        )
-        
-        # 5. 调用 LLM 生成 SQL
-        sql = self._call_llm(prompt)
-        sql = self._extract_sql(sql)
-        
-        logger.info(f"生成的 SQL: {sql}")
-        
-        # 6. SQLFluff 验证
-        is_valid = self._validate_sql(sql, dialect)
-        if not is_valid:
-            logger.warning("SQL 验证失败，尝试修复...")
-            sql = self._fix_sql(sql, dialect)
-        
-        # 7. 执行 SQL (可选)
-        result_df = None
-        if execute and sql:
-            result_df = self._execute_sql(sql)
-        
-        return sql, result_df
+        return "\n".join(lines)
     
     def _build_schema_context(self, table_names: List[str]) -> str:
         """
-        构建 Schema 上下文
+        构建 Schema 上下文 (兼容旧接口)
         
         Args:
             table_names: 表名列表
@@ -140,20 +235,43 @@ class NL2SQLEngine:
         Returns:
             str: Schema 文本描述
         """
-        lines = []
+        return self._build_graph_schema(table_names)
+    
+    def _parse_json_response(self, response: str) -> Optional[Dict]:
+        """
+        解析 LLM 的 JSON 响应
         
-        for table_name in table_names:
-            # 获取表 Schema 文本
-            schema_text = self.neo4j.get_table_schema_text(table_name)
-            lines.append(schema_text)
+        Args:
+            response: LLM 返回的文本
             
-            # 获取相关表
-            related = self.neo4j.get_related_tables(table_name, depth=1)
-            if related:
-                related_names = [r["name"] for r in related]
-                lines.append(f"\n相关表：{', '.join(related_names)}")
+        Returns:
+            Optional[Dict]: 解析后的字典，失败返回 None
+        """
+        import json
+        import re
         
-        return "\n\n".join(lines)
+        try:
+            # 清理 Markdown 标记
+            text = response.strip()
+            text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"^```\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s*```$", "", text, flags=re.IGNORECASE)
+            
+            # 尝试直接解析
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                # 尝试提取 JSON 块
+                match = re.search(r'\{.*\}', text, re.DOTALL)
+                if match:
+                    return json.loads(match.group())
+                else:
+                    logger.error(f"无法从响应中提取 JSON: {response[:200]}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"JSON 解析失败：{e}")
+            return None
     
     def _call_llm(self, prompt: str) -> str:
         """

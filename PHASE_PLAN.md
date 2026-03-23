@@ -197,6 +197,81 @@ DataRetrievalAgent 接收
 | **业务概念映射** | 将"高优订单"等黑话映射到 `status=1` | 理解业务术语 |
 | **样例值辅助** | Column 节点包含 `sample_value` | 降低大模型写错概率 |
 
+---
+
+### DataRetrieval_Agent Prompt 设计
+
+#### 系统提示词模板
+
+```text
+# Role
+你是一个顶级的数据库架构师和高级数据开发工程师（DataRetrieval_Agent）。你的核心任务是根据用户提供的业务需求，结合图数据库检索出的"局部表结构与血缘关联"，编写出精准、高效、无语法的 {dialect} SQL 查询语句。
+
+# Context (来自图谱检索的知识)
+<graph_schema>
+{graph_schema}
+</graph_schema>
+
+# User Request
+<user_query>
+{user_query}
+</user_query>
+
+# ⚠️ Strict Rules (严格约束)
+1. 【禁止幻觉】只能使用 `<graph_schema>` 中明确提供的表名和字段名！
+2. 【严格关联】多表查询必须严格按照 `<graph_schema>` 中的关联关系进行 JOIN！
+3. 【方言适配】SQL 必须符合 {dialect} 语法规范！
+4. 【精准选取】禁止 `SELECT *`，明确 SELECT 所需字段！
+5. 【安全阻断】如果需求无法实现，拒绝生成 SQL 并说明缺失！
+
+# Output Format (强制 JSON)
+{{
+ "thought_process": "思考过程：选择了哪几张表？使用了什么 JOIN？如何处理过滤条件？",
+ "is_executable": true,
+ "sql": "SELECT ..."
+}}
+```
+
+#### JSON 输出字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| **thought_process** | string | 思维链 (CoT)：解释表选择、JOIN 策略、过滤处理 |
+| **is_executable** | boolean | 安全阻断标志：数据不足时为 false |
+| **sql** | string or null | 可执行 SQL，is_executable=false 时为 null |
+
+#### 后端解析示例
+
+```python
+# 调用 NL2SQL 引擎
+result = nl2sql.query("查询北京地区司机上周的完单金额")
+
+# 检查结果
+if not result["is_executable"]:
+    print(f"数据不足：{result['thought_process']}")
+else:
+    print(f"Agent 思考：{result['thought_process']}")
+    print(f"执行 SQL: {result['sql']}")
+    df = result["dataframe"]  # 已执行的 DataFrame 结果
+```
+
+#### 安全阻断机制
+
+**场景**: 用户问"帮我查一下上周的退款率"，但图谱只召回了"交易表"，没有"退款表"。
+
+**传统 LLM**: 自作聪明捏造 `is_refund` 字段 → 执行报错 ❌
+
+**本方案**:
+```json
+{
+ "thought_process": "用户需要退款率数据，但图谱中只包含交易表 (orders)，未找到退款相关表 (refund/refund_rate 等字段)。缺失关键数据概念。",
+ "is_executable": false,
+ "sql": null
+}
+```
+
+**后端处理**: 优雅返回用户："抱歉，目前数据字典中未找到退款相关表，请补充数据源" ✅
+
 ### Neo4j Schema 设计 (Graph RAG 数据地图)
 
 #### 节点设计 (Nodes)
