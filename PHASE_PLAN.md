@@ -109,6 +109,48 @@
 
 ### 数据流转 (混合检索增强：Vector + Graph RAG)
 
+#### Hive 软外键推断算法 (Heuristic Scoring)
+
+**问题**: 企业数仓 (Hive/MaxCompute) 为追求性能，不建立物理外键，表与表之间变成"孤岛"。
+
+**解决方案**: 启发式规则打分 + 业务黑白名单 + LLM 语义校验
+
+```
+Step 1: 降噪过滤 (Noise Reduction)
+├─ 剔除审计字段：create_time, update_time, status, remark...
+├─ 剔除低基数类型：boolean, tinyint, float, double
+└─ 保留候选字段：必须包含 _id/_no/_code/_sn 后缀
+
+Step 2: 特征匹配与打分 (Matching & Scoring)
+├─ 策略 A (0.9 分): 字段名完全一致 + 数据类型完全一致
+│   例：orders.driver_id (BIGINT) ↔ driver_info.driver_id (BIGINT)
+├─ 策略 B (0.8 分): 主键包含匹配
+│   例：driver_info.id ↔ orders.driver_id
+└─ 策略 C (0.6 分): 血缘后缀匹配
+    例：orders.city_code ↔ dim_city.city_code
+
+Step 3: 阈值截断 (Thresholding)
+└─ 只保留 score >= 0.7 的关系 → 注册为 POSSIBLE_JOIN 边
+
+Step 4: LLM 语义校验 (可选，Agentic 增强)
+├─ 提取相连表的"表注释"
+├─ Prompt: "表 A【司机轨迹宽表】和表 B【营销活动维表】都包含 route_id，
+│          在实际数据分析中发生 JOIN 关联的可能性高吗？回复 True/False"
+└─ 拒绝假阳性，减少误报
+```
+
+**类型兼容规则**:
+| 类型组 | 成员 | 兼容性 |
+|--------|------|--------|
+| **数值型** | INT, BIGINT, FLOAT, DOUBLE, DECIMAL | 组内兼容 |
+| **字符串** | STRING, VARCHAR, CHAR, TEXT | 组内兼容 |
+| **时间型** | TIMESTAMP, DATETIME, DATE | 组内兼容 |
+| **跨组** | 数值↔字符串 | 低分兼容 (0.5) |
+
+---
+
+### 数据流转 (混合检索增强：Vector + Graph RAG)
+
 ```
 用户自然语言查询
     ↓

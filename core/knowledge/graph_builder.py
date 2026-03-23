@@ -537,70 +537,341 @@ class HiveMetadataExtractor(BaseMetadataExtractor):
     
     def extract_foreign_keys(self) -> List[Dict]:
         """
-        Hive 没有物理外键，使用同名字段推断算法
+        Hive 没有物理外键，使用启发式规则打分算法推断软外键
         
-        推断规则:
-        1. 两张表都有相同名称的字段
-        2. 字段类型相同或兼容
-        3. 字段名包含常见关联键 (id, user_id, order_id 等)
+        算法策略:
+        1. 降噪过滤：剔除审计字段 (create_time, status 等)
+        2. 特征匹配与打分：
+           - 策略 A (0.9 分): 字段名完全一致 + 数据类型完全一致
+           - 策略 B (0.8 分): 主键包含匹配 (driver_info.id ↔ orders.driver_id)
+           - 策略 C (0.6 分): 血缘后缀匹配 (_id, _no, _code)
+        3. 阈值截断：score >= 0.7 才注册为 POSSIBLE_JOIN
+        4. LLM 语义校验 (可选): 二次校验减少假阳性
         """
         columns = self.extract_columns()
         
-        # 按字段名分组
-        from collections import defaultdict
-        col_groups = defaultdict(list)
+        # 使用软外键推断引擎
+        inferencer = HiveSoftForeignKeyInferencer(
+            use_llm_validation=False  # 可选 LLM 校验
+        )
         
-        for col in columns:
-            col_name = col["column_name"].lower()
-            # 只考虑可能是外键的字段
-            if any(kw in col_name for kw in ["_id", "id_", "code", "_no", "no_"]):
-                col_groups[col_name].append(col)
+        inferred_fks = inferencer.infer_foreign_keys(columns)
         
-        # 生成推断的外键关系
+        # 转换为标准格式
+        result = []
+        for fk in inferred_fks:
+            result.append({
+                "table": fk["source_table"],
+                "column": fk["source_col"],
+                "ref_table": fk["target_table"],
+                "ref_column": fk["target_col"],
+                "constraint_name": f"soft_{fk['source_col']}_{fk['confidence']:.1f}",
+                "join_type": "N:1",
+                "inferred": True,
+                "confidence": fk["confidence"],
+                "relation_type": "POSSIBLE_JOIN"  # 区分物理外键
+            })
+        
+        logger.info(f"Hive 推断出 {len(inferred_fks)} 个潜在外键关系 (置信度 >= 0.7)")
+        return result
+
+
+# ==================== Hive 软外键推断引擎 ====================
+
+class HiveSoftForeignKeyInferencer:
+    """
+    Hive 软外键推断引擎
+    
+    采用启发式规则打分 + 业务黑白名单算法，模拟资深数据工程师"找表"的直觉
+    
+    核心策略:
+    1. 降噪过滤 (Noise Reduction)
+    2. 特征匹配与打分 (Matching & Scoring)
+    3. 阈值截断 (Thresholding)
+    4. LLM 语义校验 (可选，Agentic 增强)
+    """
+    
+    def __init__(self, 
+                 confidence_threshold: float = 0.7,
+                 use_llm_validation: bool = False,
+                 llm_provider=None):
+        """
+        初始化推断引擎
+        
+        Args:
+            confidence_threshold: 置信度阈值 (默认 0.7)
+            use_llm_validation: 是否使用 LLM 二次校验
+            llm_provider: LLM 提供者 (用于语义校验)
+        """
+        self.confidence_threshold = confidence_threshold
+        self.use_llm_validation = use_llm_validation
+        self.llm_provider = llm_provider
+        
+        # 业务黑名单：绝对不可能作为关联键的通用字段
+        self.stop_words = {
+            'id', 'create_time', 'update_time', 'dt', 'partition_date',
+            'is_deleted', 'status', 'remark', 'type', 'version', 'creator',
+            'modifier', 'modified_time', 'created_time', 'ext_info', 'json',
+            'comment', 'memo', 'note', 'flag', 'is_valid', 'deleted'
+        }
+        
+        # 业务主键特征词 (高权重)
+        self.key_suffixes = ('_id', '_no', '_code', '_sn', '_key', '_uuid')
+        
+        # 典型业务实体名 (用于策略 B 匹配)
+        self.entity_keywords = (
+            'user', 'customer', 'member', 'account',
+            'order', 'trade', 'deal',
+            'product', 'item', 'goods',
+            'driver', 'passenger', 'merchant',
+            'city', 'region', 'area', 'district',
+            'time', 'date', 'month', 'year'
+        )
+        
+        # 类型兼容组
+        self.numeric_types = {'int', 'integer', 'bigint', 'smallint', 'tinyint', 'float', 'double', 'decimal', 'number'}
+        self.string_types = {'string', 'varchar', 'char', 'text', 'nvarchar'}
+        self.datetime_types = {'timestamp', 'datetime', 'date', 'time'}
+    
+    def _is_valid_candidate(self, col_name: str, data_type: str) -> bool:
+        """
+        判断一个字段是否有资格作为外键候选人
+        
+        过滤规则:
+        1. 剔除黑名单字段 (create_time, status 等)
+        2. 必须包含特定后缀 (_id, _no, _code 等)
+        3. 剔除不适合 JOIN 的类型 (float, boolean, tinyint)
+        """
+        col_name_lower = col_name.lower()
+        data_type_lower = data_type.lower()
+        
+        # 1. 剔除黑名单
+        if col_name_lower in self.stop_words:
+            return False
+        
+        # 2. 必须包含特定的后缀，或者本身就是典型的业务实体名
+        has_key_suffix = col_name_lower.endswith(self.key_suffixes)
+        is_entity_name = any(kw in col_name_lower for kw in self.entity_keywords)
+        
+        if not (has_key_suffix or is_entity_name):
+            return False
+        
+        # 3. 剔除浮点型、布尔型等不适合做 JOIN 的类型
+        if data_type_lower in ('float', 'double', 'boolean', 'tinyint', 'blob', 'json'):
+            return False
+        
+        return True
+    
+    def _get_type_group(self, data_type: str) -> str:
+        """获取类型所属组 (用于兼容性判断)"""
+        data_type_lower = data_type.lower()
+        
+        if data_type_lower in self.numeric_types:
+            return 'numeric'
+        elif data_type_lower in self.string_types:
+            return 'string'
+        elif data_type_lower in self.datetime_types:
+            return 'datetime'
+        else:
+            return 'unknown'
+    
+    def _types_compatible(self, type1: str, type2: str) -> tuple:
+        """
+        检查两个类型是否兼容
+        
+        Returns:
+            (is_compatible: bool, score: float)
+        """
+        type1_lower = type1.lower()
+        type2_lower = type2.lower()
+        
+        # 完全相同：高分
+        if type1_lower == type2_lower:
+            return True, 1.0
+        
+        # 同组兼容：中分
+        group1 = self._get_type_group(type1)
+        group2 = self._get_type_group(type2)
+        
+        if group1 == group2 and group1 != 'unknown':
+            return True, 0.7
+        
+        # 跨组兼容 (如 string 和 bigint): 低分
+        if group1 in ('numeric', 'string') and group2 in ('numeric', 'string'):
+            return True, 0.5
+        
+        return False, 0.0
+    
+    def _calculate_score(self, col1: Dict, col2: Dict) -> float:
+        """
+        计算两个字段的匹配得分
+        
+        策略:
+        - 策略 A (0.9 分): 字段名完全一致 + 数据类型完全一致
+        - 策略 B (0.8 分): 主键包含匹配 (driver_info.id ↔ orders.driver_id)
+        - 策略 C (0.6 分): 血缘后缀匹配 (_id, _no, _code)
+        """
+        score = 0.0
+        
+        # 字段名完全一致
+        if col1["column_name"].lower() == col2["column_name"].lower():
+            # 策略 A: 名称一致 + 类型一致
+            type_compatible, type_score = self._types_compatible(
+                col1["data_type"],
+                col2["data_type"]
+            )
+            
+            if type_score >= 1.0:
+                score = 0.9  # 完全匹配
+            elif type_score >= 0.7:
+                score = 0.8  # 同组兼容
+            else:
+                score = 0.6  # 跨组兼容
+        else:
+            # 策略 B: 主键包含匹配
+            # 例如：driver_info.id ↔ orders.driver_id
+            table1 = col1["table_name"].lower()
+            table2 = col2["table_name"].lower()
+            col1_name = col1["column_name"].lower()
+            col2_name = col2["column_name"].lower()
+            
+            # 检查是否一个表名包含另一个字段名
+            # 例如：table1="driver_info", col2_name="driver_id"
+            table1_prefix = table1.replace("_", "").replace("info", "").replace("dim", "").replace("ods", "")
+            table2_prefix = table2.replace("_", "").replace("info", "").replace("dim", "").replace("ods", "")
+            
+            if (table1_prefix in col2_name.replace("_", "") or 
+                table2_prefix in col1_name.replace("_", "")):
+                score = 0.75  # 策略 B
+            
+            # 策略 C: 都有典型后缀
+            elif (col1_name.endswith(self.key_suffixes) and 
+                  col2_name.endswith(self.key_suffixes)):
+                score = 0.6
+        
+        return score
+    
+    def infer_foreign_keys(self, columns_data: List[Dict]) -> List[Dict]:
+        """
+        基于全量字段信息，计算软外键
+        
+        Args:
+            columns_data: List of dict
+                [{'table_name': 'x', 'column_name': 'y', 'data_type': 'z', ...}, ...]
+        
+        Returns:
+            List[Dict]: 推断的外键关系列表
+        """
+        import itertools
+        import logging
+        
+        logger = logging.getLogger(__name__)
+        logger.info("开始执行 Hive 软外键推断算法...")
+        
+        # 1. 过滤并构建倒排索引 (Inverted Index)
+        # 结构：{ 'driver_id': [('table_a', 'bigint', col_dict), ('table_b', 'bigint', col_dict)], ... }
+        inverted_index = {}
+        
+        for col in columns_data:
+            t_name = col["table_name"]
+            c_name = col["column_name"].lower()
+            d_type = col["data_type"].lower()
+            
+            if self._is_valid_candidate(c_name, d_type):
+                if c_name not in inverted_index:
+                    inverted_index[c_name] = []
+                inverted_index[c_name].append((t_name, d_type, col))
+        
         inferred_fks = []
+        processed_pairs = set()  # 避免重复处理
         
-        for col_name, cols in col_groups.items():
-            if len(cols) > 1:
-                # 同一字段名出现在多张表中
-                for i, col1 in enumerate(cols):
-                    for col2 in cols[i+1:]:
-                        # 避免自关联
-                        if col1["table_name"] != col2["table_name"]:
-                            # 类型兼容检查
-                            if self._types_compatible(col1["data_type"], col2["data_type"]):
-                                inferred_fks.append({
-                                    "table": col1["table_name"],
-                                    "column": col1["column_name"],
-                                    "ref_table": col2["table_name"],
-                                    "ref_column": col2["column_name"],
-                                    "constraint_name": f"inferred_{col_name}",
-                                    "join_type": "N:1",
-                                    "inferred": True  # 标记为推断的外键
-                                })
+        # 2. 基于倒排索引计算笛卡尔积组合，生成关联边
+        for col_name, tables in inverted_index.items():
+            # 如果这个字段只在一张表里出现，无法关联
+            if len(tables) < 2:
+                continue
+            
+            # 在拥有同名字段的表之间，两两组合建立联系
+            for (t1, type1, col1), (t2, type2, col2) in itertools.combinations(tables, 2):
+                # 避免自关联
+                if t1 == t2:
+                    continue
+                
+                # 避免重复处理 (t1.col ↔ t2.col 和 t2.col ↔ t1.col 是同一个关系)
+                pair_key = tuple(sorted([f"{t1}.{col_name}", f"{t2}.{col_name}"]))
+                if pair_key in processed_pairs:
+                    continue
+                processed_pairs.add(pair_key)
+                
+                # 计算得分
+                score = self._calculate_score(col1, col2)
+                
+                # 3. 阈值截断
+                if score >= self.confidence_threshold:
+                    # 4. LLM 语义校验 (可选)
+                    if self.use_llm_validation and self.llm_provider:
+                        is_valid = self._llm_validate(col1, col2, score)
+                        if not is_valid:
+                            logger.debug(f"LLM 校验拒绝：{t1}.{col_name} ↔ {t2}.{col_name}")
+                            continue
+                    
+                    inferred_fks.append({
+                        "source_table": t1,
+                        "source_col": col1["column_name"],
+                        "target_table": t2,
+                        "target_col": col2["column_name"],
+                        "confidence": score,
+                        "relation_type": "POSSIBLE_JOIN",
+                        "inference_strategy": "heuristic_scoring"
+                    })
         
-        logger.info(f"Hive 推断出 {len(inferred_fks)} 个潜在外键关系")
+        logger.info(f"推断完成，共发现 {len(inferred_fks)} 条潜在关联边 (置信度 >= {self.confidence_threshold})")
         return inferred_fks
     
-    def _types_compatible(self, type1: str, type2: str) -> bool:
-        """检查两个类型是否兼容"""
-        type1 = type1.upper()
-        type2 = type2.upper()
+    def _llm_validate(self, col1: Dict, col2: Dict, score: float) -> bool:
+        """
+        使用 LLM 进行语义校验 (Agentic 增强)
         
-        # 完全相同
-        if type1 == type2:
+        提取相连字段所在表的"表注释"，让 LLM 判断关联可能性
+        
+        Returns:
+            bool: 是否通过校验
+        """
+        if not self.llm_provider:
             return True
         
-        # 数值类型兼容
-        numeric_types = {"INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "FLOAT", "DOUBLE", "DECIMAL"}
-        if type1 in numeric_types and type2 in numeric_types:
-            return True
-        
-        # 字符串类型兼容
-        string_types = {"STRING", "VARCHAR", "CHAR", "TEXT"}
-        if type1 in string_types and type2 in string_types:
-            return True
-        
-        return False
+        try:
+            # 构建校验 Prompt
+            prompt = f"""
+你是一个数据仓库专家。请基于业务常识判断以下两个表是否可能发生 JOIN 关联：
+
+表 A【{col1.get("table_name", "未知")}】
+- 字段：{col1.get("column_name", "未知")}
+- 类型：{col1.get("data_type", "未知")}
+- 注释：{col1.get("comment", "无")}
+
+表 B【{col2.get("table_name", "未知")}】
+- 字段：{col2.get("column_name", "未知")}
+- 类型：{col2.get("data_type", "未知")}
+- 注释：{col2.get("comment", "无")}
+
+当前推断置信度：{score:.2f}
+
+问题：这两个表在实际数据分析中，发生 JOIN 关联的可能性高吗？
+请只回复 True 或 False，不要解释。
+"""
+            
+            # 调用 LLM
+            response = self.llm_provider.generate(prompt)
+            response_text = response.strip().lower()
+            
+            # 解析响应
+            is_valid = response_text.startswith('true') or response_text.startswith('是')
+            return is_valid
+            
+        except Exception as e:
+            logger.error(f"LLM 校验失败：{e}")
+            return True  # 失败时默认通过，避免误杀
 
 
 # ==================== 提取器工厂 ====================
