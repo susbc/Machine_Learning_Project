@@ -712,6 +712,73 @@ class SafetyValidator:
 
 ---
 
+### LangChain + Pydantic 防崩架构
+
+#### 问题：LLM 格式幻觉
+
+**传统方案痛点**:
+- LLM 输出前加"好的，这是 JSON："
+- 自创不存在的 action (如 `fillna_magic`)
+- JSON 格式错误导致 `json.loads()` 失败
+- 需要正则清理 + 多次重试
+
+**本方案解决**:
+1. ✅ **Pydantic 严格校验** - 枚举约束防止幻觉
+2. ✅ **LangChain `.with_structured_output()`** - 强制合规 JSON
+3. ✅ **Retry 自愈机制** - 自动重试处理偶发错误
+4. ✅ **对象化流转** - 返回 Pydantic 对象而非字符串
+
+#### Pydantic Schema 示例
+
+```python
+class FeatureAction(BaseModel):
+    column: str
+    action: Literal[
+        "drop", "fillna_mean", "fillna_median",
+        "log_transform", "target_encode", "onehot_encode",
+        ...  # 严格枚举，LLM 自创方法立即报错！
+    ]
+    reason: str
+```
+
+#### LangChain 编排器
+
+```python
+from core.llm import AgentOrchestrator
+
+orchestrator = AgentOrchestrator(
+    api_key="sk-xxx",
+    model_name="qwen-plus",
+    temperature=0.0  # 保证工程输出确定性
+)
+
+# 返回严格 Pydantic 对象 (非字符串!)
+strategy = orchestrator.run_feature_agent(
+    eda_summary_json,
+    eda_report_text,
+    max_retries=3  # 自动重试
+)
+
+# 直接使用对象属性
+for action in strategy.actions:
+    print(f"{action.column} -> {action.action}")
+```
+
+#### 防崩测试
+
+```bash
+# 运行测试
+python test_agent_crashproof.py
+
+# 输出:
+# ✅ Pydantic 拦截测试：非法动作被拦截！
+# ✅ Feature_Agent：成功生成合规策略
+# ✅ DataRetrieval_Agent：SQL 生成完成
+# ✅ AutoML_Agent：配置生成完成
+```
+
+---
+
 ### 新增组件
 
 | 组件 | 文件 | 说明 |
