@@ -95,11 +95,17 @@
 
 | 组件 | 文件 | 说明 |
 |------|------|------|
-| **Neo4jClient** | `core/knowledge/neo4j_client.py` | 图数据库连接 |
+| **Neo4jClient** | `core/knowledge/neo4j_client.py` | 图数据库连接 (支持 Database/BusinessConcept) |
 | **FAISSClient** | `core/knowledge/faiss_client.py` | 向量数据库连接 |
 | **SchemaEmbedder** | `core/knowledge/schema_embedder.py` | 表/字段 Embedding |
 | **NL2SQLEngine** | `core/knowledge/nl2sql_engine.py` | NL2SQL 引擎 |
 | **DataRetrievalAgent** | `agents/data_retrieval_agent.py` | 数据检索智能体 |
+| **KnowledgeGraphBuilder** | `core/knowledge/graph_builder.py` | **知识图谱构建引擎 (多数据源)** |
+| **BaseMetadataExtractor** | `core/knowledge/graph_builder.py` | 元数据提取器接口 |
+| **MySQLExtractor** | `core/knowledge/graph_builder.py` | MySQL 提取器 |
+| **OracleExtractor** | `core/knowledge/graph_builder.py` | Oracle 提取器 |
+| **HiveExtractor** | `core/knowledge/graph_builder.py` | Hive 提取器 (推断外键) |
+| **ExtractorFactory** | `core/knowledge/graph_builder.py` | 提取器工厂 |
 
 ### 数据流转 (混合检索增强：Vector + Graph RAG)
 
