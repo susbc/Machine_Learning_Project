@@ -712,6 +712,83 @@ class SafetyValidator:
 
 ---
 
+### 有状态特征工程 (MLOps 核心)
+
+#### 问题：数据穿越 (Data Leakage)
+
+**业余做法**:
+```python
+# ❌ 验证集用到了全量数据的中位数
+df['age'].fillna(df['age'].median())
+
+# ❌ 线上推理时算不出中位数，直接报错
+# ❌ Target Encoding 导致数据泄露
+```
+
+**企业级做法**:
+```python
+# ✅ 训练阶段：计算并保存中位数
+executor.fit_transform(df_train, strategy)
+# state['fill_values']['age'] = 35.2
+
+# ✅ 推理阶段：使用保存的中位数
+executor.transform(df_test)
+# 直接用 35.2 填充，不重新计算
+```
+
+#### FeatureEngineeringExecutor 核心设计
+
+| 方法 | 阶段 | 行为 |
+|------|------|------|
+| **fit_transform** | 训练 | 计算统计量 + 保存状态 + 转换数据 |
+| **transform** | 推理 | 只应用保存的状态 + 转换数据 |
+
+**保存的状态**:
+- `fill_values`: 均值/中位数/众数
+- `encoders`: TargetEncoder/OneHotEncoder
+- `scalers`: StandardScaler/MinMaxScaler
+- `feature_columns`: 特征列顺序
+
+#### 完整使用示例
+
+```python
+from model_code.feature_executor import FeatureEngineeringExecutor
+
+# 1. 调用 LLM 获取策略
+strategy = orchestrator.run_feature_agent(eda_summary, eda_report)
+
+# 2. 实例化执行器
+executor = FeatureEngineeringExecutor(target_col="is_fraud")
+
+# 3. 训练阶段：fit_transform
+X_train_clean = executor.fit_transform(df_train, strategy, y_train)
+
+# 4. 推理阶段：transform (不重新计算统计量)
+X_test_clean = executor.transform(df_test)
+
+# 5. 持久化：与模型一起保存
+joblib.dump({
+    "model": best_model,
+    "feature_executor": executor
+}, "saved/automl_pipeline_v1.pkl")
+
+# 6. 线上预测：加载并 transform
+artifact = joblib.load("saved/automl_pipeline_v1.pkl")
+executor = artifact["feature_executor"]
+df_infer_clean = executor.transform(df_infer)
+prediction = artifact["model"].predict(df_infer_clean)
+```
+
+#### 防崩三层设计
+
+| 层级 | 机制 | 效果 |
+|------|------|------|
+| **第一层** | Pydantic 枚举约束 | LLM 无法自创动作 |
+| **第二层** | 防御性编程 (列不存在跳过) | 永不报错崩溃 |
+| **第三层** | fit_transform/transform分离 | 杜绝数据穿越 |
+
+---
+
 ### LangChain + Pydantic 防崩架构
 
 #### 问题：LLM 格式幻觉
