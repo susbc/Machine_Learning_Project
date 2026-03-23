@@ -101,7 +101,7 @@
 | **NL2SQLEngine** | `core/knowledge/nl2sql_engine.py` | NL2SQL 引擎 |
 | **DataRetrievalAgent** | `agents/data_retrieval_agent.py` | 数据检索智能体 |
 
-### 数据流转
+### 数据流转 (混合检索增强：Vector + Graph RAG)
 
 ```
 用户自然语言查询
@@ -109,30 +109,105 @@
 DataRetrievalAgent 接收
     ↓
 ┌───────────────────────────────────────┐
-│ 1. 解析用户意图 (LLM)                  │
-│ 2. 检索 Neo4j 获取表关系               │
-│ 3. 检索 FAISS 获取相关字段             │
-│ 4. 构建提示词 + 调用 LLM 生成 SQL       │
-│ 5. SQL 验证 (SQLFluff)                │
-│ 6. 执行 SQL 返回 DataFrame             │
+│ Step 1: 向量召回 (Vector Search)       │
+│ - 将查询向量化                          │
+│ - 与 Table/Column 的 embedding 比对    │
+│ - 召回 Top-3 核心节点                   │
+└───────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────┐
+│ Step 2: 图谱游走 (Graph Traversal)     │
+│ - 基于召回节点向外扩展 1-2 跳            │
+│ - 查找 FOREIGN_KEY_TO 关系             │
+│ - 查找 MAPS_TO 业务概念映射            │
+└───────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────┐
+│ Step 3: 上下文组装 (Context Assembly)  │
+│ 生成大模型易懂的 Schema 文本：           │
+│ "表 orders (订单表): order_fee, driver_id │
+│  表 driver_info (司机表): driver_id, city │
+│  关联：orders.driver_id = driver_info.driver_id" │
+└───────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────┐
+│ Step 4: LLM 生成 SQL                    │
+│ - 构建提示词 + 调用 LLM                 │
+│ - SQL 验证 (SQLFluff)                  │
+│ - 执行 SQL 返回 DataFrame               │
 └───────────────────────────────────────┘
     ↓
 返回 Pandas DataFrame
 ```
 
-### Neo4j Schema 设计
+### 检索策略优势
+
+| 策略 | 说明 | 效果 |
+|------|------|------|
+| **先向量召回** | 快速定位核心表/字段 | 减少 90% 无关节点 |
+| **再图谱游走** | 发现隐含关联关系 | 自动推导 JOIN 条件 |
+| **业务概念映射** | 将"高优订单"等黑话映射到 `status=1` | 理解业务术语 |
+| **样例值辅助** | Column 节点包含 `sample_value` | 降低大模型写错概率 |
+
+### Neo4j Schema 设计 (Graph RAG 数据地图)
+
+#### 节点设计 (Nodes)
+
+| 节点标签 | 业务含义 | 核心属性 | 说明 |
+|----------|----------|----------|------|
+| **`Database`** | 数据库/业务域 | `name`, `description` | 划定搜索范围 (如"风控域") |
+| **`Table`** | 数据表 | `table_name`, `description`, `row_count`, `update_freq`, `embedding` | 挂载整表向量 |
+| **`Column`** | 表字段 | `column_name`, `data_type`, `description`, `is_primary`, `sample_value`, `embedding` | 核心实体，包含样例值 |
+| **`BusinessConcept`** | 业务概念/标签 | `name`, `description` | 映射业务黑话到物理字段 |
+
+#### 关系设计 (Relationships)
+
+| 关系类型 | 起点 → 终点 | 边属性 | 作用 |
+|----------|-------------|--------|------|
+| **`CONTAINS`** | Database → Table | - | 表所属物理库 |
+| **`HAS_COLUMN`** | Table → Column | - | 表拥有哪些字段 |
+| **`FOREIGN_KEY_TO`** | Column → Column | `join_type`, `weight` | **关键**！自动推导 JOIN 条件 |
+| **`MAPS_TO`** | BusinessConcept → Column | `rule` | 业务口径映射 (如"高优订单"→`status=1`) |
+| **`UPSTREAM_OF`** | Table → Table | `etl_job` | 表血缘分析 (可选) |
+
+#### Cypher 示例
 
 ```cypher
-// 表节点
-(:Table {name: "bank_customer", description: "银行客户信息表"})
+// 创建业务域
+CREATE (db:Database {name: "banking", description: "银行业务域"})
 
-// 字段节点
-(:Column {name: "customer_id", type: "VARCHAR", description: "客户 ID"})
+// 创建表节点
+CREATE (t:Table {
+    table_name: "bank_customer",
+    description: "客户信息表",
+    row_count: 100000,
+    update_freq: "daily"
+})
 
-// 关系
-(:Table)-[:HAS_COLUMN]->(:Column)
-(:Table)-[:FOREIGN_KEY {ref_table: "xxx"}]->(:Table)
-(:Column)-[:REFERENCES]->(:Column)
+// 创建字段节点 (含样例值)
+CREATE (c:Column {
+    column_name: "customer_level",
+    data_type: "VARCHAR",
+    description: "客户等级",
+    is_primary: false,
+    sample_value: "VIP, 普通，黑金"
+})
+
+// 创建业务概念 (映射业务黑话)
+CREATE (bc:BusinessConcept {
+    name: "高价值客户",
+    description: "月均存款>50 万或年交易>100 笔"
+})
+
+// 建立关系
+CREATE (db)-[:CONTAINS]->(t)
+CREATE (t)-[:HAS_COLUMN]->(c)
+CREATE (bc)-[:MAPS_TO {rule: "customer_level IN ['VIP', '黑金']"}]->(c)
+
+// 外键关系 (用于自动 JOIN)
+MATCH (c1:Column {table: "orders", name: "driver_id"})
+MATCH (c2:Column {table: "driver_info", name: "driver_id"})
+CREATE (c1)-[:FOREIGN_KEY_TO {join_type: "1:N"}]->(c2)
 ```
 
 ### FAISS 索引设计
