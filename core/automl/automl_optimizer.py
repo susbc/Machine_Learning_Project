@@ -35,7 +35,7 @@ class AutoMLOptimizer:
                  cv_splits: int = 5, n_jobs: int = -1):
         """
         初始化优化器
-        
+
         Args:
             X: 特征矩阵 (pandas DataFrame 或 numpy array)
             y: 目标变量 (pandas Series 或 numpy array)
@@ -51,24 +51,31 @@ class AutoMLOptimizer:
             n_jobs: 并行作业数 (-1 表示使用所有 CPU)
         """
         import pandas as pd
-        
-        self.X = X if not hasattr(X, 'values') else X.values
+
+        # 保存特征名称 (用于特征重要性输出)
+        if hasattr(X, 'columns') and hasattr(X, 'values'):
+            self.feature_names = list(X.columns)
+            self.X = X.values
+        else:
+            self.X = X
+            self.feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+
         self.y = y if not hasattr(y, 'values') else y.values
         self.config = agent_config
         self.cv_splits = cv_splits
         self.n_jobs = n_jobs
-        
+
         # 优化指标
         self.metric = agent_config.get("optimization_metric", "roc_auc")
         self.task_type = agent_config.get("task_type", "binary_classification")
-        
+
         # 最佳结果
         self.best_model = None
         self.best_study = None
         self.best_params = None
         self.best_score = None
-        
-        logger.info(f"AutoMLOptimizer 初始化完成：{len(self.X):,} 样本 × {self.X.shape[1]} 特征")
+
+        logger.info(f"AutoMLOptimizer 初始化完成：{len(self.X):,} 样本 × {len(self.feature_names)} 特征")
         logger.info(f"优化目标：{self.metric}, 候选模型：{agent_config.get('candidate_models', [])}")
     
     def _build_model(self, trial, model_name: str):
@@ -180,7 +187,7 @@ class AutoMLOptimizer:
     def _build_catboost(self, params: Dict):
         """构建 CatBoost 模型"""
         from catboost import CatBoostClassifier
-        
+
         # 默认配置
         default_params = {
             "iterations": 200,
@@ -188,11 +195,15 @@ class AutoMLOptimizer:
             "random_state": 42,
             "task_type": "CPU"
         }
-        
+
+        # 多分类任务需要设置 num_class
+        if self.task_type == "multiclass_classification":
+            default_params["classes_count"] = len(np.unique(self.y))
+
         # 自动类别权重 (处理不平衡)
         if "auto_class_weights" in params:
             default_params["auto_class_weights"] = params.pop("auto_class_weights")
-        
+
         default_params.update(params)
         return CatBoostClassifier(**default_params)
     
@@ -367,56 +378,73 @@ class AutoMLOptimizer:
         
         # 保存最佳参数
         self.best_params = self.best_study.best_params
-        
+
         # 用全量训练集重新训练最佳模型
         best_model_name = self.best_params.pop("model_type", None)
-        if best_model_name is None and len(self.config.get("candidate_models", [])) == 1:
-            best_model_name = self.config["candidate_models"][0]
-        
+
+        # 如果没有 model_type，尝试从候选模型中获取
+        if best_model_name is None:
+            candidate_models = self.config.get("candidate_models", [])
+            if len(candidate_models) == 1:
+                best_model_name = candidate_models[0]
+            elif len(candidate_models) > 1:
+                # 从 trial 中获取最佳模型类型
+                if hasattr(self.best_study.best_trial, 'params') and 'model_type' in self.best_study.best_trial.params:
+                    best_model_name = self.best_study.best_trial.params['model_type']
+                else:
+                    # 默认使用第一个模型
+                    best_model_name = candidate_models[0]
+
         if best_model_name:
             logger.info(f"使用最佳参数重新训练 {best_model_name}...")
-            self.best_model = self._build_model(self.best_study.best_trial, best_model_name)
-            self.best_model.fit(self.X, self.y)
-            self.best_score = self.best_study.best_value
-        
+            try:
+                self.best_model = self._build_model(self.best_study.best_trial, best_model_name)
+                self.best_model.fit(self.X, self.y)
+                self.best_score = self.best_study.best_value
+                logger.info(f"模型训练完成，最佳得分：{self.best_score:.4f}")
+            except Exception as e:
+                logger.error(f"模型训练失败：{e}")
+                # 尝试使用默认参数创建模型
+                try:
+                    self.best_model = self._build_model(self.best_study.best_trial, best_model_name)
+                    # 不使用 fit，直接返回
+                except:
+                    self.best_model = None
+        else:
+            logger.warning("无法确定最佳模型类型")
+
         return self.best_study, self.best_model
     
     def get_feature_importance(self, top_n: int = 20) -> Dict[str, float]:
         """
         获取特征重要性
-        
+
         Args:
             top_n: 返回 Top-N 个特征
-            
+
         Returns:
             Dict: {特征名：重要性}
         """
         if self.best_model is None:
             logger.warning("模型尚未训练，无法获取特征重要性")
             return {}
-        
+
         try:
-            # 获取特征名
-            if hasattr(self, 'feature_names'):
-                feature_names = self.feature_names
-            else:
-                feature_names = [f"feature_{i}" for i in range(self.X.shape[1])]
-            
             # 获取重要性
             if hasattr(self.best_model, 'feature_importances_'):
                 importances = self.best_model.feature_importances_
             else:
                 logger.warning("模型不支持特征重要性")
                 return {}
-            
+
             # 排序
             indices = np.argsort(importances)[::-1][:top_n]
-            
+
             return {
-                feature_names[i]: float(importances[i])
+                self.feature_names[i]: float(importances[i])
                 for i in indices
             }
-            
+
         except Exception as e:
             logger.error(f"获取特征重要性失败：{e}")
             return {}

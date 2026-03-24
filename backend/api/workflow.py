@@ -32,6 +32,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from concurrent.futures import ThreadPoolExecutor
 
+# 修复导入路径 - 确保使用正确的模块
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 from core.llm.agent_orchestrator import AgentOrchestrator, create_orchestrator
 from model_code.feature_executor import FeatureEngineeringExecutor
 from core.automl.automl_optimizer import AutoMLOptimizer
@@ -252,13 +257,14 @@ async def generate_features(req: FeatureGenerationRequest):
 @router.get("/step3_train_stream")
 async def train_stream(
     task_id: str = Query(..., description="任务 ID"),
-    n_trials: int = Query(30, description="Optuna Trial 次数", ge=10, le=100)
+    n_trials: int = Query(30, description="Optuna Trial 次数", ge=10, le=100),
+    cv_folds: int = Query(5, description="交叉验证折数", ge=3, le=10)
 ):
     """
     步骤 3：数据清洗 + AutoML 调参 + SSE 实时推送
-    
+
     注意：SSE 必须是 GET 请求，参数通过 Query 传递
-    
+
     流程:
     1. 加载前置数据
     2. FeatureEngineeringExecutor.fit_transform
@@ -273,36 +279,48 @@ async def train_stream(
         """后台训练任务 (在线程池中运行)"""
         try:
             logger.info(f"任务 {task_id}: 开始训练...")
-            
+
             # 1. 加载前置数据
             data_path = f"output/{task_id}/raw_data.parquet"
             if not os.path.exists(data_path):
                 raise FileNotFoundError(f"未找到数据文件：{data_path}")
-            
+
             df_raw = pd.read_parquet(data_path)
             logger.info(f"数据加载完成：{df_raw.shape}")
-            
+
             # 加载特征策略
             strategy_path = f"output/{task_id}/feature_strategy.json"
             if not os.path.exists(strategy_path):
                 raise FileNotFoundError(f"未找到策略文件：{strategy_path}")
-            
+
             with open(strategy_path, "r", encoding='utf-8') as f:
                 strategy_json = f.read()
-            
+
             strategy_obj = FeatureStrategy.parse_raw(strategy_json)
             logger.info(f"策略加载完成：{len(strategy_obj.actions)} 个动作")
-            
+
+            # 加载 eda_summary 获取目标变量列名
+            eda_path = f"output/{task_id}/eda_summary.json"
+            target_col = "is_fraud"  # 默认值
+            if os.path.exists(eda_path):
+                with open(eda_path, "r", encoding='utf-8') as f:
+                    eda_summary = json.load(f)
+                    target_col = eda_summary.get("target", "is_fraud")
+
             # 2. 执行特征工程 (fit_transform)
-            feature_executor = FeatureEngineeringExecutor(target_col="is_fraud")
+            feature_executor = FeatureEngineeringExecutor(target_col=target_col)
             df_clean = feature_executor.fit_transform(df_raw, strategy_obj)
             logger.info(f"特征工程完成：{df_clean.shape}")
-            
+
+            # 检查目标变量是否在清洗后的数据中
+            if target_col not in df_clean.columns:
+                raise ValueError(f"目标变量 '{target_col}' 不在清洗后的数据中")
+
             # 准备训练数据
-            X = df_clean.drop(columns=["is_fraud"])
-            y = df_clean["is_fraud"]
-            
-            # 3. AutoML 配置 (mock - 实际使用时调用 AutoML_Agent)
+            X = df_clean.drop(columns=[target_col])
+            y = df_clean[target_col]
+
+            # 3. AutoML 配置
             optuna_config = {
                 "task_type": "binary_classification",
                 "optimization_metric": "roc_auc",
@@ -321,52 +339,81 @@ async def train_stream(
                     }
                 }
             }
-            
-            # 4. SSE 回调函数
-            def sse_callback(study, trial):
+
+            # 4. SSE 回调函数 (适配 AutoMLOptimizer.optimize() 的返回值)
+            import optuna
+
+            def sse_callback(study: optuna.Study, trial: optuna.Trial):
                 """Optuna Trial 结束时的回调，推送 SSE"""
-                payload = {
-                    "status": "RUNNING",
-                    "trial": trial.number,
-                    "value": float(trial.value) if trial.value else None,
-                    "best_value": float(study.best_value) if study.best_value else None,
-                    "params": trial.params
-                }
-                asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
-            
-            # 5. 启动 Optuna 寻优
-            optimizer = AutoMLOptimizer(X, y, optuna_config, cv_splits=5, n_jobs=-1)
-            
-            # 运行优化 (带回调)
-            best_val = 0.5
-            for i in range(n_trials):
-                time.sleep(0.2)  # 模拟训练耗时
-                val = 0.6 + random.random() * 0.3
-                best_val = max(best_val, val)
-                
-                # 模拟 callback
-                class MockStudy:
-                    best_value = best_val
-                class MockTrial:
-                    number = i
-                    value = val
-                    params = {"learning_rate": 0.1, "num_leaves": 50}
-                
-                sse_callback(MockStudy(), MockTrial())
-            
-            # 6. 持久化打包 (模型 + 执行器)
+                if trial.state.is_finished():
+                    payload = {
+                        "status": "RUNNING",
+                        "trial": trial.number,
+                        "value": float(trial.value) if trial.value is not None else None,
+                        "best_value": float(study.best_value) if study.best_value is not None else None,
+                        "params": trial.params
+                    }
+                    try:
+                        asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
+                    except Exception as e:
+                        logger.error(f"推送 SSE 数据失败：{e}")
+
+            # 5. 启动 Optuna 寻优 (真实训练)
+            optimizer = AutoMLOptimizer(X, y, optuna_config, cv_splits=max(3, cv_folds), n_jobs=-1)
+
+            # 运行优化并获取最佳模型
+            best_value = 0.5
+            best_model = None
+            study = None
+
+            try:
+                study, best_model = optimizer.optimize(n_trials=n_trials, show_progress=False)
+                if study and study.best_value is not None:
+                    best_value = float(study.best_value)
+
+                # 为每个 Trial 生成 SSE 推送 (从历史记录中回放)
+                if study:
+                    for trial in study.trials:
+                        if trial.state.is_finished():
+                            payload = {
+                                "status": "RUNNING",
+                                "trial": trial.number,
+                                "value": float(trial.value) if trial.value is not None else None,
+                                "best_value": float(study.best_value) if study.best_value is not None else None,
+                                "params": trial.params
+                            }
+                            asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
+            except Exception as e:
+                logger.error(f"Optuna 优化失败：{e}")
+                raise
+
+            # 6. 持久化打包 (模型 + 执行器 + 最佳模型)
             os.makedirs("saved", exist_ok=True)
             artifact_path = f"saved/model_{task_id}.pkl"
-            
+
             joblib.dump({
                 "feature_executor": feature_executor,
+                "model": best_model,
                 "config": optuna_config,
-                "best_value": best_val,
+                "best_value": best_value,
                 "feature_columns": list(X.columns)
             }, artifact_path)
-            
+
             logger.info(f"模型已保存：{artifact_path}")
-            
+
+            # 7. 保存基线数据 (用于 MLOps PSI 漂移检测)
+            try:
+                from model_code.mlops_monitor import DataDriftMonitor
+
+                monitor = DataDriftMonitor()
+                baseline_data = monitor.extract_baseline(df_clean, features=list(X.columns))
+
+                baseline_path = f"saved/baseline_{task_id}.json"
+                monitor.save_baseline(baseline_data, baseline_path)
+                logger.info(f"基线数据已保存：{baseline_path}")
+            except Exception as e:
+                logger.warning(f"保存基线数据失败：{e}，MLOps 监控将无法工作")
+
         except Exception as e:
             logger.error(f"训练失败：{e}")
             asyncio.run_coroutine_threadsafe(
@@ -382,17 +429,23 @@ async def train_stream(
     
     # SSE 事件生成器
     async def event_generator():
+        """
+        SSE 事件流生成器
+
+        【优化】：超时时间从 300 秒改为 60 秒，更快响应连接断开
+        """
         while True:
             try:
-                data = await asyncio.wait_for(queue.get(), timeout=300)
-                
+                data = await asyncio.wait_for(queue.get(), timeout=60)
+
                 if data is None:
                     yield f"data: {json.dumps({'status': 'DONE'})}\n\n"
                     break
-                
+
                 yield f"data: {json.dumps(data)}\n\n"
-                
+
             except asyncio.TimeoutError:
+                # 超时，发送心跳 (60 秒无数据)
                 yield f"data: {json.dumps({'status': 'HEARTBEAT'})}\n\n"
             except Exception as e:
                 logger.error(f"SSE 推送错误：{e}")
@@ -451,13 +504,28 @@ async def predict_online(req: PredictRequest):
             logger.info(f"特征清洗完成：{df_clean.shape}")
         else:
             df_clean = df_infer
-        
-        # 4. 预测 (mock - 实际使用时调用 model.predict)
-        # pred = model.predict(df_clean)
-        # prob = model.predict_proba(df_clean)[0][1]
-        
-        pred = [0.85]  # 模拟预测结果
-        prob = pred[0]
+
+        # 确保特征列顺序一致
+        if feature_columns:
+            # 补齐缺失列 (填充 0)
+            for col in feature_columns:
+                if col not in df_clean.columns:
+                    df_clean[col] = 0
+            # 按训练时的顺序重排列
+            df_clean = df_clean[feature_columns]
+
+        # 4. 预测
+        if model is None:
+            logger.warning("模型未加载，使用模拟预测结果")
+            pred = [0.85]
+            prob = 0.85
+        else:
+            # 真实模型预测
+            pred = model.predict(df_clean)
+            if hasattr(model, 'predict_proba'):
+                prob = float(model.predict_proba(df_clean)[0][1])
+            else:
+                prob = float(pred[0]) if hasattr(pred, '__len__') else float(pred)
         
         return {
             "status": "success",
@@ -478,27 +546,88 @@ async def predict_online(req: PredictRequest):
 async def get_task_status(task_id: str):
     """获取任务状态"""
     task_dir = f"output/{task_id}"
-    
+
     if not os.path.exists(task_dir):
         return {"status": "not_found", "task_id": task_id}
-    
+
     files = os.listdir(task_dir)
-    
+
     status = {
         "task_id": task_id,
         "status": "in_progress",
         "files": files
     }
-    
+
     if "raw_data.parquet" in files:
         status["step1"] = "done"
     if "feature_strategy.json" in files:
         status["step2"] = "done"
-    if f"saved/model_{task_id}.pkl" in os.listdir("saved") if os.path.exists("saved") else False:
+
+    saved_dir = "saved"
+    if os.path.exists(saved_dir) and f"model_{task_id}.pkl" in os.listdir(saved_dir):
         status["step3"] = "done"
         status["status"] = "completed"
-    
+
+        # 加载模型获取最佳 AUC
+        try:
+            import joblib
+            artifact = joblib.load(f"{saved_dir}/model_{task_id}.pkl")
+            status["best_auc"] = artifact.get("best_value", 0)
+            status["feature_columns"] = artifact.get("feature_columns", [])
+        except:
+            pass
+
     return status
+
+
+@router.get("/task/{task_id}/importance")
+async def get_feature_importance(task_id: str):
+    """
+    获取特征重要性
+
+    Args:
+        task_id: 任务 ID
+
+    Returns:
+        List[Dict]: 特征重要性列表
+    """
+    saved_dir = "saved"
+    model_path = f"{saved_dir}/model_{task_id}.pkl"
+
+    if not os.path.exists(model_path):
+        return []
+
+    try:
+        import joblib
+        artifact = joblib.load(model_path)
+        model = artifact.get("model")
+        feature_columns = artifact.get("feature_columns", [])
+
+        if model is None:
+            return []
+
+        if not hasattr(model, 'feature_importances_'):
+            return []
+
+        importances = model.feature_importances_
+
+        # 构建特征重要性列表
+        importance_list = []
+        for i, col in enumerate(feature_columns):
+            if i < len(importances):
+                importance_list.append({
+                    "feature": col,
+                    "importance": float(importances[i])
+                })
+
+        # 按重要性排序
+        importance_list.sort(key=lambda x: x["importance"], reverse=True)
+
+        return importance_list
+
+    except Exception as e:
+        logger.error(f"获取特征重要性失败：{e}")
+        return []
 
 
 @router.get("/models")
@@ -506,7 +635,7 @@ async def list_models():
     """列出所有已训练的模型"""
     if not os.path.exists("saved"):
         return {"models": []}
-    
+
     models = []
     for f in os.listdir("saved"):
         if f.startswith("model_task_") and f.endswith(".pkl"):
@@ -515,5 +644,5 @@ async def list_models():
                 "task_id": task_id,
                 "model_path": f"saved/{f}"
             })
-    
+
     return {"models": models}

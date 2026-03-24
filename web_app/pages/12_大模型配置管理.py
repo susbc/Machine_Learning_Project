@@ -47,33 +47,33 @@ def get_provider_config(provider_type: str) -> Dict:
             'fields': {
                 'api_key': {'type': 'password', 'label': 'API Key', 'help': 'OpenAI API Key'},
                 'base_url': {'type': 'text', 'label': 'Base URL', 'default': 'https://api.openai.com/v1'},
-                'model': {'type': 'text', 'label': '默认模型', 'default': 'gpt-3.5-turbo'}
+                'model': {'type': 'text', 'label': '默认模型', 'default': 'gpt-3.5-turbo', 'customizable': True}
             },
-            'models': ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo', 'gpt-3.5-turbo-16k']
+            'models': ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo', 'gpt-3.5-turbo-16k', 'gpt-4o', 'gpt-4o-mini']
         },
         'anthropic': {
             'name': 'Anthropic (Claude)',
             'fields': {
                 'api_key': {'type': 'password', 'label': 'API Key', 'help': 'Anthropic API Key'},
-                'model': {'type': 'text', 'label': '默认模型', 'default': 'claude-3-sonnet-20240229'}
+                'model': {'type': 'text', 'label': '默认模型', 'default': 'claude-3-sonnet-20240229', 'customizable': True}
             },
-            'models': ['claude-3-opus-20240229', 'claude-3-sonnet-20240229', 'claude-3-haiku-20240307']
+            'models': ['claude-3-opus-20240229', 'claude-3-sonnet-20240229', 'claude-3-haiku-20240307', 'claude-3-5-sonnet-20240620']
         },
         'qwen': {
             'name': '阿里云通义千问',
             'fields': {
                 'api_key': {'type': 'password', 'label': 'API Key', 'help': '阿里云 DashScope API Key'},
-                'model': {'type': 'text', 'label': '默认模型', 'default': 'qwen-plus'}
+                'model': {'type': 'text', 'label': '默认模型', 'default': 'qwen-plus', 'customizable': True}
             },
-            'models': ['qwen-turbo', 'qwen-plus', 'qwen-max', 'qwen-max-longcontext']
+            'models': ['qwen-turbo', 'qwen-plus', 'qwen-max', 'qwen-max-longcontext', 'qwen2.5-72b-instruct']
         },
         'zhipu': {
             'name': '智谱 AI (GLM)',
             'fields': {
                 'api_key': {'type': 'password', 'label': 'API Key', 'help': '智谱 AI API Key'},
-                'model': {'type': 'text', 'label': '默认模型', 'default': 'glm-4'}
+                'model': {'type': 'text', 'label': '默认模型', 'default': 'glm-4', 'customizable': True}
             },
-            'models': ['glm-4', 'glm-3-turbo', 'glm-4-flash']
+            'models': ['glm-4', 'glm-3-turbo', 'glm-4-flash', 'glm-4-air', 'glm-4-long']
         },
         'baidu': {
             'name': '百度文心一言',
@@ -91,12 +91,15 @@ def get_provider_config(provider_type: str) -> Dict:
 def render_provider_form(manager: LLMManager, edit_id: Optional[str] = None):
     """渲染配置表单"""
     st.subheader("➕ 添加大模型配置" if not edit_id else "✏️ 编辑配置")
-    
+
     edit_data = None
     if edit_id:
         edit_data = manager.configs.get(edit_id)
-    
-    with st.form("llm_provider_form"):
+
+    # 使用唯一的 form key
+    form_key = f"llm_provider_form_{edit_id}" if edit_id else "llm_provider_form_add"
+
+    with st.form(form_key):
         col1, col2 = st.columns(2)
         
         with col1:
@@ -145,37 +148,77 @@ def render_provider_form(manager: LLMManager, edit_id: Optional[str] = None):
         if provider_type == 'openai':
             col1, col2 = st.columns(2)
             with col1:
-                config_fields['api_key'] = st.text_input("API Key", type="password", 
+                config_fields['api_key'] = st.text_input("API Key", type="password",
                     value=edit_data['config'].get('api_key', '') if edit_data else "",
                     help="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
             with col2:
                 config_fields['base_url'] = st.text_input("Base URL",
                     value=edit_data['config'].get('base_url', 'https://api.openai.com/v1') if edit_data else "https://api.openai.com/v1")
-            config_fields['model'] = st.selectbox("默认模型",
+            # 模型选择 - 支持预设 + 自定义输入
+            saved_model = edit_data['config'].get('model', 'gpt-3.5-turbo') if edit_data else 'gpt-3.5-turbo'
+            preset_index = template['models'].index(saved_model) if saved_model in template['models'] else 0
+            preset_model = st.selectbox("预设模型",
                 template['models'],
-                index=template['models'].index(edit_data['config'].get('model', 'gpt-3.5-turbo')) if edit_data else 2)
-        
+                index=preset_index)
+
+            custom_model = st.text_input("或输入自定义模型名称",
+                value="" if preset_model in template['models'] else preset_model,
+                placeholder="例如：gpt-4o-2024-08-06",
+                help="留空则使用上方预设模型")
+
+            config_fields['model'] = custom_model if custom_model.strip() else preset_model
+
         elif provider_type == 'anthropic':
             config_fields['api_key'] = st.text_input("API Key", type="password",
                 value=edit_data['config'].get('api_key', '') if edit_data else "",
                 help="sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
-            config_fields['model'] = st.selectbox("默认模型", template['models'],
-                index=template['models'].index(edit_data['config'].get('model', 'claude-3-sonnet-20240229')) if edit_data else 1)
-        
+
+            saved_model = edit_data['config'].get('model', 'claude-3-sonnet-20240229') if edit_data else 'claude-3-sonnet-20240229'
+            preset_index = template['models'].index(saved_model) if saved_model in template['models'] else 0
+            preset_model = st.selectbox("预设模型", template['models'],
+                index=preset_index)
+
+            custom_model = st.text_input("或输入自定义模型名称",
+                value="" if preset_model in template['models'] else preset_model,
+                placeholder="例如：claude-3-5-sonnet-20241022",
+                help="留空则使用上方预设模型")
+
+            config_fields['model'] = custom_model if custom_model.strip() else preset_model
+
         elif provider_type == 'qwen':
             config_fields['api_key'] = st.text_input("API Key", type="password",
                 value=edit_data['config'].get('api_key', '') if edit_data else "",
                 help="阿里云 DashScope API Key")
-            config_fields['model'] = st.selectbox("默认模型", template['models'],
-                index=template['models'].index(edit_data['config'].get('model', 'qwen-plus')) if edit_data else 1)
-        
+
+            saved_model = edit_data['config'].get('model', 'qwen-plus') if edit_data else 'qwen-plus'
+            preset_index = template['models'].index(saved_model) if saved_model in template['models'] else 0
+            preset_model = st.selectbox("预设模型", template['models'],
+                index=preset_index)
+
+            custom_model = st.text_input("或输入自定义模型名称",
+                value="" if preset_model in template['models'] else preset_model,
+                placeholder="例如：qwen2.5-vl-72b-instruct",
+                help="留空则使用上方预设模型")
+
+            config_fields['model'] = custom_model if custom_model.strip() else preset_model
+
         elif provider_type == 'zhipu':
             config_fields['api_key'] = st.text_input("API Key", type="password",
                 value=edit_data['config'].get('api_key', '') if edit_data else "",
                 help="智谱 AI API Key")
-            config_fields['model'] = st.selectbox("默认模型", template['models'],
-                index=template['models'].index(edit_data['config'].get('model', 'glm-4')) if edit_data else 0)
-        
+
+            saved_model = edit_data['config'].get('model', 'glm-4') if edit_data else 'glm-4'
+            preset_index = template['models'].index(saved_model) if saved_model in template['models'] else 0
+            preset_model = st.selectbox("预设模型", template['models'],
+                index=preset_index)
+
+            custom_model = st.text_input("或输入自定义模型名称",
+                value="" if preset_model in template['models'] else preset_model,
+                placeholder="例如：glm-4-airx",
+                help="留空则使用上方预设模型")
+
+            config_fields['model'] = custom_model if custom_model.strip() else preset_model
+
         elif provider_type == 'baidu':
             col1, col2 = st.columns(2)
             with col1:
@@ -184,8 +227,18 @@ def render_provider_form(manager: LLMManager, edit_id: Optional[str] = None):
             with col2:
                 config_fields['secret_key'] = st.text_input("Secret Key", type="password",
                     value=edit_data['config'].get('secret_key', '') if edit_data else "")
-            config_fields['model'] = st.selectbox("默认模型", template['models'],
-                index=template['models'].index(edit_data['config'].get('model', 'ernie-bot-4')) if edit_data else 0)
+
+            saved_model = edit_data['config'].get('model', 'ernie-bot-4') if edit_data else 'ernie-bot-4'
+            preset_index = template['models'].index(saved_model) if saved_model in template['models'] else 0
+            preset_model = st.selectbox("预设模型", template['models'],
+                index=preset_index)
+            
+            custom_model = st.text_input("或输入自定义模型名称",
+                value="" if preset_model in template['models'] else preset_model,
+                placeholder="例如：ernie-4.0-turbo-8k",
+                help="留空则使用上方预设模型")
+            
+            config_fields['model'] = custom_model if custom_model.strip() else preset_model
         
         # 表单按钮
         col1, col2, col3 = st.columns([2, 1, 1])
@@ -444,11 +497,12 @@ def main():
     
     # 主内容区
     if st.session_state.edit_mode:
+        # 编辑模式：只显示编辑表单
         render_provider_form(manager, st.session_state.edit_id)
-        st.markdown("---")
-    
-    render_provider_form(manager)
-    
+    else:
+        # 普通模式：显示添加表单
+        render_provider_form(manager)
+
     st.markdown("---")
     
     render_provider_list(manager)
