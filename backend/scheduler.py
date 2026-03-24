@@ -159,16 +159,26 @@ async def check_data_drift_job():
 async def simulate_online_data():
     """
     模拟从生产数据库拉取线上数据
-    
+
     实际使用时替换为真实的数据库查询
+
+    【优化】：添加注释说明生产环境替换方式
     """
     import pandas as pd
     import numpy as np
-    
-    # 模拟数据 (实际使用时删除)
+
+    # 模拟数据 (实际使用时删除，替换为真实数据库查询)
+    # 生产环境示例:
+    #   from model_code.database.db_connector import DatabaseConnector
+    #   db = DatabaseConnector(config)
+    #   db.connect()
+    #   df = db.query("SELECT * FROM orders WHERE created_at >= NOW() - INTERVAL 24 HOUR")
+    #   db.disconnect()
+    #   return df
+
     np.random.seed(42)
     n_samples = 1000
-    
+
     df = pd.DataFrame({
         'age': np.random.randint(20, 60, n_samples),
         'income': np.random.uniform(3000, 50000, n_samples),
@@ -176,11 +186,11 @@ async def simulate_online_data():
         'order_count': np.random.randint(1, 100, n_samples),
         'is_fraud': np.random.randint(0, 2, n_samples)
     })
-    
+
     # 模拟一些漂移 (实际数据中会有真实漂移)
     if datetime.now().day % 5 == 0:
         df['income'] = df['income'] * 1.5  # 收入分布漂移
-    
+
     return df
 
 

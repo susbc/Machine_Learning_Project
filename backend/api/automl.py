@@ -28,18 +28,21 @@ running_optimizations: Dict[str, Dict] = {}
 class TrialCallback:
     """
     Optuna Trial 回调类
-    
+
     在每次 Trial 结束时被调用，将结果推送到异步队列
+
+    【修复】：在初始化时传入 event loop，避免在线程中调用 get_event_loop() 可能失败
     """
-    
-    def __init__(self, queue: asyncio.Queue, study_id: str):
+
+    def __init__(self, queue: asyncio.Queue, study_id: str, loop: asyncio.AbstractEventLoop):
         self.queue = queue
         self.study_id = study_id
-    
+        self.loop = loop
+
     def __call__(self, study, trial):
         """
         Optuna 回调函数
-        
+
         Args:
             study: Optuna Study 对象
             trial: Optuna Trial 对象
@@ -54,13 +57,12 @@ class TrialCallback:
                 "params": trial.params,
                 "datetime_complete": str(trial.datetime_complete) if trial.datetime_complete else None
             }
-            
+
             # 将数据放入异步队列 (线程安全)
             try:
-                loop = asyncio.get_event_loop()
                 asyncio.run_coroutine_threadsafe(
                     self.queue.put(payload),
-                    loop
+                    self.loop
                 )
             except Exception as e:
                 logger.error(f"推送 Trial 数据失败：{e}")
@@ -69,33 +71,35 @@ class TrialCallback:
 async def event_generator(queue: asyncio.Queue, total_trials: int, study_id: str):
     """
     SSE 事件生成器
-    
+
     持续从队列读取数据并推送给前端
-    
+
     Args:
         queue: 异步队列
         total_trials: 总 Trial 次数
         study_id: 研究 ID
+
+    【优化】：超时时间从 300 秒改为 60 秒，更快响应连接断开
     """
     try:
         while True:
             # 等待新数据
-            data = await asyncio.wait_for(queue.get(), timeout=300)
-            
+            data = await asyncio.wait_for(queue.get(), timeout=60)
+
             if data is None:
                 # 结束信号
                 yield f"data: {json.dumps({'status': 'DONE', 'study_id': study_id})}\n\n"
                 break
-            
+
             # 计算进度百分比
             progress = int((data['trial_number'] + 1) / total_trials * 100)
             data['progress'] = progress
-            
+
             # SSE 标准格式
             yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-            
+
     except asyncio.TimeoutError:
-        # 超时，发送心跳
+        # 超时，发送心跳 (60 秒无数据)
         yield f"data: {json.dumps({'status': 'HEARTBEAT', 'study_id': study_id})}\n\n"
     except Exception as e:
         logger.error(f"SSE 推送错误：{e}")
@@ -125,18 +129,21 @@ def run_optuna_optimization(
     """
     import optuna
     from core.automl import AutoMLOptimizer
-    
+
     try:
+        # 获取当前 event loop (用于回调)
+        loop = asyncio.get_running_loop()
+
         # 创建优化器
         optimizer = AutoMLOptimizer(X, y, config, cv_splits=5, n_jobs=-1)
-        
+
         # 创建 Study
         direction = "maximize" if config.get("optimization_metric", "roc_auc") in ["roc_auc", "accuracy", "f1"] else "minimize"
         study = optuna.create_study(direction=direction, study_name=study_id)
-        
-        # 创建回调
-        callback = TrialCallback(queue, study_id)
-        
+
+        # 创建回调 (传入 loop)
+        callback = TrialCallback(queue, study_id, loop)
+
         # 运行优化
         study.optimize(
             objective_func if objective_func else optimizer.objective,
@@ -144,28 +151,28 @@ def run_optuna_optimization(
             callbacks=[callback],
             show_progress_bar=False  # 禁用控制台进度条，使用前端推送
         )
-        
+
         # 保存最佳结果
         running_optimizations[study_id]["best_params"] = study.best_params
         running_optimizations[study_id]["best_value"] = float(study.best_value) if study.best_value else None
         running_optimizations[study_id]["status"] = "COMPLETED"
-        
+
         # 发送结束信号
         asyncio.run_coroutine_threadsafe(
             queue.put(None),
-            asyncio.get_event_loop()
+            loop
         )
-        
+
     except Exception as e:
         logger.error(f"Optuna 优化失败：{e}")
         running_optimizations[study_id]["status"] = "FAILED"
         running_optimizations[study_id]["error"] = str(e)
-        
+
         # 发送错误信号
         try:
             asyncio.run_coroutine_threadsafe(
                 queue.put(None),
-                asyncio.get_event_loop()
+                loop
             )
         except:
             pass
@@ -234,9 +241,10 @@ async def stream_optimization(
                 }
             }
         }
-        
+
         # 在线程池中运行优化
-        loop = asyncio.get_event_loop()
+        # 【修复】使用 get_running_loop() 替代 get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.run_in_executor(
             executor,
             run_optuna_optimization,

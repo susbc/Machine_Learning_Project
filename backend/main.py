@@ -11,9 +11,14 @@ Agentic ML Studio - FastAPI 主应用
 """
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
-from api.workflow import router as workflow_router
-from scheduler import start_scheduler, stop_scheduler
+from backend.api.workflow import router as workflow_router
+from backend.api.mlops import router as mlops_router
+from backend.scheduler import start_scheduler, stop_scheduler
+import os
+from backend.scheduler import start_scheduler, stop_scheduler
 
 
 @asynccontextmanager
@@ -65,13 +70,22 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# 挂载静态文件
+static_path = os.path.join(os.path.dirname(__file__), "static")
+os.makedirs(static_path, exist_ok=True)
+app.mount("/static", StaticFiles(directory=static_path), name="static")
+
 # 挂载业务路由
 app.include_router(workflow_router)
+app.include_router(mlops_router)
 
 
 @app.get("/")
 async def root():
-    """根路径"""
+    """根路径 - 返回美观的欢迎页面"""
+    index_path = os.path.join(static_path, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
     return {
         "message": "欢迎使用 Agentic ML Studio v3.0.0",
         "docs": "/docs",
@@ -82,7 +96,7 @@ async def root():
 @app.get("/health")
 async def health_check():
     """健康检查"""
-    from scheduler import scheduler
+    from backend.scheduler import scheduler
     return {
         "status": "healthy",
         "scheduler_running": scheduler.running,
