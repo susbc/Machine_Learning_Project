@@ -10,15 +10,11 @@
 
 import sys
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from model_code.utils import (
-    ConfigDrivenPreprocessor,
-    neg_data_undersampling,
-    smart_sampling
-)
-from model_code.train import lgbm_train_with_random_search
+from model_code.utils import ConfigDrivenPreprocessor
 from model_code.predict import load_and_predict
 
 
@@ -33,7 +29,8 @@ class BuildingModel:
     """
     
     def __init__(self, data_path: str, config_path: str, data_month: str,
-                 output_dir: Optional[str] = None, model_dir: Optional[str] = None):
+                 output_dir: Optional[str] = None, model_dir: Optional[str] = None,
+                 algorithm: str = "auto"):
         """
         初始化模型引擎
         
@@ -43,6 +40,7 @@ class BuildingModel:
             data_month: 数据月份标识
             output_dir: 输出目录 (可选)
             model_dir: 模型保存目录 (可选)
+            algorithm: 训练算法配置 ("auto" | "compare" | 具体算法名)
         """
         self.data_path = Path(data_path)
         self.config_path = Path(config_path)
@@ -53,7 +51,10 @@ class BuildingModel:
         # 确保目录存在
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.model_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        # 训练算法配置
+        self.algorithm = algorithm  # "auto" | "compare" | 具体算法名
+
         # 数据与配置
         self.data: Optional[pd.DataFrame] = None
         self.df_field: Optional[pd.DataFrame] = None
@@ -158,110 +159,98 @@ class BuildingModel:
         self._load_config()
         self._identify_fields()
         self._fields_stype()
-        
-        # 关键：先处理异常值和缺失值 (这些不需要防止穿越)
-        from model_code.utils import handle_dataframe_outliers, handle_dataframe_missing_values
-        self.data = handle_dataframe_outliers(self.data, self.df_field)
-        self.data = handle_dataframe_missing_values(self.data, self.df_field)
-        
-        # 关键：先划分数据集！
+
+        # 关键：先划分数据集，再 fit 预处理器 (防止数据穿越)
         from sklearn.model_selection import train_test_split
         train_data, test_data = train_test_split(
             self.data, test_size=0.3, random_state=42, stratify=self.data[self.label]
         )
-        
+
         print(f"\n数据集划分:")
         print(f"  训练集：{train_data.shape[0]:,} 行")
         print(f"  测试集：{test_data.shape[0]:,} 行")
-        
-        # 初始化预处理器
-        self.preprocessor = ConfigDrivenPreprocessor(self.df_field)
-        
-        # 仅在训练集上 fit
+
+        # 初始化预处理器 (包含异常值处理 + 缺失值填充 + 编码 + 标准化)
         feature_cols = [c for c in train_data.columns if c not in [self.label, self.key]]
+        self.preprocessor = ConfigDrivenPreprocessor(self.df_field)
+
+        # 仅在训练集上 fit (异常值边界和缺失值统计量都来自训练集)
         self.preprocessor.fit(train_data[feature_cols])
-        
+
         # 分别 transform
         self.X_train = self.preprocessor.transform(train_data[feature_cols])
         self.X_test = self.preprocessor.transform(test_data[feature_cols])
         self.y_train = train_data[self.label]
         self.y_test = test_data[self.label]
-        
-        # 编码和标准化
-        from model_code.utils import encode_dataframe, standardize_dataframe
-        self.X_train = encode_dataframe(self.X_train, self.df_field)
-        self.X_test = encode_dataframe(self.X_test, self.df_field)
-        self.X_train = standardize_dataframe(self.X_train, self.df_field)
-        self.X_test = standardize_dataframe(self.X_test, self.df_field)
-        
+
         print("\n数据预处理完成 (无数据穿越)")
     
     def _prepare_data_for_predict(self) -> None:
-        """预测数据准备"""
+        """
+        预测数据准备
+
+        优先使用训练时 fit 好的预处理器，确保预处理逻辑完全一致。
+        若预处理器尚未 fit (仅运行预测模式)，则全量 fit 后 transform。
+        """
         self._load_data()
         self._load_config()
         self._identify_fields()
         self._fields_stype()
-        
-        # 预测时使用完整预处理
-        from model_code.utils import (
-            handle_dataframe_outliers, 
-            handle_dataframe_missing_values,
-            encode_dataframe,
-            standardize_dataframe
-        )
-        
-        self.data = handle_dataframe_outliers(self.data, self.df_field)
-        self.data = handle_dataframe_missing_values(self.data, self.df_field)
-        self.data = encode_dataframe(self.data, self.df_field)
-        self.data = standardize_dataframe(self.data, self.df_field)
+
+        feature_cols = [c for c in self.data.columns if c not in [self.label, self.key]]
+
+        if self.preprocessor is not None:
+            # 使用训练时 fit 好的预处理器 (推荐路径)
+            self.data = self.preprocessor.transform(self.data[feature_cols])
+            print("使用训练时 fit 好的预处理器进行预测")
+        else:
+            # 仅运行预测模式：全量 fit + transform
+            print("预处理器尚未初始化，对全量数据 fit + transform")
+            self.preprocessor = ConfigDrivenPreprocessor(self.df_field)
+            self.preprocessor.fit(self.data[feature_cols])
+            self.data = self.preprocessor.transform(self.data[feature_cols])
     
     def model_train(self) -> Dict[str, Any]:
         """
-        模型训练主流程
-        
-        Returns:
-            训练结果字典 (包含模型、AUC、指标等)
+        模型训练主流程 - 使用 ModelTrainer 统一编排
+
+        支持三种模式:
+        - algorithm="auto": 智能推荐最佳算法
+        - algorithm="compare": 多算法对比
+        - algorithm="lightgbm"/"xgboost"/...: 指定算法训练
         """
+        from model_code.model_trainer import ModelTrainer
+
         print("=" * 60)
         print("开始模型训练流程")
         print("=" * 60)
-        
+
         self._prepare_data_for_train()
-        
-        # 重采样
-        print("\n执行负样本欠采样...")
-        neg_data = self.data[self.data[self.label] == 0]
-        pos_data = self.data[self.data[self.label] == 1]
-        
-        # 优化：使用简化的采样逻辑
-        if len(neg_data) > len(pos_data) * 10:
-            print("负样本过多，执行欠采样...")
-            target_stats = neg_data.describe().T[["mean", "std"]].values
-            step_size = len(pos_data)
-            max_iter = 10
-            error_rate = 0.1
-            
-            sample_indices = neg_data_undersampling(
-                neg_data, target_stats, step_size, max_iter, error_rate
-            )
-            neg_data_sample = neg_data.loc[sample_indices]
-            balanced_data = pd.concat([neg_data_sample, pos_data], axis=0)
+
+        print(f"\n训练集: {self.X_train.shape[0]:,} 样本, {self.X_train.shape[1]} 特征")
+        print(f"正样本比例: {self.y_train.mean():.2%}")
+
+        trainer = ModelTrainer(
+            self.X_train, self.y_train,
+            self.X_test, self.y_test,
+            self.model_dir, self.output_dir,
+        )
+
+        # 根据 algorithm 参数选择训练模式
+        if self.algorithm == "auto":
+            print("\n模式：智能推荐")
+            results = trainer.train_auto()
+        elif self.algorithm == "compare":
+            print("\n模式：多算法对比")
+            results = trainer.train_compare()
         else:
-            balanced_data = self.data.copy()
-        
-        # 准备特征和标签
-        y = balanced_data[self.label]
-        X = balanced_data.drop([self.label, self.key], axis=1)
-        
-        # 训练模型
-        print("\n开始训练 LightGBM 模型...")
-        results = lgbm_train_with_random_search(X, y, self.model_dir, self.output_dir)
-        
+            print(f"\n模式：指定算法 {self.algorithm}")
+            results = trainer.train_single(self.algorithm)
+
         print("\n" + "=" * 60)
         print("训练完成")
         print("=" * 60)
-        
+
         return results
     
     def model_predict(self) -> pd.DataFrame:
@@ -296,10 +285,11 @@ class BuildingModel:
 
 def run(data_month: str, data_path: str, config_path: str,
         is_train: bool = True, is_predict: bool = True,
-        output_dir: Optional[str] = None, model_dir: Optional[str] = None) -> None:
+        output_dir: Optional[str] = None, model_dir: Optional[str] = None,
+        algorithm: str = "auto") -> None:
     """
     运行入口函数 - 优化版
-    
+
     优化:
     1. 配置参数化，移除全局依赖
     2. 支持单独训练或预测
@@ -309,7 +299,8 @@ def run(data_month: str, data_path: str, config_path: str,
         config_path=config_path,
         data_month=data_month,
         output_dir=output_dir,
-        model_dir=model_dir
+        model_dir=model_dir,
+        algorithm=algorithm,
     )
     
     if is_train:
@@ -320,15 +311,11 @@ def run(data_month: str, data_path: str, config_path: str,
 
 
 if __name__ == '__main__':
-    # 从配置文件加载 (后续可改为命令行参数)
     from model_code.config.config import (
         data_path, config_path, is_train, is_pretrain
     )
-    
-    if len(sys.argv) > 0:
-        data_month = sys.argv[0]
-    else:
-        data_month = "default"
+
+    data_month = sys.argv[1] if len(sys.argv) > 1 else "default"
     
     run(
         data_month=data_month,
