@@ -44,20 +44,36 @@ def load_and_predict(
     output_dir = Path(output_dir) if output_dir else Path("../output")
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 加载模型
-    model_path = model_dir / "best_lgbm_model.joblib"
-    if not model_path.exists():
-        raise FileNotFoundError(f"模型文件不存在：{model_path}")
-    
-    print(f"加载模型：{model_path}")
-    model = joblib.load(model_path)
-    
-    # 尝试加载训练摘要 (包含最佳阈值)
+    # 加载训练摘要 (获取算法名)
     summary_path = model_dir / "train_summary.joblib"
+    if not summary_path.exists():
+        raise FileNotFoundError(f"训练摘要文件不存在：{summary_path}")
+
+    try:
+        summary = joblib.load(summary_path)
+        algorithm = summary.get("algorithm", "lightgbm")  # 向后兼容默认 LGBM
+    except Exception:
+        algorithm = "lightgbm"
+
+    # 加载模型 (新命名 + 旧命名回退)
+    model_path = model_dir / f"best_model_{algorithm}.joblib"
+    if not model_path.exists():
+        # 回退到旧命名
+        old_path = model_dir / "best_lgbm_model.joblib"
+        if old_path.exists():
+            model_path = old_path
+            algorithm = "lightgbm"
+            print(f"⚠️ 使用旧版模型文件：{old_path}")
+        else:
+            raise FileNotFoundError(f"模型文件不存在：{model_path}")
+
+    print(f"加载模型：{model_path} (算法: {algorithm})")
+    model = joblib.load(model_path)
+
+    # 尝试加载训练摘要 (包含最佳阈值)
     best_threshold = threshold
     if summary_path.exists() and threshold is None:
         try:
-            summary = joblib.load(summary_path)
             best_threshold = summary.get('best_threshold', 0.5)
             print(f"使用训练时的最佳阈值：{best_threshold:.4f}")
         except Exception:
@@ -173,7 +189,24 @@ def predict_with_explanation(
     Returns:
         包含解释的预测结果
     """
-    model_path = Path(model_dir) / "best_lgbm_model.joblib" if model_dir else Path("best_lgbm_model.joblib")
+    model_dir_p = Path(model_dir) if model_dir else Path("saved")
+    summary_path = model_dir_p / "train_summary.joblib"
+    algorithm = "lightgbm"
+    if summary_path.exists():
+        try:
+            summary = joblib.load(summary_path)
+            algorithm = summary.get("algorithm", "lightgbm")
+        except Exception:
+            pass
+
+    model_path = model_dir_p / f"best_model_{algorithm}.joblib"
+    if not model_path.exists():
+        old_path = model_dir_p / "best_lgbm_model.joblib"
+        if old_path.exists():
+            model_path = old_path
+        else:
+            raise FileNotFoundError(f"模型文件不存在：{model_path}")
+
     model = joblib.load(model_path)
     
     # 预测
