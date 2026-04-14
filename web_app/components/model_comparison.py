@@ -151,11 +151,12 @@ def compare_models(
         feature_names = info.get('feature_names')
         metrics = evaluate_model(model, X_test, y_test, threshold, feature_names)
         
-        # 合并信息（保存 X_test 用于报告导出）
+        # 合并信息（保存 X_test 用于报告导出，保存 model 用于特征重要性回退）
         results[model_name] = {
             **metrics,
             'info': info,
             'path': path,
+            'model': model,
             'X_test': X_test  # 保存测试集特征
         }
     
@@ -299,10 +300,10 @@ def create_pr_comparison_chart(results: Dict[str, Dict], y_test: pd.Series) -> g
 def create_feature_importance_comparison(results: Dict[str, Dict]) -> go.Figure:
     """
     创建特征重要性对比图
-    
+
     Args:
         results: 模型对比结果
-    
+
     Returns:
         Plotly Figure
     """
@@ -311,42 +312,55 @@ def create_feature_importance_comparison(results: Dict[str, Dict]) -> go.Figure:
     for name, result in results.items():
         if 'info' in result and 'feature_names' in result['info']:
             all_features.update(result['info']['feature_names'])
-    
+
     if not all_features:
         return go.Figure().add_annotation(text="无特征重要性数据", showarrow=False)
-    
+
     all_features = sorted(list(all_features))
-    
+
     # 构建数据
-    data = []
+    importances_dict = {}
     for name, result in results.items():
+        # 优先使用 info 中的 feature_importances
         if 'info' in result and 'feature_importances' in result['info']:
             importances = result['info']['feature_importances']
             feature_names = result['info']['feature_names']
-            
-            importance_dict = dict(zip(feature_names, importances))
-            row = [importance_dict.get(f, 0) for f in all_features]
-            data.append(row)
-    
-    if not data:
+            importance_map = dict(zip(feature_names, importances))
+            importances_dict[name] = [importance_map.get(f, 0) for f in all_features]
+        elif hasattr(result.get('model'), 'feature_importances_'):
+            # Tree-based models: RandomForest, LGBM, XGBoost, CatBoost
+            importances_dict[name] = result['model'].feature_importances_.tolist()
+        elif hasattr(result.get('model'), 'coef_'):
+            # Linear models: LogisticRegression
+            coef = result['model'].coef_
+            if coef.ndim > 1:
+                importances_dict[name] = np.abs(coef).mean(axis=0).tolist()
+            else:
+                importances_dict[name] = np.abs(coef).tolist()
+        # 都不支持则跳过该模型
+
+    if not importances_dict:
         return go.Figure().add_annotation(text="无特征重要性数据", showarrow=False)
-    
+
+    model_names = list(importances_dict.keys())
+    data = [importances_dict[name] for name in model_names]
+
     # 创建热力图
     fig = px.imshow(
         data,
         labels=dict(x="特征", y="模型", color="重要性"),
         x=all_features,
-        y=list(results.keys()),
+        y=model_names,
         color_continuous_scale='Viridis',
         aspect='auto'
     )
-    
+
     fig.update_layout(
         title='特征重要性对比',
         height=max(400, len(all_features) * 20),
         xaxis_tickangle=-45
     )
-    
+
     return fig
 
 
@@ -414,36 +428,6 @@ def create_model_summary_table(results: Dict[str, Dict]) -> pd.DataFrame:
     df = df.sort_values('ROC-AUC', ascending=False, key=lambda x: x.str.replace(',', '').astype(float))
     
     return df
-
-
-def export_comparison_report(results: Dict[str, Dict], X_test: pd.DataFrame, y_test: pd.Series) -> str:
-    """
-    导出对比报告（完整版）
-    
-    Args:
-        results: 模型对比结果
-        X_test: 测试集特征
-        y_test: 测试集标签
-    
-    Returns:
-        报告文本
-    """
-    report = []
-    report.append("=" * 80)
-    report.append("模型对比分析报告")
-    report.append("=" * 80)
-    report.append("")
-    
-    # 基本信息
-    report.append(f"测试集样本数：{len(y_test):,}")
-    if hasattr(X_test, 'shape') and len(X_test.shape) > 1:
-        report.append(f"特征数：{X_test.shape[1]}")
-    else:
-        report.append(f"特征数：N/A")
-    
-    y_mean = y_test.mean() if hasattr(y_test, 'mean') else np.mean(y_test)
-    report.append(f"正样本比例：{y_mean:.2%}")
-    report.append("")
 
 
 def export_comparison_report_simple(results: Dict[str, Dict], y_test: pd.Series) -> str:
@@ -622,15 +606,8 @@ def display_comparison_results(results: Dict[str, Dict], y_test: pd.Series) -> N
     col1, col2 = st.columns(2)
     
     with col1:
-        # 从结果中获取第一个模型的 X_test 信息（所有模型使用相同的测试集）
-        first_result = list(results.values())[0]
-        X_test_info = first_result.get('X_test')
-        
-        if X_test_info is not None:
-            report_text = export_comparison_report(results, X_test_info, y_test)
-        else:
-            # 如果没有 X_test，使用简化版报告
-            report_text = export_comparison_report_simple(results, y_test)
+        # 使用简化版报告 (原版函数不完整，已移除)
+        report_text = export_comparison_report_simple(results, y_test)
         
         st.download_button(
             label="📥 下载文本报告",
