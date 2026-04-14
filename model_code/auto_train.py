@@ -19,7 +19,7 @@ import logging
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import roc_auc_score, f1_score
 from sklearn.feature_selection import SelectFromModel
-import lightgbm as lgb
+from model_code.model_factory import ModelFactory
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -39,17 +39,20 @@ class AutoTrainer:
         max_iterations: int = 10,
         early_stopping_rounds: int = 3,
         min_improvement: float = 0.001,
-        model_dir: Optional[Path] = None
+        model_dir: Optional[Path] = None,
+        algorithm: str = "auto",
     ):
         """
         初始化自动训练器
-        
+
         Args:
             base_config: 基础配置字典，包含:
-                - X: 特征 DataFrame
-                - y: 标签 Series
+                - X_train: 训练集特征 DataFrame
+                - y_train: 训练集标签 Series
+                - X_test: 测试集特征 DataFrame (可选)
+                - y_test: 测试集标签 Series (可选)
                 - model_params: 模型参数
-                - test_size: 测试集比例
+                - test_size: 测试集比例 (仅当未提供 X_test 时用于回退划分)
                 - random_state: 随机种子
             max_iterations: 最大迭代次数
             early_stopping_rounds: 提前停止轮数
@@ -62,16 +65,50 @@ class AutoTrainer:
         self.min_improvement = min_improvement
         self.model_dir = Path(model_dir) if model_dir else Path("model_code/saved")
         self.model_dir.mkdir(parents=True, exist_ok=True)
-        
+        self.algorithm = algorithm  # 算法标识，默认 "auto" 回退到 lightgbm
+
         # 迭代历史
         self.history: List[Dict[str, Any]] = []
         self.best_iteration: int = 0
         self.best_score: float = 0
         self.best_model = None
         self.best_params: Dict[str, Any] = {}
-        
+
         # 中断标志
         self.interrupted = False
+
+    def _get_data_split(self) -> Tuple[Any, Any, Any, Any]:
+        """
+        获取训练/测试数据 - 优先使用预划分数据，防止数据穿越
+
+        Returns:
+            X_train, X_test, y_train, y_test
+        """
+        random_state = self.base_config.get('random_state', 42)
+        test_size = self.base_config.get('test_size', 0.3)
+
+        # 优先使用预划分的数据 (防止数据穿越)
+        if 'X_train' in self.base_config and 'y_train' in self.base_config:
+            X_train = self.base_config['X_train']
+            y_train = self.base_config['y_train']
+
+            # 如果也提供了预划分测试集，使用它
+            if 'X_test' in self.base_config and 'y_test' in self.base_config:
+                return X_train, self.base_config['X_test'], y_train, self.base_config['y_test']
+
+            # 没有预划分测试集，从训练集再分一份 (仅用于内部验证)
+            X_train_sub, X_val, y_train_sub, y_val = train_test_split(
+                X_train, y_train, test_size=test_size, random_state=random_state, stratify=y_train
+            )
+            return X_train_sub, X_val, y_train_sub, y_val
+
+        # 回退：从原始数据划分 (存在数据穿越风险，仅用于独立使用场景)
+        X = self.base_config['X']
+        y = self.base_config['y']
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=random_state, stratify=y
+        )
+        return X_train, X_test, y_train, y_test
     
     def train_iteration(self, iteration: int, params: Optional[Dict] = None) -> Dict[str, Any]:
         """
@@ -88,29 +125,20 @@ class AutoTrainer:
         logger.info(f"迭代 {iteration}/{self.max_iterations}")
         logger.info(f"{'='*60}")
         
-        # 获取数据
-        X = self.base_config['X']
-        y = self.base_config['y']
-        test_size = self.base_config.get('test_size', 0.3)
-        random_state = self.base_config.get('random_state', 42) + iteration
-        
-        # 划分数据集
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
-        )
-        
+        # 获取数据 (优先使用预划分数据，防止数据穿越)
+        X_train, X_test, y_train, y_test = self._get_data_split()
+
         # 使用当前参数或默认参数
+        model_params = self.base_config.get('model_params', {})
         if params is None:
-            params = self.base_config.get('model_params', {})
-        
+            params = model_params
+
         # 训练模型
-        model = lgb.LGBMClassifier(
-            objective='binary',
-            metric='auc',
-            verbose=-1,
-            random_state=random_state,
-            n_jobs=-1,
-            **params
+        algo = self.algorithm if self.algorithm != "auto" else "lightgbm"
+        model = ModelFactory.build(
+            algorithm=algo,
+            task_type="binary",
+            params=params,
         )
         
         model.fit(X_train, y_train)
@@ -169,31 +197,14 @@ class AutoTrainer:
         logger.info("开始超参数优化")
         logger.info("="*60)
         
-        X = self.base_config['X']
-        y = self.base_config['y']
+        X_train, _, y_train, _ = self._get_data_split()
         random_state = self.base_config.get('random_state', 42)
         
-        # 参数空间
-        param_distributions = {
-            'n_estimators': [100, 200, 300, 400, 500],
-            'learning_rate': [0.01, 0.05, 0.1, 0.15, 0.2],
-            'max_depth': [3, 4, 5, 6, 7, 8],
-            'num_leaves': [20, 30, 40, 50, 60, 70],
-            'min_child_samples': [10, 20, 30, 40, 50],
-            'subsample': [0.7, 0.8, 0.9, 1.0],
-            'colsample_bytree': [0.7, 0.8, 0.9, 1.0],
-            'reg_alpha': [0, 0.01, 0.1, 1],
-            'reg_lambda': [0, 0.01, 0.1, 1]
-        }
+        algo = self.algorithm if self.algorithm != "auto" else "lightgbm"
+        param_distributions = ModelFactory.get_param_grid(algo)
         
         # 基础模型
-        model = lgb.LGBMClassifier(
-            objective='binary',
-            metric='auc',
-            verbose=-1,
-            random_state=random_state,
-            n_jobs=-1
-        )
+        model = ModelFactory.build(algorithm=algo, task_type="binary")
         
         # 随机搜索
         random_search = RandomizedSearchCV(
@@ -207,7 +218,7 @@ class AutoTrainer:
             random_state=random_state
         )
         
-        random_search.fit(X, y)
+        random_search.fit(X_train, y_train)
         
         best_params = random_search.best_params_
         best_score = random_search.best_score_
@@ -241,20 +252,18 @@ class AutoTrainer:
         logger.info("开始特征选择")
         logger.info("="*60)
         
-        X = self.base_config['X']
-        y = self.base_config['y']
-        feature_names = X.columns.tolist()
-        
-        # 使用 LightGBM 进行特征选择
-        model = lgb.LGBMClassifier(
-            objective='binary',
-            verbose=-1,
-            random_state=42,
-            n_jobs=-1,
-            **self.base_config.get('model_params', {})
+        X_train, _, y_train, _ = self._get_data_split()
+        feature_names = X_train.columns.tolist()
+
+        # 使用 ModelFactory 进行特征选择
+        algo = self.algorithm if self.algorithm != "auto" else "lightgbm"
+        model = ModelFactory.build(
+            algorithm=algo,
+            task_type="binary",
+            params=self.base_config.get('model_params', {}),
         )
-        
-        model.fit(X, y)
+
+        model.fit(X_train, y_train)
         
         # 基于重要性选择特征
         selector = SelectFromModel(model, threshold=threshold, prefit=True)
@@ -365,10 +374,19 @@ class AutoTrainer:
         logger.info("\n[步骤 2/4] 特征选择")
         if not self.base_config.get('skip_feature_selection', False):
             selected_features = self.feature_selection(max_features=50)
-            self.base_config['X'] = self.base_config['X'][selected_features]
+            # 更新所有数据集的特征 (支持预划分数据)
+            if 'X_train' in self.base_config:
+                self.base_config['X_train'] = self.base_config['X_train'][selected_features]
+                if 'X_test' in self.base_config:
+                    self.base_config['X_test'] = self.base_config['X_test'][selected_features]
+            else:
+                self.base_config['X'] = self.base_config['X'][selected_features]
         else:
             logger.info("跳过特征选择")
-            selected_features = self.base_config['X'].columns.tolist()
+            if 'X_train' in self.base_config:
+                selected_features = self.base_config['X_train'].columns.tolist()
+            else:
+                selected_features = self.base_config['X'].columns.tolist()
         
         # 第 3 步：迭代训练
         logger.info("\n[步骤 3/4] 迭代训练")
@@ -494,28 +512,44 @@ def run_auto_training(
     y: pd.Series,
     model_params: Dict[str, Any],
     max_iterations: int = 10,
-    model_dir: Optional[Path] = None
+    model_dir: Optional[Path] = None,
+    X_train: Optional[pd.DataFrame] = None,
+    y_train: Optional[pd.Series] = None,
+    X_test: Optional[pd.DataFrame] = None,
+    y_test: Optional[pd.Series] = None,
 ) -> Dict[str, Any]:
     """
     便捷函数：运行自动训练
-    
+
     Args:
-        X: 特征 DataFrame
-        y: 标签 Series
+        X: 特征 DataFrame (回退用，优先使用 X_train)
+        y: 标签 Series (回退用，优先使用 y_train)
         model_params: 模型参数
         max_iterations: 最大迭代次数
         model_dir: 模型保存目录
-    
+        X_train: 训练集特征 (可选，推荐提供以防止数据穿越)
+        y_train: 训练集标签 (可选，推荐提供以防止数据穿越)
+        X_test: 测试集特征 (可选)
+        y_test: 测试集标签 (可选)
+
     Returns:
         训练总结
     """
-    config = {
-        'X': X,
-        'y': y,
+    config: Dict[str, Any] = {
         'model_params': model_params,
         'test_size': 0.3,
         'random_state': 42
     }
+
+    if X_train is not None and y_train is not None:
+        config['X_train'] = X_train
+        config['y_train'] = y_train
+        if X_test is not None and y_test is not None:
+            config['X_test'] = X_test
+            config['y_test'] = y_test
+    else:
+        config['X'] = X
+        config['y'] = y
     
     trainer = AutoTrainer(
         base_config=config,
