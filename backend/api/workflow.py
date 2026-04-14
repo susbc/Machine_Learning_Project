@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from core.llm.agent_orchestrator import AgentOrchestrator, create_orchestrator
 from model_code.feature_executor import FeatureEngineeringExecutor
+from model_code.model_factory import ModelFactory
 from core.automl.automl_optimizer import AutoMLOptimizer
 from core.llm.agent_schemas import FeatureStrategy
 
@@ -129,13 +130,15 @@ async def retrieve_data(req: DataRetrievalRequest):
         
         logger.info(f"SQL 生成完成：{sql_result.sql[:100]}...")
         
-        # 3. 执行 SQL 拉取数据 (模拟 - 实际使用时替换为真实数据库查询)
+        # =====================================================================
+        # [DEMO MODE] 模拟数据 — 真实环境请取消下方注释并移除本标记块
         # from model_code.database import DatabaseConnector
         # db = DatabaseConnector(db_config)
         # db.connect()
         # df = db.query(sql_result.sql)
         # db.disconnect()
-        
+        # =====================================================================
+
         # 模拟数据
         np.random.seed(42)
         n_samples = 1000
@@ -324,7 +327,7 @@ async def train_stream(
             optuna_config = {
                 "task_type": "binary_classification",
                 "optimization_metric": "roc_auc",
-                "candidate_models": ["lightgbm", "catboost"],
+                "candidate_models": ModelFactory.get_supported_algorithms(),
                 "n_trials": n_trials,
                 "search_spaces": {
                     "lightgbm": {
