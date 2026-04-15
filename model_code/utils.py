@@ -144,12 +144,20 @@ def convert_dataframe_types_vectorized(data: pd.DataFrame, df_field: pd.DataFram
 def handle_dataframe_outliers(data: pd.DataFrame, df_field: pd.DataFrame) -> pd.DataFrame:
     """
     异常值处理 - 优化版
-    
+
+    ⚠️ DEPRECATED: 此函数会在调用时对传入数据计算统计量，
+    如果在 train/test split 之前调用会导致数据穿越。
+    推荐使用 ConfigDrivenPreprocessor (fit 在训练集, transform 在测试集)。
+
     优化:
     1. 移除 .copy()，直接修改原数据
     2. 使用字典映射替代 iterrows
     3. 向量化异常值检测
     """
+    warnings.warn(
+        "handle_dataframe_outliers 存在数据穿越风险，推荐使用 ConfigDrivenPreprocessor",
+        DeprecationWarning, stacklevel=2
+    )
     # 构建异常值处理映射
     outlier_mapping = df_field.set_index('field_name')['outlier_value'].to_dict()
     
@@ -202,12 +210,20 @@ def _handle_range_outliers_inplace(data: pd.DataFrame, field_name: str, range_st
 def handle_dataframe_missing_values(data: pd.DataFrame, df_field: pd.DataFrame) -> pd.DataFrame:
     """
     缺失值处理 - 优化版
-    
+
+    ⚠️ DEPRECATED: 此函数会在调用时对传入数据计算统计量，
+    如果在 train/test split 之前调用会导致数据穿越。
+    推荐使用 ConfigDrivenPreprocessor (fit 在训练集, transform 在测试集)。
+
     优化:
     1. 移除 .copy()，使用 inplace 操作
     2. 构建填充字典，批量 fillna
     3. 向量化统计计算
     """
+    warnings.warn(
+        "handle_dataframe_missing_values 存在数据穿越风险，推荐使用 ConfigDrivenPreprocessor",
+        DeprecationWarning, stacklevel=2
+    )
     # 构建缺失值处理映射
     missing_mapping = df_field.set_index('field_name')['missing_value'].to_dict()
     
@@ -265,12 +281,20 @@ def handle_dataframe_missing_values(data: pd.DataFrame, df_field: pd.DataFrame) 
 def encode_dataframe(data: pd.DataFrame, df_field: pd.DataFrame) -> pd.DataFrame:
     """
     编码处理 - 优化版
-    
+
+    ⚠️ DEPRECATED: 此函数会对传入数据 fit 编码器，
+    如果在 train/test split 之前调用会导致数据穿越。
+    推荐使用 ConfigDrivenPreprocessor (fit 在训练集, transform 在测试集)。
+
     优化:
     1. 移除 .copy()
     2. 批量独热编码
     3. 向量化顺序编码
     """
+    warnings.warn(
+        "encode_dataframe 存在数据穿越风险，推荐使用 ConfigDrivenPreprocessor",
+        DeprecationWarning, stacklevel=2
+    )
     # 筛选字符串字段
     str_fields = df_field[df_field['field_type'] == 'str'][['field_name', 'ecode_type']]
     
@@ -303,11 +327,19 @@ def encode_dataframe(data: pd.DataFrame, df_field: pd.DataFrame) -> pd.DataFrame
 def standardize_dataframe(data: pd.DataFrame, df_field: pd.DataFrame) -> pd.DataFrame:
     """
     标准化处理 - 优化版
-    
+
+    ⚠️ DEPRECATED: 此函数会对传入数据 fit 标准化器，
+    如果在 train/test split 之前调用会导致数据穿越。
+    推荐使用 ConfigDrivenPreprocessor (fit 在训练集, transform 在测试集)。
+
     优化:
     1. 移除 .copy()
     2. 批量标准化
     """
+    warnings.warn(
+        "standardize_dataframe 存在数据穿越风险，推荐使用 ConfigDrivenPreprocessor",
+        DeprecationWarning, stacklevel=2
+    )
     # 筛选需要标准化的字段
     std_fields = df_field[df_field['standardize_type'].notna()][['field_name', 'standardize_type']]
     
@@ -355,8 +387,19 @@ class ConfigDrivenPreprocessor(BaseEstimator, TransformerMixin):
     3. 可保存/加载配置
     """
     
-    def __init__(self, df_field: pd.DataFrame):
+    def __init__(
+        self,
+        df_field: pd.DataFrame,
+        enable_missing: bool = True,
+        enable_outlier: bool = True,
+        enable_encoding: bool = True,
+        enable_standardization: bool = True,
+    ):
         self.df_field = df_field
+        self.enable_missing = enable_missing
+        self.enable_outlier = enable_outlier
+        self.enable_encoding = enable_encoding
+        self.enable_standardization = enable_standardization
         self.scalers_ = {}
         self.encoders_ = {}
         self.fill_values_ = {}
@@ -366,43 +409,43 @@ class ConfigDrivenPreprocessor(BaseEstimator, TransformerMixin):
     def fit(self, X: pd.DataFrame, y=None):
         """仅在训练集上拟合统计量"""
         self.feature_names_in_ = X.columns.tolist()
-        
-        # 拟合缺失值填充统计量
-        self._fit_missing_values(X)
-        
-        # 拟合异常值边界
-        self._fit_outlier_bounds(X)
-        
-        # 拟合标准化器
-        self._fit_scalers(X)
-        
-        # 拟合编码器
-        self._fit_encoders(X)
-        
+
+        if self.enable_missing:
+            self._fit_missing_values(X)
+
+        if self.enable_outlier:
+            self._fit_outlier_bounds(X)
+
+        if self.enable_standardization:
+            self._fit_scalers(X)
+
+        if self.enable_encoding:
+            self._fit_encoders(X)
+
         return self
     
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         """应用预处理规则"""
         X = X.copy()
-        
-        # 应用缺失值填充
-        X.fillna(self.fill_values_, inplace=True)
-        
-        # 应用异常值裁剪
-        for field, (lower, upper) in self.outlier_bounds_.items():
-            if field in X.columns:
-                X[field] = X[field].clip(lower, upper)
-        
-        # 应用标准化
-        for field, scaler in self.scalers_.items():
-            if field in X.columns:
-                X[field] = scaler.transform(X[[field]]).flatten()
-        
-        # 应用编码
-        for field, encoder in self.encoders_.items():
-            if field in X.columns:
-                X[field] = encoder.transform(X[[field]]).flatten()
-        
+
+        if self.enable_missing:
+            X.fillna(self.fill_values_, inplace=True)
+
+        if self.enable_outlier:
+            for field, (lower, upper) in self.outlier_bounds_.items():
+                if field in X.columns:
+                    X[field] = X[field].clip(lower, upper)
+
+        if self.enable_standardization:
+            for field, scaler in self.scalers_.items():
+                if field in X.columns:
+                    X[field] = scaler.transform(X[[field]]).flatten()
+
+        if self.enable_encoding:
+            for field, encoder in self.encoders_.items():
+                if field in X.columns:
+                    X[field] = encoder.transform(X[[field]]).flatten()
+
         return X
     
     def _fit_missing_values(self, X: pd.DataFrame):
@@ -475,3 +518,38 @@ class ConfigDrivenPreprocessor(BaseEstimator, TransformerMixin):
             if ecode_type != 'one-hot':  # one-hot 不需要 fit
                 self.encoders_[field] = OrdinalEncoder()
                 self.encoders_[field].fit(X[[field]])
+
+    def save(self, path: str) -> None:
+        """Save preprocessor state to joblib file."""
+        import joblib
+        joblib.dump({
+            'df_field': self.df_field,
+            'fill_values_': self.fill_values_,
+            'outlier_bounds_': self.outlier_bounds_,
+            'scalers_': self.scalers_,
+            'encoders_': self.encoders_,
+            'feature_names_in_': self.feature_names_in_,
+            'enable_missing': self.enable_missing,
+            'enable_outlier': self.enable_outlier,
+            'enable_encoding': self.enable_encoding,
+            'enable_standardization': self.enable_standardization,
+        }, path)
+
+    @classmethod
+    def load(cls, path: str) -> "ConfigDrivenPreprocessor":
+        """Load preprocessor state from joblib file."""
+        import joblib
+        data = joblib.load(path)
+        instance = cls(
+            df_field=data['df_field'],
+            enable_missing=data['enable_missing'],
+            enable_outlier=data['enable_outlier'],
+            enable_encoding=data['enable_encoding'],
+            enable_standardization=data['enable_standardization'],
+        )
+        instance.fill_values_ = data['fill_values_']
+        instance.outlier_bounds_ = data['outlier_bounds_']
+        instance.scalers_ = data['scalers_']
+        instance.encoders_ = data['encoders_']
+        instance.feature_names_in_ = data['feature_names_in_']
+        return instance
