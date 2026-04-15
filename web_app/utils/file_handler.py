@@ -570,6 +570,55 @@ def infer_field_type(series: pd.Series) -> str:
     return "str"
 
 
+def auto_generate_field_config(
+    df: pd.DataFrame,
+    label_col: str,
+    key_col: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    根据 DataFrame 自动生成字段配置
+
+    使用 infer_field_type 自动推断字段类型，并设置合理的默认处理规则。
+
+    Args:
+        df: 输入 DataFrame
+        label_col: 目标变量列名
+        key_col: 可选，ID/键列名
+
+    Returns:
+        配置 DataFrame，包含 field_name, field_type, outlier_value,
+        missing_value, ecode_type, standardize_type 列
+    """
+    config_data = []
+
+    for col in df.columns:
+        if col == label_col:
+            field_type = "label"
+        elif col == key_col:
+            field_type = "key"
+        else:
+            field_type = infer_field_type(df[col])
+
+        # 缺失值处理默认规则
+        missing_value = np.nan
+        if df[col].isna().sum() > 0:
+            if field_type == 'num':
+                missing_value = 'mean'
+            else:
+                missing_value = 'mode'
+
+        config_data.append({
+            "field_name": col,
+            "field_type": field_type,
+            "outlier_value": np.nan,
+            "missing_value": missing_value,
+            "ecode_type": "one-hot" if field_type == "str" else np.nan,
+            "standardize_type": "z-score" if field_type == "num" else np.nan,
+        })
+
+    return pd.DataFrame(config_data)
+
+
 # ============================================================================
 # 文件下载
 # ============================================================================
