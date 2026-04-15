@@ -20,6 +20,7 @@ from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import roc_auc_score, f1_score
 from sklearn.feature_selection import SelectFromModel
 from model_code.model_factory import ModelFactory
+from model_code.utils import ConfigDrivenPreprocessor, smart_sampling
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +42,9 @@ class AutoTrainer:
         min_improvement: float = 0.001,
         model_dir: Optional[Path] = None,
         algorithm: str = "auto",
+        preprocessor: Optional[ConfigDrivenPreprocessor] = None,
+        enable_sampling: bool = False,
+        sampling_config: Optional[Dict[str, Any]] = None,
     ):
         """
         初始化自动训练器
@@ -58,6 +62,10 @@ class AutoTrainer:
             early_stopping_rounds: 提前停止轮数
             min_improvement: 最小改进阈值
             model_dir: 模型保存目录
+            algorithm: 算法标识 (默认 "auto" 回退到 lightgbm)
+            preprocessor: 预处理管道 (可选)
+            enable_sampling: 是否启用智能抽样
+            sampling_config: 抽样配置字典
         """
         self.base_config = base_config
         self.max_iterations = max_iterations
@@ -66,6 +74,11 @@ class AutoTrainer:
         self.model_dir = Path(model_dir) if model_dir else Path("model_code/saved")
         self.model_dir.mkdir(parents=True, exist_ok=True)
         self.algorithm = algorithm  # 算法标识，默认 "auto" 回退到 lightgbm
+
+        # 预处理管道
+        self.preprocessor = preprocessor
+        self.enable_sampling = enable_sampling
+        self.sampling_config = sampling_config or {"negative_ratio": 0.1, "random_state": 42}
 
         # 迭代历史
         self.history: List[Dict[str, Any]] = []
@@ -80,6 +93,7 @@ class AutoTrainer:
     def _get_data_split(self) -> Tuple[Any, Any, Any, Any]:
         """
         获取训练/测试数据 - 优先使用预划分数据，防止数据穿越
+        支持预处理管道和智能抽样
 
         Returns:
             X_train, X_test, y_train, y_test
@@ -94,20 +108,44 @@ class AutoTrainer:
 
             # 如果也提供了预划分测试集，使用它
             if 'X_test' in self.base_config and 'y_test' in self.base_config:
-                return X_train, self.base_config['X_test'], y_train, self.base_config['y_test']
-
-            # 没有预划分测试集，从训练集再分一份 (仅用于内部验证)
-            X_train_sub, X_val, y_train_sub, y_val = train_test_split(
-                X_train, y_train, test_size=test_size, random_state=random_state, stratify=y_train
+                X_test = self.base_config['X_test']
+                y_test = self.base_config['y_test']
+            else:
+                # 没有预划分测试集，从训练集再分一份 (仅用于内部验证)
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_train, y_train, test_size=test_size, random_state=random_state, stratify=y_train
+                )
+        else:
+            # 回退：从原始数据划分 (存在数据穿越风险，仅用于独立使用场景)
+            X = self.base_config['X']
+            y = self.base_config['y']
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, random_state=random_state, stratify=y
             )
-            return X_train_sub, X_val, y_train_sub, y_val
 
-        # 回退：从原始数据划分 (存在数据穿越风险，仅用于独立使用场景)
-        X = self.base_config['X']
-        y = self.base_config['y']
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
-        )
+        # ---- 数据预处理 (仅在训练集上 fit，防止数据穿越) ----
+        if self.preprocessor is not None:
+            if self.preprocessor.feature_names_in_ is None:
+                self.preprocessor.fit(X_train)
+            X_train = self.preprocessor.transform(X_train)
+            X_test = self.preprocessor.transform(X_test)
+            logger.info(f"数据预处理完成 (缺失值={self.preprocessor.enable_missing}, "
+                        f"异常值={self.preprocessor.enable_outlier}, "
+                        f"编码={self.preprocessor.enable_encoding}, "
+                        f"标准化={self.preprocessor.enable_standardization})")
+
+        # ---- 智能抽样 (可选) ----
+        if self.enable_sampling:
+            train_df = X_train.copy()
+            train_df['_label'] = y_train
+            neg_ratio = self.sampling_config.get("negative_ratio", 0.1)
+            rs = self.sampling_config.get("random_state", random_state)
+            logger.info(f"执行负样本欠采样 (负样本比例={neg_ratio:.2f})...")
+            sampled_df = smart_sampling(train_df, label_col='_label',
+                                        negative_ratio=neg_ratio, random_state=rs)
+            y_train = sampled_df['_label']
+            X_train = sampled_df.drop(columns=['_label'])
+
         return X_train, X_test, y_train, y_test
     
     def train_iteration(self, iteration: int, params: Optional[Dict] = None) -> Dict[str, Any]:
@@ -350,6 +388,69 @@ class AutoTrainer:
         """中断训练"""
         self.interrupted = True
         logger.info("训练已中断")
+
+    @classmethod
+    def from_file(
+        cls,
+        file_path: str,
+        label_col: str,
+        field_config: Optional[pd.DataFrame] = None,
+        key_col: Optional[str] = None,
+        algorithm: str = "auto",
+        enable_preprocessing: bool = True,
+        enable_sampling: bool = False,
+        sampling_config: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> "AutoTrainer":
+        """
+        从数据文件创建 AutoTrainer (独立使用模式)
+
+        支持自动读取 CSV/Excel 文件，自动生成字段配置。
+
+        Args:
+            file_path: CSV 或 Excel 文件路径
+            label_col: 目标变量列名
+            field_config: 可选，字段配置 DataFrame。如果为 None 则自动生成。
+            key_col: 可选，ID/键列名
+            algorithm: 算法标识
+            enable_preprocessing: 是否启用预处理管道
+            enable_sampling: 是否启用负样本欠采样
+            sampling_config: 采样配置
+            **kwargs: 额外的 AutoTrainer 构造函数参数
+
+        Returns:
+            AutoTrainer 实例
+        """
+        from web_app.utils.file_handler import read_file_from_path
+
+        df = read_file_from_path(file_path)
+        if df is None:
+            raise ValueError(f"无法读取文件：{file_path}")
+
+        X = df.drop(columns=[label_col])
+        y = df[label_col]
+
+        preprocessor = None
+        if enable_preprocessing:
+            if field_config is None:
+                field_config = auto_generate_field_config(df, label_col, key_col)
+            preprocessor = ConfigDrivenPreprocessor(field_config)
+
+        config: Dict[str, Any] = {
+            'X': X,
+            'y': y,
+            'test_size': 0.3,
+            'random_state': 42,
+        }
+
+        return cls(
+            base_config=config,
+            algorithm=algorithm,
+            preprocessor=preprocessor,
+            enable_sampling=enable_sampling,
+            sampling_config=sampling_config,
+            **kwargs,
+        )
     
     def run(self) -> Dict[str, Any]:
         """
@@ -507,6 +608,57 @@ class AutoTrainer:
         return fig
 
 
+def auto_generate_field_config(
+    df: pd.DataFrame,
+    label_col: str,
+    key_col: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    根据 DataFrame 自动生成字段配置
+
+    使用 infer_field_type 自动推断字段类型，并设置合理的默认处理规则。
+
+    Args:
+        df: 输入 DataFrame
+        label_col: 目标变量列名
+        key_col: 可选，ID/键列名
+
+    Returns:
+        配置 DataFrame，包含 field_name, field_type, outlier_value,
+        missing_value, ecode_type, standardize_type 列
+    """
+    from web_app.utils.file_handler import infer_field_type
+
+    config_data = []
+
+    for col in df.columns:
+        if col == label_col:
+            field_type = "label"
+        elif col == key_col:
+            field_type = "key"
+        else:
+            field_type = infer_field_type(df[col])
+
+        # 缺失值处理默认规则
+        missing_value = np.nan
+        if df[col].isna().sum() > 0:
+            if field_type == 'num':
+                missing_value = 'mean'
+            else:
+                missing_value = 'mode'
+
+        config_data.append({
+            "field_name": col,
+            "field_type": field_type,
+            "outlier_value": np.nan,
+            "missing_value": missing_value,
+            "ecode_type": "one-hot" if field_type == "str" else np.nan,
+            "standardize_type": "z-score" if field_type == "num" else np.nan,
+        })
+
+    return pd.DataFrame(config_data)
+
+
 def run_auto_training(
     X: pd.DataFrame,
     y: pd.Series,
@@ -517,6 +669,10 @@ def run_auto_training(
     y_train: Optional[pd.Series] = None,
     X_test: Optional[pd.DataFrame] = None,
     y_test: Optional[pd.Series] = None,
+    algorithm: str = "auto",
+    preprocessor: Optional[ConfigDrivenPreprocessor] = None,
+    enable_sampling: bool = False,
+    sampling_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     便捷函数：运行自动训练
@@ -531,6 +687,10 @@ def run_auto_training(
         y_train: 训练集标签 (可选，推荐提供以防止数据穿越)
         X_test: 测试集特征 (可选)
         y_test: 测试集标签 (可选)
+        algorithm: 算法标识
+        preprocessor: 预处理管道
+        enable_sampling: 是否启用智能抽样
+        sampling_config: 采样配置
 
     Returns:
         训练总结
@@ -554,7 +714,11 @@ def run_auto_training(
     trainer = AutoTrainer(
         base_config=config,
         max_iterations=max_iterations,
-        model_dir=model_dir
+        model_dir=model_dir,
+        algorithm=algorithm,
+        preprocessor=preprocessor,
+        enable_sampling=enable_sampling,
+        sampling_config=sampling_config,
     )
     
     return trainer.run()
