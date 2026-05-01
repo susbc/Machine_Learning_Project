@@ -43,7 +43,8 @@ TAB_LABELS = [
 tab_data_ui, tab_config_ui, tab_eda_ui, tab_train_ui, tab_model_ui, tab_predict_ui = st.tabs(TAB_LABELS)
 
 with tab_data_ui:
-    st.info("待实现：数据准备 Tab（Task 2）")
+    from web_app.manual_training import tab_data
+    tab_data.render()
 with tab_config_ui:
     st.info("待实现：字段配置 Tab（Task 3）")
 with tab_eda_ui:
