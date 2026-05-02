@@ -332,6 +332,17 @@ def _encode_test_data(X_test):
     return X_encoded
 
 
+def _safe_y_mean(y_test) -> float:
+    """计算 y_test 的均值；若 y 是字符串则改为 mode 占比。"""
+    import pandas as pd
+
+    arr = y_test if isinstance(y_test, pd.Series) else pd.Series(y_test)
+    if arr.dtype == "object":
+        mode_val = arr.mode().iloc[0]
+        return float((arr == mode_val).mean())
+    return float(arr.mean())
+
+
 def _render_model_compare() -> None:
     import pandas as pd
     import numpy as np
@@ -428,7 +439,7 @@ def _render_model_compare() -> None:
             with col1:
                 st.metric("测试集样本数", len(y_test))
             with col2:
-                y_mean = y_test.mean() if hasattr(y_test, "mean") else np.mean(y_test)
+                y_mean = _safe_y_mean(y_test)
                 st.metric("正样本比例", f"{y_mean:.2%}")
         else:
             st.warning("训练结果中未找到测试集数据，将使用当前数据重新划分")
@@ -455,7 +466,7 @@ def _render_model_compare() -> None:
             with col1:
                 st.metric("测试集样本数", len(y_test))
             with col2:
-                y_mean = y_test.mean() if hasattr(y_test, "mean") else np.mean(y_test)
+                y_mean = _safe_y_mean(y_test)
                 st.metric("正样本比例", f"{y_mean:.2%}")
     else:
         st.info("使用当前上传的数据划分测试集")
@@ -488,7 +499,7 @@ def _render_model_compare() -> None:
         with col1:
             st.metric("测试集样本数", len(y_test))
         with col2:
-            y_mean = y_test.mean() if hasattr(y_test, "mean") else np.mean(y_test)
+            y_mean = _safe_y_mean(y_test)
             st.metric("正样本比例", f"{y_mean:.2%}")
 
     st.markdown("---")
