@@ -31,10 +31,24 @@ def render() -> None:
     )
 
     # LLM 推荐参数「应用」前置：必须在 widget 渲染之前 pop
+    # 同时写固定模式 (train_<k>) 和范围模式 (train_range_<k>) 两套 key，
+    # 这样不论用户启用搜索与否都能看到推荐值生效。
     if "train_llm_pending_apply" in st.session_state:
         pending = st.session_state.pop("train_llm_pending_apply")
         for k, v in pending.items():
+            # 固定值
             st.session_state[f"train_{k}"] = v
+            # 范围模式：以推荐值为中心向两端扩展（数值参数）
+            range_key = f"train_range_{k}"
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                # 简单策略：±20% 形成搜索区间
+                lo = v * 0.7 if v > 0 else v - abs(v) * 0.3 - 1
+                hi = v * 1.3 if v > 0 else v + abs(v) * 0.3 + 1
+                if isinstance(v, int):
+                    lo, hi = int(round(lo)), int(round(hi))
+                st.session_state[range_key] = (lo, hi)
+            elif isinstance(v, str):
+                st.session_state[range_key] = [v]
 
     # 算法推荐「采纳」前置：必须在 selectbox 渲染之前写 widget key
     if "train_algo_pending_adopt" in st.session_state:
@@ -166,58 +180,8 @@ def render() -> None:
 
     st.markdown("---")
 
-    # ====== 动态参数 widgets ======
-    st.subheader("⚙️ 模型参数配置")
-
-    with st.expander(f"{ModelFactory.get_display_name(selected_algo)} 参数设置", expanded=True):
-        specs = get_specs(selected_algo)
-        collected_params = {}
-        cols = st.columns(3)
-        for i, spec in enumerate(specs):
-            with cols[i % 3]:
-                widget_key = f"train_{spec.name}"
-                current = st.session_state.model_params.get(spec.name, spec.default)
-                if spec.widget == "slider":
-                    v = st.slider(
-                        spec.label,
-                        min_value=spec.min_value,
-                        max_value=spec.max_value,
-                        value=current,
-                        step=spec.step,
-                        format=spec.fmt,
-                        help=spec.help,
-                        key=widget_key,
-                    )
-                elif spec.widget == "select":
-                    idx = spec.options.index(current) if current in spec.options else 0
-                    v = st.selectbox(
-                        spec.label,
-                        options=spec.options,
-                        index=idx,
-                        help=spec.help,
-                        key=widget_key,
-                    )
-                elif spec.widget == "number_input":
-                    v = st.number_input(
-                        spec.label,
-                        value=current,
-                        min_value=spec.min_value or 0,
-                        max_value=spec.max_value,
-                        step=spec.step,
-                        help=spec.help,
-                        key=widget_key,
-                    )
-                elif spec.widget == "checkbox":
-                    v = st.checkbox(
-                        spec.label,
-                        value=current,
-                        help=spec.help,
-                        key=widget_key,
-                    )
-                collected_params[spec.name] = v
-
-    # 训练配置
-    st.markdown("**📊 训练配置**")
+    # ====== 训练配置（先于参数配置，决定参数 widget 模式）======
+    st.subheader("📊 训练配置")
     col1, col2, col3 = st.columns(3)
     with col1:
         test_size = st.slider(
@@ -249,9 +213,9 @@ def render() -> None:
         )
 
     use_grid_search = st.checkbox(
-        "启用随机网格搜索调参",
+        "🔍 启用随机网格搜索调参",
         value=True,
-        help="启用后会尝试不同的参数组合，寻找最优参数",
+        help="启用后参数滑块将变为范围模式，搜索器在范围内随机采样组合寻找最优参数",
         key="train_use_grid_search",
     )
 
@@ -267,7 +231,101 @@ def render() -> None:
     else:
         n_iter = 1
 
-    st.session_state.model_params = collected_params
+    # ====== 动态参数 widgets ======
+    if use_grid_search:
+        st.subheader("⚙️ 参数搜索范围")
+        st.caption("拖动滑块两端定义搜索范围，select 类参数勾选要搜索的选项")
+    else:
+        st.subheader("⚙️ 模型参数配置")
+
+    collected_params = {}        # 固定参数模式 → {name: value}
+    collected_ranges = {}        # 搜索模式 → {name: (low, high) | [options]}
+
+    with st.expander(f"{ModelFactory.get_display_name(selected_algo)} 参数", expanded=True):
+        specs = get_specs(selected_algo)
+        cols = st.columns(3)
+        for i, spec in enumerate(specs):
+            with cols[i % 3]:
+                widget_key = f"train_{spec.name}"
+                range_key = f"train_range_{spec.name}"
+                current = st.session_state.model_params.get(spec.name, spec.default)
+
+                if use_grid_search and spec.widget == "slider":
+                    # 范围模式：两端滑块
+                    default_lo = st.session_state.get(range_key, (spec.min_value, spec.max_value))
+                    if not isinstance(default_lo, tuple) or len(default_lo) != 2:
+                        default_lo = (spec.min_value, spec.max_value)
+                    rng = st.slider(
+                        spec.label + " 范围",
+                        min_value=spec.min_value,
+                        max_value=spec.max_value,
+                        value=default_lo,
+                        step=spec.step,
+                        format=spec.fmt,
+                        help=(spec.help or "") + "（搜索区间）",
+                        key=range_key,
+                    )
+                    collected_ranges[spec.name] = rng
+
+                elif use_grid_search and spec.widget == "select":
+                    # select 改为多选
+                    default_sel = st.session_state.get(range_key, list(spec.options))
+                    if not isinstance(default_sel, list):
+                        default_sel = list(spec.options)
+                    sel = st.multiselect(
+                        spec.label + " 候选",
+                        options=spec.options,
+                        default=default_sel,
+                        help=(spec.help or "") + "（搜索候选）",
+                        key=range_key,
+                    )
+                    collected_ranges[spec.name] = sel if sel else list(spec.options)
+
+                else:
+                    # 固定参数模式
+                    if spec.widget == "slider":
+                        v = st.slider(
+                            spec.label,
+                            min_value=spec.min_value,
+                            max_value=spec.max_value,
+                            value=current,
+                            step=spec.step,
+                            format=spec.fmt,
+                            help=spec.help,
+                            key=widget_key,
+                        )
+                    elif spec.widget == "select":
+                        idx = spec.options.index(current) if current in spec.options else 0
+                        v = st.selectbox(
+                            spec.label,
+                            options=spec.options,
+                            index=idx,
+                            help=spec.help,
+                            key=widget_key,
+                        )
+                    elif spec.widget == "number_input":
+                        v = st.number_input(
+                            spec.label,
+                            value=current,
+                            min_value=spec.min_value or 0,
+                            max_value=spec.max_value,
+                            step=spec.step,
+                            help=spec.help,
+                            key=widget_key,
+                        )
+                    elif spec.widget == "checkbox":
+                        v = st.checkbox(
+                            spec.label,
+                            value=current,
+                            help=spec.help,
+                            key=widget_key,
+                        )
+                    collected_params[spec.name] = v
+
+    # 训练时统一从 collected_params / collected_ranges 取，不再写 model_params
+    if not use_grid_search:
+        st.session_state.model_params = collected_params
+    st.session_state.train_param_ranges = collected_ranges
 
     # ====== LLM 一键调参区块 ======
     st.markdown("---")
@@ -510,11 +568,14 @@ def render() -> None:
 
             add_training_log(f"\n使用 {ModelFactory.get_display_name(selected_algo)} 模型训练...")
 
+            # 启用搜索时 base_model 用默认参数构建（具体值由搜索器在范围内采样）
+            # 不启用搜索时用 UI 收集的具体值
+            build_params = {} if use_grid_search else st.session_state.model_params
             try:
                 base_model = ModelFactory.build(
                     algorithm=selected_algo,
                     task_type="binary",
-                    params=st.session_state.model_params,
+                    params=build_params,
                 )
             except ImportError as e:
                 add_training_log(f"\n❌ {selected_algo} 未安装：{e}")
@@ -548,7 +609,32 @@ def render() -> None:
 
             if use_grid_search and n_iter > 1:
                 add_training_log(f"\n执行随机网格搜索 (n_iter={n_iter}, cv={cv_folds})...")
-                param_grid = ModelFactory.get_param_grid(selected_algo)
+
+                # 基于 UI 范围生成 param_grid
+                user_ranges = st.session_state.get("train_param_ranges", {})
+                specs_for_grid = get_specs(selected_algo)
+                spec_map = {s.name: s for s in specs_for_grid}
+                param_grid = {}
+                for name, rng in user_ranges.items():
+                    spec = spec_map.get(name)
+                    if spec is None:
+                        continue
+                    if spec.widget == "slider" and isinstance(rng, tuple):
+                        low, high = rng
+                        if low == high:
+                            param_grid[name] = [low]
+                        elif isinstance(spec.default, int):
+                            step = max(int(spec.step or 1), 1)
+                            vals = list(range(int(low), int(high) + 1, step))
+                            param_grid[name] = vals if vals else [int(low)]
+                        else:
+                            # 连续：在范围内取 8 个等距值
+                            param_grid[name] = list(np.linspace(low, high, 8))
+                    elif spec.widget == "select" and isinstance(rng, list) and rng:
+                        param_grid[name] = rng
+
+                add_training_log(f"搜索空间：{ {k: f'{len(v)} 候选' for k, v in param_grid.items()} }")
+
                 random_search = RandomizedSearchCV(
                     estimator=base_model,
                     param_distributions=param_grid,
@@ -562,6 +648,8 @@ def render() -> None:
                 random_search.fit(X_train, y_train)
                 model = random_search.best_estimator_
                 add_training_log(f"最佳参数：{random_search.best_params_}")
+                # 把搜出的最优参数作为本次 model_params 记录
+                st.session_state.model_params = dict(random_search.best_params_)
                 st.session_state.cv_results = random_search.cv_results_
             else:
                 add_training_log("\n使用固定参数训练...")
