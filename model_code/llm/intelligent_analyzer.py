@@ -578,6 +578,105 @@ class IntelligentAnalyzer:
         return str(filepath)
 
 
+    def recommend_hyperparameters(
+        self,
+        df: 'pd.DataFrame',
+        target_col: str,
+        model_type: str,
+        eda_summary: Optional[Dict] = None,
+        last_training: Optional[Dict] = None,
+        business_context: str = "",
+    ) -> str:
+        """
+        调用 LLM 推荐超参数。
+
+        复用已有的 hyperparameter_tuning 模板，
+        在末尾追加结构化 JSON 输出指令。
+
+        Args:
+            df: 完整数据框
+            target_col: 目标列名
+            model_type: 算法标识 (lightgbm / xgboost / ...)
+            eda_summary: EDA 摘要字典（可选）
+            last_training: 上次训练结果（可选）
+            business_context: 业务场景描述（可选）
+
+        Returns:
+            LLM 原文（包含 JSON + 解释文本）。
+        """
+        if pd is None:
+            raise RuntimeError("需要安装 pandas")
+
+        n_samples, n_features = df.shape
+        n_numeric = len(df.select_dtypes(include=['int64', 'float64']).columns)
+        n_categorical = len(df.select_dtypes(include=['object', 'category']).columns)
+        missing_rate = float(df.isna().sum().sum()) / (n_samples * n_features)
+
+        # 类别不平衡
+        if df[target_col].nunique() == 2:
+            class_dist = df[target_col].value_counts(normalize=True)
+            imbalance_ratio = float(class_dist.min() / class_dist.max())
+        else:
+            imbalance_ratio = 1.0
+
+        # 高相关对（取前 5）
+        high_corr_pairs = []
+        if eda_summary and "high_corr_pairs" in eda_summary:
+            high_corr_pairs = eda_summary["high_corr_pairs"][:5]
+
+        # 异常值率（仅数值列）
+        outlier_summary = {}
+        if eda_summary and "outlier_rates" in eda_summary:
+            outlier_summary = eda_summary["outlier_rates"]
+
+        # 上次训练结果
+        last_params = last_training.get("model_params", {}) if last_training else {}
+        last_auc = last_training.get("test_auc") if last_training else None
+
+        # 使用已有的 hyperparameter_tuning 模板
+        current_params_str = json.dumps(last_params, indent=2, ensure_ascii=False) if last_params else f"用户将为 {model_type} 手动设置参数"
+        history_text = f"上次训练 AUC: {last_auc:.4f}" if last_auc else "首次训练"
+
+        prompt = self.prompts['hyperparameter_tuning'].format(
+            model_type=model_type,
+            current_params=current_params_str,
+            history_records=history_text,
+            performance_history="",
+            max_train_time="未限制",
+            compute_resources="单 CPU",
+        )
+
+        # 追加数据画像 + JSON 输出指令
+        json_instruction = f"""
+
+## 当前数据画像
+- 样本量：{n_samples}
+- 特征数：{n_features}（数值：{n_numeric}，类别：{n_categorical}）
+- 缺失率：{missing_rate:.2%}
+- 类别不平衡比（少数/多数）：{imbalance_ratio:.4f}
+- 高相关特征对：{high_corr_pairs if high_corr_pairs else '无'}
+- 异常值概况：{outlier_summary if outlier_summary else '无'}
+- 目标列：{target_col}
+- 算法：{model_type}
+
+## 输出要求
+请在回答末尾输出一个完整的 JSON 代码块（用 ```json 包围），格式如下：
+```json
+{{
+  "params": {{
+    "n_estimators": 300,
+    "learning_rate": 0.05
+  }},
+  "reasoning": "一段简短的理由，说明为什么推荐这些参数"
+}}
+```
+JSON 中只包含适用于 {model_type} 的参数。参数值必须在 UI 控件的合理范围内。
+"""
+
+        messages = [{"role": "user", "content": prompt + json_instruction}]
+        return self.llm_manager.chat(messages, temperature=0.3)
+
+
 # 单例模式
 _analyzer_instance: Optional[IntelligentAnalyzer] = None
 
