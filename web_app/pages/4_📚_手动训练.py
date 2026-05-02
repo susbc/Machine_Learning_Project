@@ -52,7 +52,8 @@ with tab_eda_ui:
     from web_app.manual_training import tab_eda
     tab_eda.render()
 with tab_train_ui:
-    st.info("待实现：模型训练 Tab（Task 5）")
+    from web_app.manual_training import tab_train
+    tab_train.render()
 with tab_model_ui:
     st.info("待实现：模型管理与对比 Tab（Task 6）")
 with tab_predict_ui:
