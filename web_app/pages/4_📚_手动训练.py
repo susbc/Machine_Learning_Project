@@ -58,4 +58,5 @@ with tab_model_ui:
     from web_app.manual_training import tab_model_mgmt
     tab_model_mgmt.render()
 with tab_predict_ui:
-    st.info("待实现：预测与结果 Tab（Task 7）")
+    from web_app.manual_training import tab_predict
+    tab_predict.render()
