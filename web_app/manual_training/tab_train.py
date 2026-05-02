@@ -62,20 +62,18 @@ def render() -> None:
     algo_options = get_supported_algorithms()
     algo_labels = [ModelFactory.get_display_name(a) for a in algo_options]
 
-    current_algo_idx = st.session_state.get("train_algorithm_idx", 0)
-    if current_algo_idx >= len(algo_options):
-        current_algo_idx = 0
+    # 默认值（仅在 widget 首次渲染时生效）
+    if "train_algo_selectbox" not in st.session_state:
+        st.session_state.train_algo_selectbox = algo_labels[0]
 
     col_algo, col_btn = st.columns([3, 1])
     with col_algo:
         selected_algo_display = st.selectbox(
             "选择算法",
             options=algo_labels,
-            index=current_algo_idx,
             key="train_algo_selectbox",
         )
     selected_algo = algo_options[algo_labels.index(selected_algo_display)]
-    st.session_state.train_algorithm_idx = algo_labels.index(selected_algo_display)
     st.session_state.train_algorithm = selected_algo
 
     # 智能推荐按钮
@@ -152,8 +150,9 @@ def render() -> None:
             col_rec1, col_rec2 = st.columns(2)
             with col_rec1:
                 if st.button("✅ 采纳推荐", use_container_width=True, type="primary", key="train_algo_adopt_btn"):
-                    recommended_idx = algo_options.index(rec["recommended"])
-                    st.session_state.train_algorithm_idx = recommended_idx
+                    # 直接修改 selectbox 的 widget key 才能生效
+                    st.session_state.train_algo_selectbox = ModelFactory.get_display_name(rec["recommended"])
+                    st.session_state.train_algorithm = rec["recommended"]
                     st.session_state.train_algo_show_recommendation = False
                     st.rerun()
             with col_rec2:
