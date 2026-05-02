@@ -272,28 +272,48 @@ def render() -> None:
     # ====== LLM 一键调参区块 ======
     st.markdown("---")
     st.subheader("🤖 LLM 一键调参")
+    st.caption("基于当前数据画像 + 上次训练结果，让 LLM 推荐最优参数组合")
 
     from web_app.manual_training.llm_tuning import recommend_params, LLMTuningError
 
     llm_state = st.session_state.get("train_llm_state", "idle")
     llm_rec = st.session_state.get("train_llm_recommendation")
+    llm_error = st.session_state.get("train_llm_error")
+    llm_raw_backup = st.session_state.get("train_llm_raw_backup", "")
 
-    if llm_state == "idle" or llm_state == "error":
-        if st.button("🤖 LLM 推荐参数", use_container_width=True, key="train_llm_request_btn"):
+    # 错误提示（在按钮上方显示）
+    if llm_state == "error" and llm_error:
+        st.error(f"❌ {llm_error}")
+        if llm_raw_backup:
+            with st.expander("查看 LLM 原始响应（用于调试）", expanded=False):
+                st.code(llm_raw_backup, language="text")
+
+    if llm_state in ("idle", "error"):
+        if st.button(
+            f"🤖 调用 LLM 为 {ModelFactory.get_display_name(selected_algo)} 推荐参数",
+            use_container_width=True,
+            type="secondary",
+            key="train_llm_request_btn",
+        ):
             from model_code.llm.llm_connector import get_llm_manager
             llm_mgr = get_llm_manager()
             if not llm_mgr.providers:
-                st.warning("⚠️ 请先在「12_大模型配置管理」页面配置 LLM 提供商")
+                st.warning("⚠️ 请先在「12_大模型配置管理」页面配置并启用 LLM 提供商")
+            elif llm_mgr.get_active_provider() is None:
+                st.warning("⚠️ 没有激活的 LLM 提供商，请去「12_大模型配置管理」激活一个")
             else:
                 st.session_state.train_llm_state = "loading"
+                st.session_state.train_llm_error = None
+                st.session_state.train_llm_raw_backup = ""
                 st.rerun()
 
     if llm_state == "loading":
-        with st.spinner("正在调用 LLM 分析并推荐参数..."):
+        with st.spinner("🤖 LLM 正在分析数据画像并生成参数建议... (可能需要 10-30 秒)"):
             try:
-                label_col_llm = st.session_state.field_config[
-                    st.session_state.field_config["field_type"] == "label"
-                ]["field_name"].values[0]
+                label_rows = config_df[config_df["field_type"] == "label"]
+                if len(label_rows) == 0:
+                    raise LLMTuningError("配置表中未指定 label 字段")
+                label_col_llm = label_rows["field_name"].values[0]
                 result = recommend_params(
                     df=df,
                     target_col=label_col_llm,
@@ -303,34 +323,80 @@ def render() -> None:
                 )
                 st.session_state.train_llm_recommendation = result
                 st.session_state.train_llm_state = "has_recommendation"
+                st.session_state.train_llm_error = None
             except LLMTuningError as e:
                 st.session_state.train_llm_error = str(e)
-                st.session_state.train_llm_raw_backup = ""
+                # 尝试保留原始响应供调试
+                try:
+                    from model_code.llm.intelligent_analyzer import get_intelligent_analyzer
+                    # 已经请求过的话不再请求；保留空
+                except Exception:
+                    pass
                 st.session_state.train_llm_state = "error"
             except Exception as e:
-                st.session_state.train_llm_error = f"调用 LLM 失败：{e}"
+                import traceback
+                st.session_state.train_llm_error = f"调用 LLM 失败：{type(e).__name__}: {e}"
+                st.session_state.train_llm_raw_backup = traceback.format_exc()
                 st.session_state.train_llm_state = "error"
             st.rerun()
 
     if llm_state == "has_recommendation" and llm_rec:
-        with st.expander("🤖 LLM 推荐结果", expanded=True):
-            st.info(f"**推荐理由**\n\n{llm_rec['reasoning']}")
-            st.code(json.dumps(llm_rec["params"], indent=2, ensure_ascii=False), language="json")
-            if llm_rec.get("warnings"):
+        algo_display = ModelFactory.get_display_name(selected_algo)
+
+        # 顶部：策略卡片
+        st.success(
+            f"### 🏆 LLM 调参建议（{algo_display}）\n\n"
+            f"**总体策略**：{llm_rec.get('strategy') or '（LLM 未给出）'}"
+        )
+
+        # 数据分析
+        if llm_rec.get("data_analysis"):
+            st.markdown("#### 📊 数据画像分析")
+            st.info(llm_rec["data_analysis"])
+
+        # 推荐参数表格（参数名 + 当前值 + 推荐值 + 理由）
+        st.markdown("#### 🎛️ 推荐参数明细")
+        param_reasons = llm_rec.get("param_reasons", {}) or {}
+        rows = []
+        for k, v in llm_rec["params"].items():
+            current_v = st.session_state.model_params.get(k, "—")
+            rows.append({
+                "参数": k,
+                "当前值": current_v,
+                "推荐值": v,
+                "推荐理由": param_reasons.get(k, "—"),
+            })
+        import pandas as _pd
+        st.dataframe(_pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # 预期改进
+        if llm_rec.get("expected_improvement"):
+            st.markdown("#### 🎯 预期改进")
+            st.caption(llm_rec["expected_improvement"])
+
+        # 警告
+        if llm_rec.get("warnings"):
+            with st.expander(f"⚠️ {len(llm_rec['warnings'])} 条调整提示", expanded=False):
                 for w in llm_rec["warnings"]:
-                    st.warning(f"⚠️ {w}")
-            col_llm1, col_llm2 = st.columns(2)
-            with col_llm1:
-                if st.button("✅ 应用到参数控件", use_container_width=True, key="train_llm_apply_btn"):
-                    st.session_state.train_llm_pending_apply = llm_rec["params"]
-                    st.session_state.train_llm_state = "idle"
-                    st.session_state.train_llm_recommendation = None
-                    st.rerun()
-            with col_llm2:
-                if st.button("🗑️ 清除推荐", use_container_width=True, key="train_llm_clear_btn"):
-                    st.session_state.train_llm_state = "idle"
-                    st.session_state.train_llm_recommendation = None
-                    st.rerun()
+                    st.warning(w)
+
+        # 原始响应（调试用）
+        with st.expander("🔍 查看 LLM 原始响应", expanded=False):
+            st.code(llm_rec.get("raw", ""), language="text")
+
+        # 操作按钮
+        col_llm1, col_llm2 = st.columns(2)
+        with col_llm1:
+            if st.button("✅ 应用到参数控件", use_container_width=True, type="primary", key="train_llm_apply_btn"):
+                st.session_state.train_llm_pending_apply = llm_rec["params"]
+                st.session_state.train_llm_state = "idle"
+                st.session_state.train_llm_recommendation = None
+                st.rerun()
+        with col_llm2:
+            if st.button("🗑️ 清除推荐", use_container_width=True, key="train_llm_clear_btn"):
+                st.session_state.train_llm_state = "idle"
+                st.session_state.train_llm_recommendation = None
+                st.rerun()
 
     # ====== 训练控制区域 ======
     st.markdown("---")

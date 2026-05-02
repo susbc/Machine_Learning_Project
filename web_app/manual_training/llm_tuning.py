@@ -76,10 +76,21 @@ def _extract_json(text: str) -> str:
     if m:
         return m.group(1)
 
-    # Level 3: 首个包含 "params" 的大括号块
-    m = re.search(r"\{[^{}]*\"params\"[^{}]*\}", text, re.DOTALL)
-    if m:
-        return m.group(0)
+    # Level 3: 首个包含 "params" 的大括号块（贪婪匹配，支持嵌套）
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1]
+                    if '"params"' in candidate:
+                        return candidate
+                    break
+        start = text.find("{", start + 1)
 
     raise LLMTuningError("LLM 返回非 JSON 格式")
 
@@ -145,9 +156,12 @@ def recommend_params(
     Returns:
         {
             "params": {"n_estimators": 300, ...},
-            "reasoning": "...",
+            "param_reasons": {"n_estimators": "...", ...},
+            "data_analysis": "...",
+            "strategy": "...",
+            "expected_improvement": "...",
             "raw": "...",
-            "warnings": ["learning_rate 超出 UI 上限，已截到 0.3"],
+            "warnings": [...],
         }
 
     Raises:
@@ -157,6 +171,18 @@ def recommend_params(
 
     analyzer = get_intelligent_analyzer()
 
+    # 构造 param_ranges 给 LLM 参考
+    specs = get_specs(model_type)
+    param_ranges = {}
+    for spec in specs:
+        info = {"default": spec.default}
+        if spec.options:
+            info["options"] = spec.options
+        else:
+            info["min"] = spec.min_value
+            info["max"] = spec.max_value
+        param_ranges[spec.name] = info
+
     # 1. 调 LLM
     raw_response = analyzer.recommend_hyperparameters(
         df=df,
@@ -164,7 +190,11 @@ def recommend_params(
         model_type=model_type,
         eda_summary=eda_summary,
         last_training=last_training,
+        param_ranges=param_ranges,
     )
+
+    if not raw_response or not raw_response.strip():
+        raise LLMTuningError("LLM 返回空内容，请检查模型配置或网络")
 
     # 2. 鲁棒解析
     json_str = _extract_json(raw_response)
@@ -178,17 +208,23 @@ def recommend_params(
     if not params or not isinstance(params, dict):
         raise LLMTuningError("LLM 未给出可应用的参数")
 
-    reasoning = payload.get("reasoning", "")
-
     # 4. 过滤 + 截断
     clipped, warn_list = _clip_and_coerce(params, model_type)
-
     if not clipped:
-        raise LLMTuningError("LLM 未给出可应用的参数")
+        raise LLMTuningError("LLM 给出的参数全部不可用（不在 UI 暴露范围内）")
+
+    # 5. param_reasons 过滤（只保留 clipped 中存在的参数）
+    raw_reasons = payload.get("param_reasons") or {}
+    if not isinstance(raw_reasons, dict):
+        raw_reasons = {}
+    param_reasons = {k: raw_reasons[k] for k in clipped if k in raw_reasons}
 
     return {
         "params": clipped,
-        "reasoning": reasoning,
+        "param_reasons": param_reasons,
+        "data_analysis": payload.get("data_analysis", ""),
+        "strategy": payload.get("strategy", ""),
+        "expected_improvement": payload.get("expected_improvement", ""),
         "raw": raw_response,
         "warnings": warn_list,
     }

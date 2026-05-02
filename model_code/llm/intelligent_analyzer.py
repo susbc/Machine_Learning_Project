@@ -586,12 +586,10 @@ class IntelligentAnalyzer:
         eda_summary: Optional[Dict] = None,
         last_training: Optional[Dict] = None,
         business_context: str = "",
+        param_ranges: Optional[Dict[str, Dict]] = None,
     ) -> str:
         """
         调用 LLM 推荐超参数。
-
-        复用已有的 hyperparameter_tuning 模板，
-        在末尾追加结构化 JSON 输出指令。
 
         Args:
             df: 完整数据框
@@ -600,6 +598,7 @@ class IntelligentAnalyzer:
             eda_summary: EDA 摘要字典（可选）
             last_training: 上次训练结果（可选）
             business_context: 业务场景描述（可选）
+            param_ranges: UI 参数边界信息 {name: {min, max, default, options}}
 
         Returns:
             LLM 原文（包含 JSON + 解释文本）。
@@ -619,12 +618,9 @@ class IntelligentAnalyzer:
         else:
             imbalance_ratio = 1.0
 
-        # 高相关对（取前 5）
         high_corr_pairs = []
         if eda_summary and "high_corr_pairs" in eda_summary:
             high_corr_pairs = eda_summary["high_corr_pairs"][:5]
-
-        # 异常值率（仅数值列）
         outlier_summary = {}
         if eda_summary and "outlier_rates" in eda_summary:
             outlier_summary = eda_summary["outlier_rates"]
@@ -633,21 +629,27 @@ class IntelligentAnalyzer:
         last_params = last_training.get("model_params", {}) if last_training else {}
         last_auc = last_training.get("test_auc") if last_training else None
 
-        # 使用已有的 hyperparameter_tuning 模板
-        current_params_str = json.dumps(last_params, indent=2, ensure_ascii=False) if last_params else f"用户将为 {model_type} 手动设置参数"
-        history_text = f"上次训练 AUC: {last_auc:.4f}" if last_auc else "首次训练"
-
-        prompt = self.prompts['hyperparameter_tuning'].format(
-            model_type=model_type,
-            current_params=current_params_str,
-            history_records=history_text,
-            performance_history="",
-            max_train_time="未限制",
-            compute_resources="单 CPU",
+        current_params_str = (
+            json.dumps(last_params, indent=2, ensure_ascii=False)
+            if last_params
+            else f"首次训练 {model_type}，无历史参数"
         )
+        history_text = f"上次训练 AUC: {last_auc:.4f}" if last_auc else "首次训练，无历史"
 
-        # 追加数据画像 + JSON 输出指令
-        json_instruction = f"""
+        # 参数边界说明
+        param_range_text = ""
+        if param_ranges:
+            range_lines = []
+            for name, info in param_ranges.items():
+                if info.get("options"):
+                    range_lines.append(f"  - {name}: 选项 {info['options']}（默认 {info.get('default')}）")
+                else:
+                    range_lines.append(
+                        f"  - {name}: [{info.get('min')}, {info.get('max')}]（默认 {info.get('default')}）"
+                    )
+            param_range_text = "\n## UI 参数边界（必须严格遵守）\n" + "\n".join(range_lines)
+
+        prompt = f"""你是一位机器学习调参专家，请根据数据画像为 **{model_type}** 模型推荐合适的超参数。
 
 ## 当前数据画像
 - 样本量：{n_samples}
@@ -657,24 +659,44 @@ class IntelligentAnalyzer:
 - 高相关特征对：{high_corr_pairs if high_corr_pairs else '无'}
 - 异常值概况：{outlier_summary if outlier_summary else '无'}
 - 目标列：{target_col}
-- 算法：{model_type}
+
+## 历史信息
+- 当前参数：{current_params_str}
+- 训练历史：{history_text}
+
+## 业务场景
+{business_context or '通用机器学习建模'}
+{param_range_text}
 
 ## 输出要求
-请在回答末尾输出一个完整的 JSON 代码块（用 ```json 包围），格式如下：
+
+请输出**严格的 JSON**，必须用 ```json 包围，格式如下：
+
 ```json
 {{
+  "data_analysis": "对数据特点的简短分析（80-150 字），点明样本量级、平衡度、特征分布对调参的影响",
+  "strategy": "本次调参的总体策略（80-120 字），例如「降低过拟合风险 + 加速收敛」",
   "params": {{
-    "n_estimators": 300,
-    "learning_rate": 0.05
+    "param_name_1": value,
+    "param_name_2": value
   }},
-  "reasoning": "一段简短的理由，说明为什么推荐这些参数"
+  "param_reasons": {{
+    "param_name_1": "为什么推荐这个值（30-50 字）",
+    "param_name_2": "..."
+  }},
+  "expected_improvement": "对比默认/上次参数预期的改进点（50-100 字）"
 }}
 ```
-JSON 中只包含适用于 {model_type} 的参数。参数值必须在 UI 控件的合理范围内。
+
+约束：
+- `params` 中只包含适用于 {model_type} 的参数，参数值必须在「UI 参数边界」内
+- 所有文字字段必须使用中文
+- 必须给出 `param_reasons`（每个推荐参数都要有理由）
+- JSON 之外可附自由文本说明，但 JSON 必须完整有效
 """
 
-        messages = [{"role": "user", "content": prompt + json_instruction}]
-        return self.llm_manager.chat(messages, temperature=0.3)
+        messages = [{"role": "user", "content": prompt}]
+        return self.llm_manager.chat(messages, temperature=0.3, max_tokens=2500)
 
 
 # 单例模式
