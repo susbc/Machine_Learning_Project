@@ -10,6 +10,8 @@ tab_train.py — 模型训练 Tab
 不做行为/算法/参数变更。
 """
 
+import json
+
 import streamlit as st
 
 
@@ -28,6 +30,12 @@ def render() -> None:
         render_feature_importance,
     )
 
+    # LLM 推荐参数「应用」前置：必须在 widget 渲染之前 pop
+    if "train_llm_pending_apply" in st.session_state:
+        pending = st.session_state.pop("train_llm_pending_apply")
+        for k, v in pending.items():
+            st.session_state[f"train_{k}"] = v
+
     st.header("🚀 模型训练")
     st.markdown("---")
 
@@ -40,100 +48,111 @@ def render() -> None:
         st.warning("⚠️ 请先在「2️⃣ 字段配置」Tab 配置字段")
         return
 
-    # ====== 参数配置区域 ======
-    st.subheader("🎯 模型参数配置")
+    # ====== 算法选择 ======
+    st.subheader("🎯 算法选择")
 
-    with st.expander("⚙️ LightGBM 参数设置", expanded=True):
-        col1, col2, col3 = st.columns(3)
+    from web_app.manual_training.param_specs import get_specs, get_supported_algorithms
+    from model_code.model_factory import ModelFactory
+    from model_code.auto_selector import AutoModelSelector
 
-        with col1:
-            n_estimators = st.slider(
-                "n_estimators (树的数量)",
-                min_value=50,
-                max_value=1000,
-                value=st.session_state.model_params.get("n_estimators", 200),
-                step=50,
-                key="train_n_estimators",
-            )
+    algo_options = get_supported_algorithms()
+    algo_labels = [ModelFactory.get_display_name(a) for a in algo_options]
 
-            learning_rate = st.slider(
-                "learning_rate (学习率)",
-                min_value=0.001,
-                max_value=0.3,
-                value=st.session_state.model_params.get("learning_rate", 0.1),
-                step=0.01,
-                format="%.3f",
-                key="train_learning_rate",
-            )
+    current_algo_idx = st.session_state.get("train_algorithm_idx", 0)
+    if current_algo_idx >= len(algo_options):
+        current_algo_idx = 0
 
-            max_depth = st.slider(
-                "max_depth (树的最大深度)",
-                min_value=3,
-                max_value=15,
-                value=st.session_state.model_params.get("max_depth", 6),
-                step=1,
-                key="train_max_depth",
-            )
+    selected_algo_display = st.selectbox(
+        "选择算法",
+        options=algo_labels,
+        index=current_algo_idx,
+        key="train_algo_selectbox",
+    )
+    selected_algo = algo_options[algo_labels.index(selected_algo_display)]
+    st.session_state.train_algorithm_idx = algo_labels.index(selected_algo_display)
+    st.session_state.train_algorithm = selected_algo
 
-        with col2:
-            num_leaves = st.slider(
-                "num_leaves (叶子节点数)",
-                min_value=10,
-                max_value=200,
-                value=st.session_state.model_params.get("num_leaves", 50),
-                step=10,
-                key="train_num_leaves",
-            )
+    # 智能推荐按钮
+    if st.button("🧠 智能推荐算法", use_container_width=True, key="train_algo_recommend_btn"):
+        with st.spinner("正在分析数据并推荐算法..."):
+            label_col = st.session_state.field_config[
+                st.session_state.field_config["field_type"] == "label"
+            ]["field_name"].values[0]
+            feature_cols_raw = [c for c in df.columns if c != label_col]
+            feature_df = df[feature_cols_raw]
+            rec = AutoModelSelector.recommend(feature_df, df[label_col])
+            st.session_state.train_algo_recommendation = rec
+            st.session_state.train_algo_show_recommendation = True
 
-            min_child_samples = st.slider(
-                "min_child_samples (叶子最小样本数)",
-                min_value=5,
-                max_value=100,
-                value=st.session_state.model_params.get("min_child_samples", 20),
-                step=5,
-                key="train_min_child_samples",
-            )
+    if st.session_state.get("train_algo_show_recommendation"):
+        rec = st.session_state.train_algo_recommendation
+        with st.expander("🧠 算法推荐结果", expanded=True):
+            st.info(f"**推荐算法**: {ModelFactory.get_display_name(rec['recommended'])}\n\n**理由**: {rec['reason']}")
+            if rec.get("alternatives"):
+                st.caption(f"备选: {', '.join(ModelFactory.get_display_name(a) for a in rec['alternatives'][:3])}")
+            col_rec1, col_rec2 = st.columns(2)
+            with col_rec1:
+                if st.button("✅ 采纳推荐", use_container_width=True, key="train_algo_adopt_btn"):
+                    recommended_idx = algo_options.index(rec["recommended"])
+                    st.session_state.train_algorithm_idx = recommended_idx
+                    st.session_state.train_algo_show_recommendation = False
+                    st.rerun()
+            with col_rec2:
+                if st.button("❌ 关闭", use_container_width=True, key="train_algo_close_btn"):
+                    st.session_state.train_algo_show_recommendation = False
+                    st.rerun()
 
-            subsample = st.slider(
-                "subsample (样本采样比例)",
-                min_value=0.5,
-                max_value=1.0,
-                value=st.session_state.model_params.get("subsample", 0.9),
-                step=0.05,
-                format="%.2f",
-                key="train_subsample",
-            )
+    st.markdown("---")
 
-        with col3:
-            colsample_bytree = st.slider(
-                "colsample_bytree (特征采样比例)",
-                min_value=0.5,
-                max_value=1.0,
-                value=st.session_state.model_params.get("colsample_bytree", 0.9),
-                step=0.05,
-                format="%.2f",
-                key="train_colsample_bytree",
-            )
+    # ====== 动态参数 widgets ======
+    st.subheader("⚙️ 模型参数配置")
 
-            reg_alpha = st.slider(
-                "reg_alpha (L1 正则化)",
-                min_value=0.0,
-                max_value=10.0,
-                value=st.session_state.model_params.get("reg_alpha", 0.1),
-                step=0.1,
-                format="%.1f",
-                key="train_reg_alpha",
-            )
-
-            reg_lambda = st.slider(
-                "reg_lambda (L2 正则化)",
-                min_value=0.0,
-                max_value=10.0,
-                value=st.session_state.model_params.get("reg_lambda", 0.1),
-                step=0.1,
-                format="%.1f",
-                key="train_reg_lambda",
-            )
+    with st.expander(f"{ModelFactory.get_display_name(selected_algo)} 参数设置", expanded=True):
+        specs = get_specs(selected_algo)
+        collected_params = {}
+        cols = st.columns(3)
+        for i, spec in enumerate(specs):
+            with cols[i % 3]:
+                widget_key = f"train_{spec.name}"
+                current = st.session_state.model_params.get(spec.name, spec.default)
+                if spec.widget == "slider":
+                    v = st.slider(
+                        spec.label,
+                        min_value=spec.min_value,
+                        max_value=spec.max_value,
+                        value=current,
+                        step=spec.step,
+                        format=spec.fmt,
+                        help=spec.help,
+                        key=widget_key,
+                    )
+                elif spec.widget == "select":
+                    idx = spec.options.index(current) if current in spec.options else 0
+                    v = st.selectbox(
+                        spec.label,
+                        options=spec.options,
+                        index=idx,
+                        help=spec.help,
+                        key=widget_key,
+                    )
+                elif spec.widget == "number_input":
+                    v = st.number_input(
+                        spec.label,
+                        value=current,
+                        min_value=spec.min_value or 0,
+                        max_value=spec.max_value,
+                        step=spec.step,
+                        help=spec.help,
+                        key=widget_key,
+                    )
+                elif spec.widget == "checkbox":
+                    v = st.checkbox(
+                        spec.label,
+                        value=current,
+                        help=spec.help,
+                        key=widget_key,
+                    )
+                collected_params[spec.name] = v
 
     # 训练配置
     st.markdown("**📊 训练配置**")
@@ -186,17 +205,70 @@ def render() -> None:
     else:
         n_iter = 1
 
-    st.session_state.model_params = {
-        "n_estimators": n_estimators,
-        "learning_rate": learning_rate,
-        "max_depth": max_depth,
-        "num_leaves": num_leaves,
-        "min_child_samples": min_child_samples,
-        "subsample": subsample,
-        "colsample_bytree": colsample_bytree,
-        "reg_alpha": reg_alpha,
-        "reg_lambda": reg_lambda,
-    }
+    st.session_state.model_params = collected_params
+
+    # ====== LLM 一键调参区块 ======
+    st.markdown("---")
+    st.subheader("🤖 LLM 一键调参")
+
+    from web_app.manual_training.llm_tuning import recommend_params, LLMTuningError
+
+    llm_state = st.session_state.get("train_llm_state", "idle")
+    llm_rec = st.session_state.get("train_llm_recommendation")
+
+    if llm_state == "idle" or llm_state == "error":
+        if st.button("🤖 LLM 推荐参数", use_container_width=True, key="train_llm_request_btn"):
+            from model_code.llm.llm_connector import get_llm_manager
+            llm_mgr = get_llm_manager()
+            if not llm_mgr.providers:
+                st.warning("⚠️ 请先在「12_大模型配置管理」页面配置 LLM 提供商")
+            else:
+                st.session_state.train_llm_state = "loading"
+                st.rerun()
+
+    if llm_state == "loading":
+        with st.spinner("正在调用 LLM 分析并推荐参数..."):
+            try:
+                label_col_llm = st.session_state.field_config[
+                    st.session_state.field_config["field_type"] == "label"
+                ]["field_name"].values[0]
+                result = recommend_params(
+                    df=df,
+                    target_col=label_col_llm,
+                    model_type=selected_algo,
+                    eda_summary=st.session_state.get("eda_summary_cache"),
+                    last_training=st.session_state.get("training_results"),
+                )
+                st.session_state.train_llm_recommendation = result
+                st.session_state.train_llm_state = "has_recommendation"
+            except LLMTuningError as e:
+                st.session_state.train_llm_error = str(e)
+                st.session_state.train_llm_raw_backup = ""
+                st.session_state.train_llm_state = "error"
+            except Exception as e:
+                st.session_state.train_llm_error = f"调用 LLM 失败：{e}"
+                st.session_state.train_llm_state = "error"
+            st.rerun()
+
+    if llm_state == "has_recommendation" and llm_rec:
+        with st.expander("🤖 LLM 推荐结果", expanded=True):
+            st.info(f"**推荐理由**\n\n{llm_rec['reasoning']}")
+            st.code(json.dumps(llm_rec["params"], indent=2, ensure_ascii=False), language="json")
+            if llm_rec.get("warnings"):
+                for w in llm_rec["warnings"]:
+                    st.warning(f"⚠️ {w}")
+            col_llm1, col_llm2 = st.columns(2)
+            with col_llm1:
+                if st.button("✅ 应用到参数控件", use_container_width=True, key="train_llm_apply_btn"):
+                    st.session_state.train_llm_pending_apply = llm_rec["params"]
+                    st.session_state.train_llm_state = "idle"
+                    st.session_state.train_llm_recommendation = None
+                    st.rerun()
+            with col_llm2:
+                if st.button("🗑️ 清除推荐", use_container_width=True, key="train_llm_clear_btn"):
+                    st.session_state.train_llm_state = "idle"
+                    st.session_state.train_llm_recommendation = None
+                    st.rerun()
 
     # ====== 训练控制区域 ======
     st.markdown("---")
@@ -311,15 +383,28 @@ def render() -> None:
 
             st.session_state.training_progress = 0.7
 
-            try:
-                import lightgbm as lgb
+            add_training_log(f"\n使用 {ModelFactory.get_display_name(selected_algo)} 模型训练...")
 
-                use_lgbm = True
-                add_training_log("\n使用 LightGBM 模型训练...")
-            except Exception:
-                use_lgbm = False
-                add_training_log("\n⚠️ LightGBM 不可用，使用 RandomForest 模型...")
-                add_training_log("💡 提示：安装 LightGBM 需要系统库支持，或使用 RandomForest")
+            try:
+                base_model = ModelFactory.build(
+                    algorithm=selected_algo,
+                    task_type="binary",
+                    params=st.session_state.model_params,
+                )
+            except ImportError as e:
+                add_training_log(f"\n❌ {selected_algo} 未安装：{e}")
+                st.error(f"{ModelFactory.get_display_name(selected_algo)} 未安装")
+                if selected_algo == "xgboost":
+                    st.code("pip install xgboost")
+                elif selected_algo == "catboost":
+                    st.code("pip install catboost")
+                st.session_state.training_in_progress = False
+                return
+            except Exception as e:
+                add_training_log(f"\n❌ 模型构建失败：{e}")
+                st.error(f"模型构建失败：{e}")
+                st.session_state.training_in_progress = False
+                return
 
             from sklearn.model_selection import train_test_split, RandomizedSearchCV
             from sklearn.metrics import roc_auc_score, precision_recall_curve
@@ -336,76 +421,27 @@ def render() -> None:
             add_training_log(f"训练集：{X_train.shape[0]:,} 样本")
             add_training_log(f"测试集：{X_test.shape[0]:,} 样本")
 
-            if use_lgbm:
-                model = lgb.LGBMClassifier(
-                    objective="binary",
-                    metric="auc",
-                    verbose=-1,
-                    random_state=random_state,
+            if use_grid_search and n_iter > 1:
+                add_training_log(f"\n执行随机网格搜索 (n_iter={n_iter}, cv={cv_folds})...")
+                param_grid = ModelFactory.get_param_grid(selected_algo)
+                random_search = RandomizedSearchCV(
+                    estimator=base_model,
+                    param_distributions=param_grid,
+                    n_iter=n_iter,
+                    cv=cv_folds,
+                    scoring="roc_auc",
                     n_jobs=-1,
-                    **st.session_state.model_params,
+                    verbose=0,
+                    random_state=random_state,
                 )
-
-                if use_grid_search and n_iter > 1:
-                    add_training_log(f"\n执行随机网格搜索 (n_iter={n_iter}, cv={cv_folds})...")
-                    param_grid = {
-                        "n_estimators": [100, 200, 300],
-                        "learning_rate": [0.01, 0.05, 0.1],
-                        "max_depth": [5, 6, 7, 8],
-                        "num_leaves": [30, 50, 70],
-                        "min_child_samples": [10, 20, 30],
-                    }
-                    random_search = RandomizedSearchCV(
-                        estimator=model,
-                        param_distributions=param_grid,
-                        n_iter=n_iter,
-                        cv=cv_folds,
-                        scoring="roc_auc",
-                        n_jobs=-1,
-                        verbose=0,
-                        random_state=random_state,
-                    )
-                    random_search.fit(X_train, y_train)
-                    model = random_search.best_estimator_
-                    add_training_log(f"最佳参数：{random_search.best_params_}")
-                    st.session_state.cv_results = random_search.cv_results_
-                else:
-                    add_training_log("\n使用固定参数训练...")
-                    model.fit(X_train, y_train)
+                random_search.fit(X_train, y_train)
+                model = random_search.best_estimator_
+                add_training_log(f"最佳参数：{random_search.best_params_}")
+                st.session_state.cv_results = random_search.cv_results_
             else:
-                from sklearn.ensemble import RandomForestClassifier
-
-                model = RandomForestClassifier(
-                    n_estimators=100,
-                    max_depth=10,
-                    random_state=random_state,
-                    n_jobs=-1,
-                )
-
-                if use_grid_search and n_iter > 1:
-                    add_training_log(f"\n执行随机网格搜索 (n_iter={n_iter}, cv={cv_folds})...")
-                    param_grid = {
-                        "n_estimators": [50, 100, 200],
-                        "max_depth": [5, 10, 15, None],
-                        "min_samples_split": [2, 5, 10],
-                    }
-                    random_search = RandomizedSearchCV(
-                        estimator=model,
-                        param_distributions=param_grid,
-                        n_iter=n_iter,
-                        cv=cv_folds,
-                        scoring="roc_auc",
-                        n_jobs=-1,
-                        verbose=0,
-                        random_state=random_state,
-                    )
-                    random_search.fit(X_train, y_train)
-                    model = random_search.best_estimator_
-                    add_training_log(f"最佳参数：{random_search.best_params_}")
-                    st.session_state.cv_results = random_search.cv_results_
-                else:
-                    add_training_log("\n使用固定参数训练...")
-                    model.fit(X_train, y_train)
+                add_training_log("\n使用固定参数训练...")
+                model = base_model
+                model.fit(X_train, y_train)
 
             st.session_state.training_progress = 0.85
             add_training_log("\n模型训练完成！")
@@ -430,6 +466,7 @@ def render() -> None:
 
             st.session_state.training_results = {
                 "model": model,
+                "algorithm": selected_algo,
                 "model_params": st.session_state.model_params,
                 "test_auc": test_auc,
                 "best_threshold": best_threshold,
@@ -447,7 +484,7 @@ def render() -> None:
 
             model_path = (
                 st.session_state.model_dir
-                / f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.joblib"
+                / f"model_{selected_algo}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.joblib"
             )
             joblib.dump(model, model_path)
             add_training_log(f"\n✅ 模型已保存：{model_path}")
