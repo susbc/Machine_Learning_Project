@@ -421,14 +421,18 @@ class LLMManager:
     def _init_provider(self, name: str, config: Dict) -> None:
         """初始化提供商"""
         provider_type = config.get('type', '').lower()
-        
+
         if provider_type not in self.PROVIDERS:
             logger.warning(f"未知的大模型类型：{provider_type}")
             return
-        
+
+        # config 结构是 {id, name, type, config: {api_key, base_url, ...}, ...}
+        # Provider 构造函数期望直接拿到 {api_key, base_url, model}，需解嵌一层
+        provider_config = config.get('config', config)
+
         try:
             provider_class = self.PROVIDERS[provider_type]
-            self.providers[name] = provider_class(config)
+            self.providers[name] = provider_class(provider_config)
             logger.info(f"初始化 {name} ({provider_type}) 成功")
         except Exception as e:
             logger.error(f"初始化 {name} 失败：{e}")
