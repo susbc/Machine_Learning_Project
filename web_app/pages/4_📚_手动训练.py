@@ -49,7 +49,8 @@ with tab_config_ui:
     from web_app.manual_training import tab_config
     tab_config.render()
 with tab_eda_ui:
-    st.info("待实现：数据探索 Tab（Task 4）")
+    from web_app.manual_training import tab_eda
+    tab_eda.render()
 with tab_train_ui:
     st.info("待实现：模型训练 Tab（Task 5）")
 with tab_model_ui:
