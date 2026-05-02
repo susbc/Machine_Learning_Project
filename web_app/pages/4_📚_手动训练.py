@@ -55,6 +55,7 @@ with tab_train_ui:
     from web_app.manual_training import tab_train
     tab_train.render()
 with tab_model_ui:
-    st.info("待实现：模型管理与对比 Tab（Task 6）")
+    from web_app.manual_training import tab_model_mgmt
+    tab_model_mgmt.render()
 with tab_predict_ui:
     st.info("待实现：预测与结果 Tab（Task 7）")
