@@ -36,6 +36,10 @@ def render() -> None:
         for k, v in pending.items():
             st.session_state[f"train_{k}"] = v
 
+    # 算法推荐「采纳」前置：必须在 selectbox 渲染之前写 widget key
+    if "train_algo_pending_adopt" in st.session_state:
+        st.session_state.train_algo_selectbox = st.session_state.pop("train_algo_pending_adopt")
+
     st.header("🚀 模型训练")
     st.markdown("---")
 
@@ -150,8 +154,8 @@ def render() -> None:
             col_rec1, col_rec2 = st.columns(2)
             with col_rec1:
                 if st.button("✅ 采纳推荐", use_container_width=True, type="primary", key="train_algo_adopt_btn"):
-                    # 直接修改 selectbox 的 widget key 才能生效
-                    st.session_state.train_algo_selectbox = ModelFactory.get_display_name(rec["recommended"])
+                    # 通过 pending key 在下一轮 rerun 顶部写入 selectbox（widget 已渲染，不能直接改）
+                    st.session_state.train_algo_pending_adopt = ModelFactory.get_display_name(rec["recommended"])
                     st.session_state.train_algorithm = rec["recommended"]
                     st.session_state.train_algo_show_recommendation = False
                     st.rerun()
