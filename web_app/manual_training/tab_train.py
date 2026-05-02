@@ -48,6 +48,10 @@ def render() -> None:
         st.warning("⚠️ 请先在「2️⃣ 字段配置」Tab 配置字段")
         return
 
+    # 提前取数据/配置，供算法推荐 + LLM 调参 + 训练共用
+    df = st.session_state.uploaded_data
+    config_df = st.session_state.field_config
+
     # ====== 算法选择 ======
     st.subheader("🎯 算法选择")
 
@@ -62,22 +66,35 @@ def render() -> None:
     if current_algo_idx >= len(algo_options):
         current_algo_idx = 0
 
-    selected_algo_display = st.selectbox(
-        "选择算法",
-        options=algo_labels,
-        index=current_algo_idx,
-        key="train_algo_selectbox",
-    )
+    col_algo, col_btn = st.columns([3, 1])
+    with col_algo:
+        selected_algo_display = st.selectbox(
+            "选择算法",
+            options=algo_labels,
+            index=current_algo_idx,
+            key="train_algo_selectbox",
+        )
     selected_algo = algo_options[algo_labels.index(selected_algo_display)]
     st.session_state.train_algorithm_idx = algo_labels.index(selected_algo_display)
     st.session_state.train_algorithm = selected_algo
 
     # 智能推荐按钮
-    if st.button("🧠 智能推荐算法", use_container_width=True, key="train_algo_recommend_btn"):
-        with st.spinner("正在分析数据并推荐算法..."):
-            label_col = st.session_state.field_config[
-                st.session_state.field_config["field_type"] == "label"
-            ]["field_name"].values[0]
+    with col_btn:
+        st.write("")  # 占位对齐
+        recommend_clicked = st.button(
+            "🧠 智能推荐",
+            use_container_width=True,
+            key="train_algo_recommend_btn",
+            help="基于数据特征启发式推荐最适合的算法",
+        )
+
+    if recommend_clicked:
+        with st.spinner("正在分析数据特征并推荐算法..."):
+            label_rows = config_df[config_df["field_type"] == "label"]
+            if len(label_rows) == 0:
+                st.error("⚠️ 配置表中未指定 label 字段，请先在「2️⃣ 字段配置」Tab 配置")
+                st.stop()
+            label_col = label_rows["field_name"].values[0]
             feature_cols_raw = [c for c in df.columns if c != label_col]
             feature_df = df[feature_cols_raw]
             rec = AutoModelSelector.recommend(feature_df, df[label_col])
@@ -86,13 +103,55 @@ def render() -> None:
 
     if st.session_state.get("train_algo_show_recommendation"):
         rec = st.session_state.train_algo_recommendation
+        analysis = rec.get("analysis", {})
         with st.expander("🧠 算法推荐结果", expanded=True):
-            st.info(f"**推荐算法**: {ModelFactory.get_display_name(rec['recommended'])}\n\n**理由**: {rec['reason']}")
-            if rec.get("alternatives"):
-                st.caption(f"备选: {', '.join(ModelFactory.get_display_name(a) for a in rec['alternatives'][:3])}")
+            # 顶部：推荐算法 + 主理由
+            st.success(
+                f"### 🏆 推荐算法：**{ModelFactory.get_display_name(rec['recommended'])}**\n\n"
+                f"**推荐理由**：{rec['reason']}"
+            )
+
+            # 中部：数据画像
+            st.markdown("#### 📊 数据画像")
+            col_a, col_b, col_c, col_d = st.columns(4)
+            with col_a:
+                st.metric("样本数", f"{analysis.get('n_samples', 0):,}")
+            with col_b:
+                st.metric("特征数", f"{analysis.get('n_features', 0)}")
+            with col_c:
+                st.metric("类别特征", f"{analysis.get('n_categorical', 0)}")
+            with col_d:
+                imb = analysis.get("imbalance_ratio", 1.0)
+                st.metric("不平衡比", f"{imb:.3f}", help="少数类/多数类，越小越不平衡")
+
+            spar = analysis.get("sparsity", 0.0)
+            st.caption(f"特征稀疏度（零值占比）：{spar:.1%}")
+
+            # 候选算法排行
+            if rec.get("candidates"):
+                st.markdown("#### 📋 候选算法排行")
+                candidate_explanations = {
+                    "lightgbm": "训练速度快、内存占用低，适合大规模数据与稀疏特征",
+                    "xgboost": "精度高、正则化能力强，可调参空间大",
+                    "catboost": "原生支持类别特征，无需独热编码，类别多时优势明显",
+                    "random_forest": "稳定不易过拟合，可解释性好，适合中小数据集",
+                    "logistic_regression": "简单可解释，适合线性可分问题，可作为基线模型",
+                }
+                rank_rows = []
+                for i, algo in enumerate(rec["candidates"], 1):
+                    medal = ["🥇", "🥈", "🥉"][i - 1] if i <= 3 else f"{i}."
+                    rank_rows.append({
+                        "排名": medal,
+                        "算法": ModelFactory.get_display_name(algo),
+                        "适用性说明": candidate_explanations.get(algo, ""),
+                    })
+                import pandas as _pd
+                st.dataframe(_pd.DataFrame(rank_rows), use_container_width=True, hide_index=True)
+
+            # 操作按钮
             col_rec1, col_rec2 = st.columns(2)
             with col_rec1:
-                if st.button("✅ 采纳推荐", use_container_width=True, key="train_algo_adopt_btn"):
+                if st.button("✅ 采纳推荐", use_container_width=True, type="primary", key="train_algo_adopt_btn"):
                     recommended_idx = algo_options.index(rec["recommended"])
                     st.session_state.train_algorithm_idx = recommended_idx
                     st.session_state.train_algo_show_recommendation = False
@@ -275,9 +334,6 @@ def render() -> None:
     st.subheader("🚀 训练控制")
 
     col1, col2, col3 = st.columns([2, 1, 1])
-
-    df = st.session_state.uploaded_data
-    config_df = st.session_state.field_config
 
     with col1:
         st.info(
