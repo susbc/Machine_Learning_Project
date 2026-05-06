@@ -18,6 +18,9 @@ import plotly.express as px
 from pathlib import Path
 import sys
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # 添加项目路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -137,15 +140,15 @@ if page == "🏠 首页":
     
     with col1:
         if st.button("🤖 开始 Agent 工作流", use_container_width=True):
-            st.switch_page("web_app/pages/14_🤖_Agent 工作流.py")
+            st.switch_page("pages/14_🤖_Agent 工作流.py")
     
     with col2:
         if st.button("📊 开始 AutoML 训练", use_container_width=True):
-            st.switch_page("web_app/pages/15_📊_AutoML 训练.py")
+            st.switch_page("pages/15_📊_AutoML 训练.py")
     
     with col3:
         if st.button("📈 查看 MLOps 监控", use_container_width=True):
-            st.switch_page("web_app/pages/16_📈_MLOps 监控.py")
+            st.switch_page("pages/16_📈_MLOps 监控.py")
 
 # 数据库连接
 elif page == "🗄️ 数据库连接":

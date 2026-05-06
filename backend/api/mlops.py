@@ -136,11 +136,12 @@ async def get_model_health():
                     auc = artifact.get("best_value", 0)
                     status = "健康" if auc > 0.8 else "亚健康" if auc > 0.7 else "需优化"
 
+                    # [DEMO MODE] 以下值为模拟值，需对接实际监控系统后替换
                     models.append({
                         "模型": model_version,
                         "AUC": round(auc, 4),
-                        "预测延迟 (ms)": 45,  # 模拟值
-                        "调用次数": 0,  # 需要从日志统计
+                        "预测延迟 (ms)": None,  # TODO: 对接实际延迟统计 (如 Prometheus 指标)
+                        "调用次数": None,  # TODO: 对接实际调用统计 (如 API 访问日志)
                         "健康度": status
                     })
 
@@ -210,11 +211,9 @@ async def get_inspection_logs(
             except Exception as e:
                 logger.warning(f"读取日志文件 {report_path} 失败：{e}")
 
-        # 如果没有日志，返回一个默认值
+        # 如果没有日志，返回空列表 (不再返回模拟数据)
         if not logs:
-            logs = [
-                {"时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "事件": "每日巡检", "结果": "正常", "详情": "系统启动后首次巡检"},
-            ]
+            logs = []
 
         return {"logs": logs}
 
@@ -249,10 +248,15 @@ async def trigger_retrain(
         # 2. 添加新的重训任务到调度器
         # 3. 发送通知
 
+        from datetime import timedelta
+        scheduled_time = (datetime.now() + timedelta(days=1)).replace(
+            hour=4, minute=0, second=0, microsecond=0
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
         return {
             "status": "success",
             "message": f"已触发模型 {model_version} 的重训任务",
-            "scheduled_time": "2026-03-24 04:00:00"  # 次日凌晨 4 点
+            "scheduled_time": scheduled_time
         }
 
     except Exception as e:

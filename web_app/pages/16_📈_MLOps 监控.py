@@ -12,6 +12,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import os
 from datetime import datetime, timedelta
 
 # 页面配置
@@ -61,7 +62,7 @@ st.markdown("""
 """)
 
 # API 基础 URL
-API_BASE_URL = "http://localhost:8000"
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 
 # 模型选择
 models_response = requests.get(f"{API_BASE_URL}/api/workflow/models")

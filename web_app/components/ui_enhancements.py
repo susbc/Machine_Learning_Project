@@ -190,16 +190,6 @@ def render_quick_actions(actions: list) -> None:
                 action['callback']()
 
 
-def render_loading_spinner(text: str = "加载中...") -> None:
-    """
-    渲染加载动画
-    
-    Args:
-        text: 加载文本
-    """
-    with st.spinner(text):
-        # 这是一个上下文管理器，用于包装加载操作
-        pass
 
 
 def render_card(

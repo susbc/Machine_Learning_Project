@@ -10,6 +10,9 @@ Agentic ML Studio - FastAPI 主应用
     健康检查：http://localhost:8000/health
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -18,7 +21,6 @@ from backend.api.workflow import router as workflow_router
 from backend.api.mlops import router as mlops_router
 from backend.scheduler import start_scheduler, stop_scheduler
 import os
-from backend.scheduler import start_scheduler, stop_scheduler
 
 
 @asynccontextmanager
@@ -78,6 +80,12 @@ app.mount("/static", StaticFiles(directory=static_path), name="static")
 # 挂载业务路由
 app.include_router(workflow_router)
 app.include_router(mlops_router)
+
+# TODO: AutoML 路由 (SSE 流式 Optuna 优化)
+# 前端 OptunaDashboard.vue 已对接，但后端仍使用 mock 数据，
+# 需接入真实训练流程后再启用
+# from backend.api.automl import router as automl_router
+# app.include_router(automl_router, prefix="/api")
 
 
 @app.get("/")

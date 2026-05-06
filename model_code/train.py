@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import (
-    roc_auc_score, precision_score, recall_score,
+    roc_auc_score,
     precision_recall_curve, average_precision_score,
     classification_report, confusion_matrix
 )
@@ -221,47 +221,48 @@ def find_optimal_threshold(
     threshold_range: Tuple[float, float, float] = (0.01, 0.99, 0.01)
 ) -> Tuple[float, Dict[str, float]]:
     """
-    寻找最优分类阈值 - 向量化版本
-    
+    寻找最优分类阈值 - 完全向量化版本
+
+    使用矩阵运算一次性计算所有阈值的 precision/recall/f1，
+    避免 sklearn 逐阈值调用的循环开销。
+
     Args:
         y_true: 真实标签
         y_proba: 预测概率
         metric: 优化指标 ('f1', 'precision', 'recall')
         threshold_range: (min, max, step)
-    
+
     Returns:
         最优阈值和对应指标
     """
     min_th, max_th, step = threshold_range
     thresholds = np.arange(min_th, max_th + step, step)
-    
-    # 向量化计算所有阈值的指标
+
+    # 预测矩阵: (n_samples, n_thresholds)
     predictions = (y_proba[:, np.newaxis] >= thresholds).astype(int)
-    
+    y = y_true[:, np.newaxis]
+
+    # 完全向量化计算 TP / FP / FN
+    tp = np.sum(predictions & y, axis=0)
+    fp = np.sum(predictions & (1 - y), axis=0)
+    fn = np.sum((1 - predictions) & y, axis=0)
+
+    precisions = tp / (tp + fp + 1e-10)
+    recalls = tp / (tp + fn + 1e-10)
+    f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-10)
+
     if metric == 'f1':
-        precisions = np.array([precision_score(y_true, predictions[:, i]) 
-                              for i in range(len(thresholds))])
-        recalls = np.array([recall_score(y_true, predictions[:, i]) 
-                           for i in range(len(thresholds))])
-        f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-10)
         best_idx = np.argmax(f1_scores)
         return thresholds[best_idx], {
             'f1': f1_scores[best_idx],
             'precision': precisions[best_idx],
             'recall': recalls[best_idx]
         }
-    
     elif metric == 'precision':
-        precisions = np.array([precision_score(y_true, predictions[:, i]) 
-                              for i in range(len(thresholds))])
         best_idx = np.argmax(precisions)
         return thresholds[best_idx], {'precision': precisions[best_idx]}
-    
     elif metric == 'recall':
-        recalls = np.array([recall_score(y_true, predictions[:, i]) 
-                           for i in range(len(thresholds))])
         best_idx = np.argmax(recalls)
         return thresholds[best_idx], {'recall': recalls[best_idx]}
-    
     else:
         raise ValueError(f"不支持的指标：{metric}")

@@ -5,15 +5,15 @@
 包含:
 - EDAAgent: 探索性数据分析智能体
 - FeatureAgent: 特征工程智能体
-- FeatureEngineeringExecutor: 特征工程执行器
+
+注: FeatureEngineeringExecutor 请使用 model_code.feature_executor 中的有状态版本
 """
 
 from .eda_agent import EDAAgent, compute_eda_summary
-from .feature_agent import FeatureAgent, FeatureEngineeringExecutor
+from .feature_agent import FeatureAgent
 
 __all__ = [
     "EDAAgent",
     "FeatureAgent",
-    "FeatureEngineeringExecutor",
     "compute_eda_summary",
 ]

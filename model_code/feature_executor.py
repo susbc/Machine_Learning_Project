@@ -148,6 +148,11 @@ class FeatureEngineeringExecutor:
         col = action_item.column
         action = action_item.action
         
+        # 防御性编程：保护目标列不被删除
+        if action == "drop" and col == self.target_col:
+            logger.info(f"⚠️ 跳过对目标列 [{col}] 的 drop 操作，训练需要保留目标变量")
+            return df
+
         # 防御性编程：无视 LLM 产生的列名幻觉
         if col not in df.columns:
             logger.warning(f"⚠️ 列 [{col}] 不存在，已安全跳过操作：{action}")

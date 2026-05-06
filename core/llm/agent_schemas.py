@@ -86,7 +86,7 @@ class FeatureAction(BaseModel):
     
     reason: str = Field(
         ...,
-        description="执行该操作的业务或统计学理由（20 字以内）"
+        description="执行该操作的业务或统计学理由（中文，200 字以内）"
     )
     
     params: Optional[Dict[str, Any]] = Field(
@@ -97,8 +97,8 @@ class FeatureAction(BaseModel):
     @validator('reason')
     def validate_reason_length(cls, v):
         """验证理由长度"""
-        if len(v) > 50:
-            raise ValueError("理由描述过长，请精简到 50 字以内")
+        if len(v) > 200:
+            raise ValueError("理由描述过长，请精简到 200 字以内")
         return v
 
 
