@@ -32,6 +32,7 @@ from web_app.utils.session_state import init_session_state
 from model_code.auto_train import AutoTrainer, auto_generate_field_config
 from model_code.model_factory import ModelFactory
 from model_code.utils import ConfigDrivenPreprocessor
+from web_app.manual_training.param_specs import get_specs
 
 # 初始化
 init_session_state()
@@ -334,77 +335,118 @@ with st.expander("高级选项"):
 
 st.header("5. 模型参数")
 
-default_params = st.session_state.get('model_params', {
-    'n_estimators': 200,
-    'learning_rate': 0.1,
-    'max_depth': 6,
-    'num_leaves': 50
-})
+# 确定当前算法（用于渲染对应参数）
+render_algo = selected_algo if selected_algo != "auto" else "lightgbm"
+if selected_algo == "auto":
+    st.caption("💡 当前为「自动推荐」模式，参数将应用于自动解析出的算法（通常为 LightGBM）")
 
-col1, col2, col3 = st.columns(3)
+specs = get_specs(render_algo)
 
-with col1:
-    n_estimators = st.slider(
-        "n_estimators",
-        min_value=50,
-        max_value=1000,
-        value=default_params.get('n_estimators', 200),
-        step=50
+# 历史默认参数（来自 session_state）
+default_params = st.session_state.get('model_params', {})
+
+# 范围搜索开关
+enable_param_search = st.checkbox(
+    "启用参数范围搜索（随机网格搜索）",
+    value=True,
+    help="启用后参数以范围形式配置，超参数优化将在范围内搜索；关闭则为固定值模式",
+    key="auto_iter_enable_search",
+)
+
+if enable_param_search:
+    st.info("拖动滑块两端定义搜索范围，优化过程将在范围内随机搜索")
+
+model_params = {}
+model_param_ranges = {}
+
+# 按 3 列布局渲染参数
+n_cols = 3
+param_chunks = [specs[i:i + n_cols] for i in range(0, len(specs), n_cols)]
+for chunk in param_chunks:
+    cols = st.columns(len(chunk))
+    for col, spec in zip(cols, chunk):
+        with col:
+            if enable_param_search:
+                # 范围模式
+                range_key = f"auto_range_{spec.name}"
+                if spec.widget == "slider":
+                    # 默认值优先读 session_state 中已存的固定值，否则取全范围
+                    saved_val = default_params.get(spec.name, spec.default)
+                    if isinstance(saved_val, (int, float)):
+                        lo = max(spec.min_value, saved_val - spec.step * 3)
+                        hi = min(spec.max_value, saved_val + spec.step * 3)
+                    else:
+                        lo, hi = spec.min_value, spec.max_value
+                    lo, hi = st.slider(
+                        spec.label,
+                        min_value=spec.min_value,
+                        max_value=spec.max_value,
+                        value=(lo, hi),
+                        step=spec.step,
+                        format=spec.fmt or "%.2f",
+                        help=spec.help,
+                        key=range_key,
+                    )
+                    model_param_ranges[spec.name] = {"min": lo, "max": hi}
+                    # 用中点作为初始训练值
+                    model_params[spec.name] = type(spec.default)((lo + hi) / 2)
+                elif spec.widget == "select":
+                    selected_opts = st.multiselect(
+                        spec.label,
+                        options=spec.options,
+                        default=list(spec.options),
+                        help=spec.help,
+                        key=f"auto_range_{spec.name}",
+                    )
+                    model_param_ranges[spec.name] = selected_opts
+                    model_params[spec.name] = selected_opts[0] if selected_opts else spec.default
+            else:
+                # 固定值模式
+                if spec.widget == "slider":
+                    saved_val = default_params.get(spec.name, spec.default)
+                    value = st.slider(
+                        spec.label,
+                        min_value=spec.min_value,
+                        max_value=spec.max_value,
+                        value=saved_val,
+                        step=spec.step,
+                        format=spec.fmt or "%.2f",
+                        help=spec.help,
+                        key=f"auto_fixed_{spec.name}",
+                    )
+                elif spec.widget == "select":
+                    value = st.selectbox(
+                        spec.label,
+                        options=spec.options,
+                        index=spec.options.index(spec.default) if spec.default in spec.options else 0,
+                        help=spec.help,
+                        key=f"auto_fixed_{spec.name}",
+                    )
+                elif spec.widget == "number_input":
+                    value = st.number_input(
+                        spec.label,
+                        value=spec.default,
+                        step=spec.step,
+                        help=spec.help,
+                        key=f"auto_fixed_{spec.name}",
+                    )
+                elif spec.widget == "checkbox":
+                    value = st.checkbox(
+                        spec.label,
+                        value=spec.default,
+                        help=spec.help,
+                        key=f"auto_fixed_{spec.name}",
+                    )
+                model_params[spec.name] = value
+
+# 显示当前参数 / 范围摘要
+if enable_param_search:
+    range_summary = ", ".join(
+        f"{k}: [{v['min']}, {v['max']}]" for k, v in model_param_ranges.items()
     )
-
-    learning_rate = st.slider(
-        "learning_rate",
-        min_value=0.001,
-        max_value=0.3,
-        value=default_params.get('learning_rate', 0.1),
-        step=0.01,
-        format="%.3f"
-    )
-
-with col2:
-    max_depth = st.slider(
-        "max_depth",
-        min_value=3,
-        max_value=15,
-        value=default_params.get('max_depth', 6),
-        step=1
-    )
-
-    num_leaves = st.slider(
-        "num_leaves",
-        min_value=10,
-        max_value=200,
-        value=default_params.get('num_leaves', 50),
-        step=10
-    )
-
-with col3:
-    subsample = st.slider(
-        "subsample",
-        min_value=0.5,
-        max_value=1.0,
-        value=default_params.get('subsample', 0.9),
-        step=0.05,
-        format="%.2f"
-    )
-
-    colsample_bytree = st.slider(
-        "colsample_bytree",
-        min_value=0.5,
-        max_value=1.0,
-        value=default_params.get('colsample_bytree', 0.9),
-        step=0.05,
-        format="%.2f"
-    )
-
-model_params = {
-    'n_estimators': n_estimators,
-    'learning_rate': learning_rate,
-    'max_depth': max_depth,
-    'num_leaves': num_leaves,
-    'subsample': subsample,
-    'colsample_bytree': colsample_bytree
-}
+    st.caption(f"📐 搜索范围：{range_summary}")
+else:
+    st.caption(f"🎯 固定参数：{model_params}")
 
 # ============================================================================
 # 确定 label_col 和 key_col
@@ -580,7 +622,31 @@ F1 分数：{result['f1']:.6f}
             # 超参数优化（第一次迭代后）
             if iteration == 1 and not skip_hyperopt:
                 st.info("正在进行超参数优化...")
-                trainer.optimize_hyperparameters(n_iter=n_hyperopt_iter)
+                if enable_param_search and model_param_ranges:
+                    # 基于 UI 范围生成搜索空间
+                    import numpy as np
+
+                    param_distributions = {}
+                    for name, rng in model_param_ranges.items():
+                        if isinstance(rng, dict):
+                            low, high = rng["min"], rng["max"]
+                            # 用 session_state 中已有的固定值判断类型
+                            val = model_params.get(name, low)
+                            if isinstance(val, int) or (isinstance(val, float) and val == int(val)):
+                                step = max(1, int((high - low) / 8))
+                                vals = list(range(int(low), int(high) + 1, step))
+                                param_distributions[name] = vals if vals else [int(low)]
+                            else:
+                                param_distributions[name] = list(np.linspace(low, high, 8))
+                        elif isinstance(rng, list):
+                            param_distributions[name] = rng
+
+                    trainer.optimize_hyperparameters(
+                        n_iter=n_hyperopt_iter,
+                        param_distributions=param_distributions,
+                    )
+                else:
+                    trainer.optimize_hyperparameters(n_iter=n_hyperopt_iter)
 
             # 特征选择（第一次迭代后）
             if iteration == 1 and not skip_feature_selection:

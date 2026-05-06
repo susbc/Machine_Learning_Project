@@ -20,9 +20,6 @@ from datetime import datetime
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-# 导入现有模型代码
-sys.path.insert(0, str(project_root))
-
 from web_app.utils.session_state import init_session_state, add_training_log, get_training_logs
 from web_app.components.progress import (
     render_training_progress,

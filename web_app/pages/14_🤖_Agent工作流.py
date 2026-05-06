@@ -13,6 +13,8 @@ import requests
 import pandas as pd
 import json
 import time
+import random
+import os
 from datetime import datetime
 
 # 页面配置
@@ -23,7 +25,7 @@ st.set_page_config(
 )
 
 # API 基础地址
-API_BASE = "http://localhost:8000/api/workflow"
+API_BASE = os.getenv("API_BASE_URL", "http://127.0.0.1:8000/api/workflow")
 
 # 标题
 st.title("🤖 Agent 工作流")
@@ -220,11 +222,8 @@ elif step == "Step 3: 模型训练":
         if st.button("⚡ 开始训练", type="primary"):
             try:
                 status_text.text("正在启动训练...")
-                
-                # 使用 EventSource 接收 SSE
-                import eventstream
-                
-                # 构建 SSE URL
+
+                # 构建 SSE URL (当前为模拟模式，后续对接后端 SSE)
                 sse_url = f"{API_BASE}/step3_train_stream?task_id={st.session_state.task_id}&n_trials={n_trials}"
                 
                 # 显示训练日志
@@ -242,7 +241,6 @@ elif step == "Step 3: 模型训练":
                     status_text.text(f"Trial {i+1}/{n_trials}")
                     
                     # 模拟结果
-                    import random
                     value = 0.6 + random.random() * 0.3
                     
                     logs.append(f"Trial {i+1}: AUC = {value:.4f}")
@@ -272,9 +270,16 @@ elif step == "Step 4: 线上预测":
     st.markdown("使用训练好的模型进行线上推理")
     
     # 模型选择
-    models_response = requests.get(f"{API_BASE}/models")
-    
-    if models_response.status_code == 200:
+    models_available = True
+    try:
+        models_response = requests.get(f"{API_BASE}/models", timeout=5)
+        if models_response.status_code != 200:
+            models_available = False
+    except requests.exceptions.RequestException:
+        models_available = False
+        st.warning("⚠️ 无法连接到后端服务，请确保 FastAPI 已启动")
+
+    if models_available and models_response.status_code == 200:
         models = models_response.json().get("models", [])
         
         if models:

@@ -221,25 +221,31 @@ class AutoTrainer:
         
         return iteration_result
     
-    def optimize_hyperparameters(self, n_iter: int = 10) -> Dict[str, Any]:
+    def optimize_hyperparameters(self, n_iter: int = 10, param_distributions: Optional[Dict] = None) -> Dict[str, Any]:
         """
         自动超参数优化
-        
+
         Args:
             n_iter: 随机搜索迭代次数
-        
+            param_distributions: 自定义参数搜索空间（不指定则使用 ModelFactory 默认）
+
         Returns:
             最佳参数
         """
         logger.info("\n" + "="*60)
         logger.info("开始超参数优化")
         logger.info("="*60)
-        
+
         X_train, _, y_train, _ = self._get_data_split()
         random_state = self.base_config.get('random_state', 42)
-        
+
         algo = self.algorithm if self.algorithm != "auto" else "lightgbm"
-        param_distributions = ModelFactory.get_param_grid(algo)
+
+        if param_distributions is not None:
+            distributions = param_distributions
+            logger.info(f"使用自定义搜索空间: {list(distributions.keys())}")
+        else:
+            distributions = ModelFactory.get_param_grid(algo)
         
         # 基础模型
         model = ModelFactory.build(algorithm=algo, task_type="binary")
@@ -247,7 +253,7 @@ class AutoTrainer:
         # 随机搜索
         random_search = RandomizedSearchCV(
             estimator=model,
-            param_distributions=param_distributions,
+            param_distributions=distributions,
             n_iter=n_iter,
             cv=5,
             scoring='roc_auc',

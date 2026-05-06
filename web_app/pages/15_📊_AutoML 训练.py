@@ -14,8 +14,6 @@ import numpy as np
 import requests
 import time
 import json
-import aiohttp
-import asyncio
 import os
 from typing import Optional, Dict, Any
 
@@ -31,7 +29,7 @@ st.title("📊 AutoML 训练")
 st.markdown("**Agentic AutoML Platform v3.0.0** | 自动化机器学习训练")
 
 # API 基础 URL
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 
 # 侧边栏 - 训练配置
 st.sidebar.header("训练配置")

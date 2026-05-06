@@ -114,7 +114,8 @@ class AgentOrchestrator:
 - 对于缺失率 > 50% 的特征，强制执行 drop。
 - 对于偏度 (skewness) > 3 的数值特征，建议使用 log_transform。
 - 你的输出必须严格符合预期的 JSON Schema，严禁任何代码和 Markdown。
-- action 字段只能从预定义的枚举值中选择，严禁自创方法。"""),
+- action 字段只能从预定义的枚举值中选择，严禁自创方法。
+- reason 字段必须使用中文，且不超过 50 字，务必精简！"""),
             
             ("human", """统计画像：
 {eda_summary}

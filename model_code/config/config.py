@@ -163,6 +163,7 @@ def print_config() -> None:
 
 
 # 向后兼容的旧配置 (保留但标记为废弃)
+# ⚠️ 新代码应直接使用 MODEL_SAVE_PATH, INPUT_DIR, OUTPUT_DIR 等常量
 model_path = str(MODEL_SAVE_PATH)
 input_path = str(INPUT_DIR)
 output_path = str(OUTPUT_DIR)

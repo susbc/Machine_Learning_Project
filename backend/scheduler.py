@@ -78,10 +78,8 @@ async def check_data_drift_job():
         logger.info(f"基线数据加载完成：{len(baseline_data)} 项")
         
         # 2. 从生产数据库拉取过去 24 小时的线上数据
-        # 实际使用时替换为真实数据库查询
-        # df_online = await fetch_online_data(hours=24)
-        df_online = await simulate_online_data()  # 模拟数据
-        
+        df_online = await fetch_online_data(hours=24)
+
         if df_online is None or len(df_online) == 0:
             logger.warning("未获取到线上数据，跳过巡检")
             return
@@ -156,25 +154,32 @@ async def check_data_drift_job():
         )
 
 
+async def fetch_online_data(hours: int = 24):
+    """
+    从生产数据库拉取线上数据
+
+    TODO: 实现真实数据库查询
+    示例:
+        from model_code.database.db_connector import DatabaseConnector
+        db = DatabaseConnector(config)
+        db.connect()
+        df = db.query(f"SELECT * FROM orders WHERE created_at >= NOW() - INTERVAL {hours} HOUR")
+        db.disconnect()
+        return df
+
+    当前返回 None，需接入数据源后启用。
+    """
+    return None
+
+
 async def simulate_online_data():
     """
-    模拟从生产数据库拉取线上数据
+    模拟从生产数据库拉取线上数据 (仅供开发测试使用)
 
-    实际使用时替换为真实的数据库查询
-
-    【优化】：添加注释说明生产环境替换方式
+    生产环境请替换为 fetch_online_data()
     """
     import pandas as pd
     import numpy as np
-
-    # 模拟数据 (实际使用时删除，替换为真实数据库查询)
-    # 生产环境示例:
-    #   from model_code.database.db_connector import DatabaseConnector
-    #   db = DatabaseConnector(config)
-    #   db.connect()
-    #   df = db.query("SELECT * FROM orders WHERE created_at >= NOW() - INTERVAL 24 HOUR")
-    #   db.disconnect()
-    #   return df
 
     np.random.seed(42)
     n_samples = 1000
@@ -324,8 +329,7 @@ async def auto_retrain_job(task_id: str):
     
     try:
         # 1. 拉取最新数据
-        # df_new = await fetch_latest_data()
-        df_new = await simulate_online_data()  # 模拟数据
+        df_new = await fetch_online_data()
         
         # 2. 执行 AutoML 训练
         # 这里可以调用 workflow.py 中的训练逻辑
