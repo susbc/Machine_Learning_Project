@@ -12,8 +12,16 @@
 
 from .neo4j_client import Neo4jClient
 from .faiss_client import FAISSClient
-from .schema_embedder import SchemaEmbedder
-from .nl2sql_engine import NL2SQLEngine
+
+try:
+    from .schema_embedder import SchemaEmbedder
+except ModuleNotFoundError:
+    SchemaEmbedder = None
+
+try:
+    from .nl2sql_engine import NL2SQLEngine
+except ModuleNotFoundError:
+    NL2SQLEngine = None
 
 __all__ = [
     "Neo4jClient",

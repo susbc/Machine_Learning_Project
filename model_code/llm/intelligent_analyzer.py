@@ -25,6 +25,35 @@ except ImportError:
     np = None
 
 
+def _safe_float(value, default=None):
+    """Convert scalar-like metric values to float without breaking prompts."""
+    if value is None:
+        return default
+    try:
+        if pd is not None and pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _format_metric(value, digits: int = 4) -> str:
+    numeric_value = _safe_float(value)
+    if numeric_value is None:
+        return "未提供"
+    return f"{numeric_value:.{digits}f}"
+
+
+def _json_default(value):
+    if np is not None and isinstance(value, np.generic):
+        return value.item()
+    if np is not None and isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
 class IntelligentAnalyzer:
     """智能分析器"""
     
@@ -259,33 +288,49 @@ class IntelligentAnalyzer:
         """
         if pd is None:
             return "错误：需要安装 pandas"
+
+        if df is None or df.empty:
+            return "错误：数据集为空，无法分析"
+
+        if target_col not in df.columns:
+            return f"错误：目标列 {target_col} 不存在"
         
         # 收集统计信息
-        n_samples, n_features = df.shape
-        target_info = f"{target_col} (类型：{df[target_col].dtype})"
+        n_samples, n_columns = df.shape
+        feature_cols = [c for c in df.columns if c != target_col]
+        n_features = len(feature_cols)
+        target_unique = df[target_col].nunique(dropna=True)
+        target_info = f"{target_col} (类型：{df[target_col].dtype}, 唯一值：{target_unique})"
         
         # 特征统计
         feature_stats = []
-        for col in df.columns[:10]:  # 限制前 10 个特征
-            if col == target_col:
-                continue
-            if df[col].dtype in ['int64', 'float64']:
-                stats = f"{col}: 均值={df[col].mean():.2f}, 标准差={df[col].std():.2f}, 缺失={df[col].isna().sum()}"
+        for col in feature_cols[:12]:
+            missing_count = int(df[col].isna().sum())
+            if pd.api.types.is_numeric_dtype(df[col]):
+                mean_value = _safe_float(df[col].mean())
+                std_value = _safe_float(df[col].std())
+                stats = (
+                    f"{col}: 数值型, 均值={_format_metric(mean_value, 3)}, "
+                    f"标准差={_format_metric(std_value, 3)}, 缺失={missing_count}"
+                )
             else:
-                stats = f"{col}: 唯一值={df[col].nunique()}, 缺失={df[col].isna().sum()}"
+                stats = f"{col}: 类别/文本型, 唯一值={df[col].nunique(dropna=True)}, 缺失={missing_count}"
             feature_stats.append(stats)
-        feature_stats = "\n".join(feature_stats)
+        feature_stats = "\n".join(feature_stats) or "无可用特征"
         
         # 数据质量
-        missing_rate = df.isna().sum().sum() / (n_samples * n_features) * 100
-        duplicate_rate = df.duplicated().sum() / n_samples * 100
+        missing_rate = df.isna().sum().sum() / max(n_samples * n_columns, 1) * 100
+        duplicate_rate = df.duplicated().sum() / max(n_samples, 1) * 100
         
         # 类别不平衡
-        if df[target_col].nunique() == 2:
-            class_dist = df[target_col].value_counts(normalize=True)
-            imbalance_info = f"正例比例：{class_dist.iloc[0]*100:.1f}%"
+        if target_unique == 2:
+            class_dist = df[target_col].value_counts(normalize=True, dropna=True)
+            parts = [f"{label}: {ratio * 100:.1f}%" for label, ratio in class_dist.items()]
+            imbalance_info = "；".join(parts)
+        elif target_unique <= 20:
+            imbalance_info = f"{target_unique} 个类别，最大类占比 {df[target_col].value_counts(normalize=True).max() * 100:.1f}%"
         else:
-            imbalance_info = "多分类问题"
+            imbalance_info = "连续目标或高基数目标，请确认当前任务是否适合分类建模"
         
         # 构建提示词
         prompt = self.prompts['data_analysis'].format(
@@ -319,8 +364,16 @@ class IntelligentAnalyzer:
         """
         if pd is None:
             return "错误：需要安装 pandas"
+
+        if df is None or df.empty:
+            return "错误：数据集为空，无法推荐模型"
+
+        if target_col not in df.columns:
+            return f"错误：目标列 {target_col} 不存在"
         
-        n_samples, n_features = df.shape
+        n_samples = len(df)
+        feature_df = df.drop(columns=[target_col])
+        n_features = feature_df.shape[1]
         
         # 数据规模分类
         if n_samples < 1000:
@@ -331,19 +384,28 @@ class IntelligentAnalyzer:
             size_category = "大"
         
         # 特征类型
-        numeric_features = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
-        categorical_features = df.select_dtypes(include=['object', 'category']).columns.tolist()
+        numeric_features = feature_df.select_dtypes(include=['number']).columns.tolist()
+        categorical_features = feature_df.select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
         feature_types = f"数值特征：{len(numeric_features)}, 类别特征：{len(categorical_features)}"
         
         # 目标类型
-        target_type = "二分类" if df[target_col].nunique() == 2 else "多分类"
+        target_unique = df[target_col].nunique(dropna=True)
+        if target_unique == 2:
+            target_type = "二分类"
+        elif target_unique <= 20 or not pd.api.types.is_numeric_dtype(df[target_col]):
+            target_type = "多分类"
+        else:
+            target_type = "连续/高基数目标（当前训练流程以分类为主，需确认是否离散化或改造回归）"
         
         # 类别分布
-        if df[target_col].nunique() == 2:
-            class_dist = df[target_col].value_counts(normalize=True)
-            class_distribution = f"类别 0: {class_dist.iloc[1]*100:.1f}%, 类别 1: {class_dist.iloc[0]*100:.1f}%"
+        if target_unique == 2:
+            class_dist = df[target_col].value_counts(normalize=True, dropna=True)
+            class_distribution = "；".join([
+                f"{label}: {ratio * 100:.1f}%"
+                for label, ratio in class_dist.items()
+            ])
         else:
-            class_distribution = f"{df[target_col].nunique()} 个类别"
+            class_distribution = f"{target_unique} 个唯一值"
         
         # 默认需求
         default_requirements = {
@@ -383,13 +445,15 @@ class IntelligentAnalyzer:
         Returns:
             分析建议
         """
-        train_auc = metrics.get('train_auc', 0)
-        val_auc = metrics.get('val_auc', 0)
-        train_f1 = metrics.get('train_f1', 0)
-        val_f1 = metrics.get('val_f1', 0)
+        metrics = metrics or {}
+        params = params or {}
+        train_auc = _safe_float(metrics.get('train_auc'))
+        val_auc = _safe_float(metrics.get('val_auc'))
+        train_f1 = _safe_float(metrics.get('train_f1'))
+        val_f1 = _safe_float(metrics.get('val_f1'))
         
-        auc_gap = abs(train_auc - val_auc)
-        f1_gap = abs(train_f1 - val_f1)
+        auc_gap = abs(train_auc - val_auc) if train_auc is not None and val_auc is not None else None
+        f1_gap = abs(train_f1 - val_f1) if train_f1 is not None and val_f1 is not None else None
         
         # 特征重要性
         if feature_importance:
@@ -399,7 +463,7 @@ class IntelligentAnalyzer:
             fi_text = "未提供"
         
         # 参数字符串
-        params_text = json.dumps(params, indent=2, ensure_ascii=False)
+        params_text = json.dumps(params, indent=2, ensure_ascii=False, default=_json_default)
         
         # 构建提示词
         prompt = self.prompts['training_analysis'].format(
@@ -407,12 +471,12 @@ class IntelligentAnalyzer:
             train_size=metrics.get('train_size', 0),
             val_size=metrics.get('val_size', 0),
             n_features=metrics.get('n_features', 0),
-            train_auc=train_auc,
-            val_auc=val_auc,
-            train_f1=train_f1,
-            val_f1=val_f1,
-            auc_gap=auc_gap,
-            f1_gap=f1_gap,
+            train_auc=_format_metric(train_auc),
+            val_auc=_format_metric(val_auc),
+            train_f1=_format_metric(train_f1),
+            val_f1=_format_metric(val_f1),
+            auc_gap=_format_metric(auc_gap),
+            f1_gap=_format_metric(f1_gap),
             model_params=params_text,
             feature_importance=fi_text
         )
@@ -436,6 +500,10 @@ class IntelligentAnalyzer:
         """
         if pd is None:
             return "错误：需要安装 pandas"
+
+        predictions = pd.Series(predictions).dropna()
+        if predictions.empty:
+            return "错误：预测结果为空，无法分析"
         
         total = len(predictions)
         predicted_positive = (predictions >= threshold).sum()
@@ -491,7 +559,7 @@ class IntelligentAnalyzer:
         # 历史记录格式化
         if history:
             history_text = "\n".join([
-                f"试验{i+1}: {json.dumps(h.get('params', {}))} → AUC: {h.get('auc', 'N/A')}"
+                f"试验{i+1}: {json.dumps(h.get('params', {}), ensure_ascii=False, default=_json_default)} → AUC: {h.get('auc', 'N/A')}"
                 for i, h in enumerate(history[-5:])  # 最近 5 次
             ])
         else:
@@ -516,7 +584,7 @@ class IntelligentAnalyzer:
         # 构建提示词
         prompt = self.prompts['hyperparameter_tuning'].format(
             model_type=current_params.get('model_type', 'Unknown'),
-            current_params=json.dumps(current_params, indent=2),
+            current_params=json.dumps(current_params, indent=2, ensure_ascii=False, default=_json_default),
             history_records=history_text,
             performance_history=perf_text,
             max_train_time=constraints.get('max_train_time', '30 分钟'),
@@ -558,7 +626,7 @@ class IntelligentAnalyzer:
 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 ## 元数据
-{json.dumps(metadata or {}, indent=2, ensure_ascii=False)}
+{json.dumps(metadata or {}, indent=2, ensure_ascii=False, default=_json_default)}
 
 ---
 
@@ -630,7 +698,7 @@ class IntelligentAnalyzer:
         last_auc = last_training.get("test_auc") if last_training else None
 
         current_params_str = (
-            json.dumps(last_params, indent=2, ensure_ascii=False)
+                json.dumps(last_params, indent=2, ensure_ascii=False, default=_json_default)
             if last_params
             else f"首次训练 {model_type}，无历史参数"
         )

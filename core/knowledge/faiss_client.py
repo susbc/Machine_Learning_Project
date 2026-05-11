@@ -13,7 +13,7 @@ FAISS 客户端 - 向量数据库连接
 from typing import Dict, List, Optional, Any, Tuple
 import numpy as np
 import faiss
-import pickle
+import json
 import os
 import logging
 
@@ -81,6 +81,10 @@ class FAISSClient:
         # 验证维度
         if embeddings.shape[1] != self.dimension:
             raise ValueError(f"Embedding 维度不匹配：期望 {self.dimension}, 实际 {embeddings.shape[1]}")
+
+        if len(metadata) < len(embeddings):
+            raise ValueError("元数据数量不能少于 Embedding 数量")
+        metadata = metadata[:len(embeddings)]
         
         # 添加到索引
         self.index.add(embeddings)
@@ -178,9 +182,9 @@ class FAISSClient:
             faiss.write_index(self.index, path)
             
             # 保存元数据
-            metadata_path = path.replace(".index", ".meta.pkl")
-            with open(metadata_path, "wb") as f:
-                pickle.dump(self.metadata, f)
+            metadata_path = path.replace(".index", ".meta.json")
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(self.metadata, f, ensure_ascii=False, indent=2)
             
             logger.info(f"FAISS 索引已保存：{path}")
         except Exception as e:
@@ -199,10 +203,10 @@ class FAISSClient:
             self.index = faiss.read_index(path)
             
             # 加载元数据
-            metadata_path = path.replace(".index", ".meta.pkl")
+            metadata_path = path.replace(".index", ".meta.json")
             if os.path.exists(metadata_path):
-                with open(metadata_path, "rb") as f:
-                    self.metadata = pickle.load(f)
+                with open(metadata_path, "r", encoding="utf-8") as f:
+                    self.metadata = json.load(f)
             
             logger.info(f"FAISS 索引已加载：{path}, 共 {self.index.ntotal} 个向量")
         except Exception as e:

@@ -24,8 +24,10 @@ import asyncio
 import time
 import random
 import logging
+import re
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -34,7 +36,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 # 修复导入路径 - 确保使用正确的模块
 import sys
-import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from core.llm.agent_orchestrator import AgentOrchestrator, create_orchestrator
@@ -51,6 +52,33 @@ router = APIRouter(prefix="/api/workflow", tags=["Agentic AutoML Workflow"])
 
 # 线程池：专门用来跑阻塞的 ML 训练任务
 executor_pool = ThreadPoolExecutor(max_workers=4)
+
+TASK_ID_PATTERN = re.compile(r"^task_[a-f0-9]{8}$")
+OUTPUT_DIR = Path("output")
+SAVED_DIR = Path("saved")
+
+
+def validate_task_id(task_id: str) -> str:
+    """限制任务 ID 格式，避免路径穿越和任意文件访问。"""
+    if not TASK_ID_PATTERN.fullmatch(task_id):
+        raise HTTPException(status_code=400, detail="无效的 task_id")
+    return task_id
+
+
+def _safe_child_path(base_dir: Path, *parts: str) -> Path:
+    base = base_dir.resolve()
+    path = base.joinpath(*parts).resolve()
+    if path != base and base not in path.parents:
+        raise HTTPException(status_code=400, detail="无效的文件路径")
+    return path
+
+
+def get_task_dir(task_id: str) -> Path:
+    return _safe_child_path(OUTPUT_DIR, validate_task_id(task_id))
+
+
+def get_saved_path(filename: str) -> Path:
+    return _safe_child_path(SAVED_DIR, filename)
 
 # 初始化 LLM 编排器 (从环境变量读取 API Key)
 orchestrator = create_orchestrator(
@@ -176,17 +204,18 @@ async def retrieve_data(req: DataRetrievalRequest):
             eda_summary["features"][col] = feature_stats
         
         # 5. 落盘保存中间结果
-        os.makedirs(f"output/{task_id}", exist_ok=True)
+        task_dir = get_task_dir(task_id)
+        task_dir.mkdir(parents=True, exist_ok=True)
         
         # 保存原始数据
-        df.to_parquet(f"output/{task_id}/raw_data.parquet", index=False)
+        df.to_parquet(task_dir / "raw_data.parquet", index=False)
         
         # 保存 eda_summary
-        with open(f"output/{task_id}/eda_summary.json", "w", encoding='utf-8') as f:
+        with open(task_dir / "eda_summary.json", "w", encoding='utf-8') as f:
             json.dump(eda_summary, f, indent=2, ensure_ascii=False)
         
         # 保存 SQL
-        with open(f"output/{task_id}/query.sql", "w") as f:
+        with open(task_dir / "query.sql", "w", encoding='utf-8') as f:
             f.write(sql_result.sql)
         
         logger.info(f"中间结果已保存：output/{task_id}/")
@@ -223,7 +252,8 @@ async def generate_features(req: FeatureGenerationRequest):
         logger.info(f"任务 {req.task_id}: 生成特征策略...")
         
         # 1. 读取上一步的统计画像
-        eda_summary_path = f"output/{req.task_id}/eda_summary.json"
+        task_dir = get_task_dir(req.task_id)
+        eda_summary_path = task_dir / "eda_summary.json"
         if not os.path.exists(eda_summary_path):
             raise HTTPException(status_code=404, detail=f"未找到任务 {req.task_id} 的 eda_summary")
         
@@ -240,7 +270,7 @@ async def generate_features(req: FeatureGenerationRequest):
         logger.info(f"策略生成完成：{len(strategy_obj.actions)} 个动作")
         
         # 3. 落盘保存策略
-        with open(f"output/{req.task_id}/feature_strategy.json", "w", encoding='utf-8') as f:
+        with open(task_dir / "feature_strategy.json", "w", encoding='utf-8') as f:
             json.dump(strategy_obj.dict(), f, indent=2, ensure_ascii=False)
         
         return {
@@ -284,7 +314,8 @@ async def train_stream(
             logger.info(f"任务 {task_id}: 开始训练...")
 
             # 1. 加载前置数据
-            data_path = f"output/{task_id}/raw_data.parquet"
+            task_dir = get_task_dir(task_id)
+            data_path = task_dir / "raw_data.parquet"
             if not os.path.exists(data_path):
                 raise FileNotFoundError(f"未找到数据文件：{data_path}")
 
@@ -292,7 +323,7 @@ async def train_stream(
             logger.info(f"数据加载完成：{df_raw.shape}")
 
             # 加载特征策略
-            strategy_path = f"output/{task_id}/feature_strategy.json"
+            strategy_path = task_dir / "feature_strategy.json"
             if not os.path.exists(strategy_path):
                 raise FileNotFoundError(f"未找到策略文件：{strategy_path}")
 
@@ -303,7 +334,7 @@ async def train_stream(
             logger.info(f"策略加载完成：{len(strategy_obj.actions)} 个动作")
 
             # 加载 eda_summary 获取目标变量列名
-            eda_path = f"output/{task_id}/eda_summary.json"
+            eda_path = task_dir / "eda_summary.json"
             target_col = "is_fraud"  # 默认值
             if os.path.exists(eda_path):
                 with open(eda_path, "r", encoding='utf-8') as f:
@@ -391,8 +422,8 @@ async def train_stream(
                 raise
 
             # 6. 持久化打包 (模型 + 执行器 + 最佳模型)
-            os.makedirs("saved", exist_ok=True)
-            artifact_path = f"saved/model_{task_id}.pkl"
+            SAVED_DIR.mkdir(exist_ok=True)
+            artifact_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
 
             joblib.dump({
                 "feature_executor": feature_executor,
@@ -411,7 +442,7 @@ async def train_stream(
                 monitor = DataDriftMonitor()
                 baseline_data = monitor.extract_baseline(df_clean, features=list(X.columns))
 
-                baseline_path = f"saved/baseline_{task_id}.json"
+                baseline_path = get_saved_path(f"baseline_{validate_task_id(task_id)}.json")
                 monitor.save_baseline(baseline_data, baseline_path)
                 logger.info(f"基线数据已保存：{baseline_path}")
             except Exception as e:
@@ -483,11 +514,12 @@ async def predict_online(req: PredictRequest):
     """
     try:
         # 1. 加载持久化的神器包
-        artifact_path = f"saved/model_{req.model_version}.pkl"
+        model_version = validate_task_id(req.model_version)
+        artifact_path = get_saved_path(f"model_{model_version}.pkl")
         if not os.path.exists(artifact_path):
             raise HTTPException(
                 status_code=404,
-                detail=f"模型未找到：{req.model_version}，请先训练模型"
+                detail=f"模型未找到：{model_version}，请先训练模型"
             )
         
         artifact = joblib.load(artifact_path)
@@ -495,7 +527,7 @@ async def predict_online(req: PredictRequest):
         model = artifact.get("model")  # mock 模式下为 None
         feature_columns = artifact.get("feature_columns", [])
         
-        logger.info(f"加载模型：{req.model_version}")
+        logger.info(f"加载模型：{model_version}")
         
         # 2. 将前端 JSON 转为 DataFrame
         df_infer = pd.DataFrame([req.features])
@@ -532,7 +564,7 @@ async def predict_online(req: PredictRequest):
         
         return {
             "status": "success",
-            "model_version": req.model_version,
+            "model_version": model_version,
             "prediction": float(pred[0]),
             "probability": float(prob),
             "input_features": req.features
@@ -548,7 +580,7 @@ async def predict_online(req: PredictRequest):
 @router.get("/task/{task_id}/status")
 async def get_task_status(task_id: str):
     """获取任务状态"""
-    task_dir = f"output/{task_id}"
+    task_dir = get_task_dir(task_id)
 
     if not os.path.exists(task_dir):
         return {"status": "not_found", "task_id": task_id}
@@ -566,19 +598,19 @@ async def get_task_status(task_id: str):
     if "feature_strategy.json" in files:
         status["step2"] = "done"
 
-    saved_dir = "saved"
-    if os.path.exists(saved_dir) and f"model_{task_id}.pkl" in os.listdir(saved_dir):
+    model_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
+    if model_path.exists():
         status["step3"] = "done"
         status["status"] = "completed"
 
         # 加载模型获取最佳 AUC
         try:
             import joblib
-            artifact = joblib.load(f"{saved_dir}/model_{task_id}.pkl")
+            artifact = joblib.load(model_path)
             status["best_auc"] = artifact.get("best_value", 0)
             status["feature_columns"] = artifact.get("feature_columns", [])
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"读取模型状态失败：{e}")
 
     return status
 
@@ -594,8 +626,7 @@ async def get_feature_importance(task_id: str):
     Returns:
         List[Dict]: 特征重要性列表
     """
-    saved_dir = "saved"
-    model_path = f"{saved_dir}/model_{task_id}.pkl"
+    model_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
 
     if not os.path.exists(model_path):
         return []
@@ -636,16 +667,20 @@ async def get_feature_importance(task_id: str):
 @router.get("/models")
 async def list_models():
     """列出所有已训练的模型"""
-    if not os.path.exists("saved"):
+    if not SAVED_DIR.exists():
         return {"models": []}
 
     models = []
-    for f in os.listdir("saved"):
+    for f in os.listdir(SAVED_DIR):
         if f.startswith("model_task_") and f.endswith(".pkl"):
             task_id = f.replace("model_", "").replace(".pkl", "")
-            models.append({
-                "task_id": task_id,
-                "model_path": f"saved/{f}"
-            })
+            try:
+                validate_task_id(task_id)
+                models.append({
+                    "task_id": task_id,
+                    "model_path": str(get_saved_path(f))
+                })
+            except HTTPException:
+                logger.warning(f"跳过无效模型文件名：{f}")
 
     return {"models": models}

@@ -63,11 +63,54 @@ st.markdown("""
 
 # API 基础 URL
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+PSI_COLUMNS = ['特征', 'PSI 值', '状态']
+
+
+def build_psi_dataframe(features: dict) -> pd.DataFrame:
+    """Normalize drift-report features into a stable PSI table schema."""
+    rows = []
+    if not isinstance(features, dict):
+        return pd.DataFrame(columns=PSI_COLUMNS)
+
+    for feat, info in features.items():
+        if not isinstance(info, dict):
+            continue
+
+        psi_val = pd.to_numeric(info.get('psi', 0), errors='coerce')
+        psi_val = 0.0 if pd.isna(psi_val) else float(psi_val)
+        severity = info.get('severity', 'normal')
+
+        if severity == 'critical':
+            status = '🚨'
+        elif severity == 'warning':
+            status = '⚠️'
+        else:
+            status = '✅'
+
+        rows.append({
+            '特征': str(feat).replace('_stats', '').replace('_dist', ''),
+            'PSI 值': psi_val,
+            '状态': status
+        })
+
+    return pd.DataFrame(rows, columns=PSI_COLUMNS)
+
+
+def fallback_psi_dataframe() -> pd.DataFrame:
+    return pd.DataFrame({
+        '特征': ['age', 'income', 'city_code', 'order_count', 'credit_score'],
+        'PSI 值': [0.05, 0.12, 0.08, 0.25, 0.03],
+        '状态': ['✅', '⚠️', '✅', '🚨', '✅']
+    }, columns=PSI_COLUMNS)
 
 # 模型选择
-models_response = requests.get(f"{API_BASE_URL}/api/workflow/models")
+try:
+    models_response = requests.get(f"{API_BASE_URL}/api/workflow/models", timeout=10)
+except requests.RequestException as e:
+    st.error(f"无法获取模型列表：{e}")
+    models_response = None
 
-if models_response.status_code == 200:
+if models_response is not None and models_response.status_code == 200:
     models = models_response.json().get("models", [])
 
     if models:
@@ -92,41 +135,15 @@ if models_response.status_code == 200:
                 drift_report = psi_response.json()
                 features = drift_report.get('features', {})
 
-                psi_data_list = []
-                for feat, info in features.items():
-                    psi_val = info.get('psi', 0)
-                    severity = info.get('severity', 'normal')
-
-                    if severity == 'critical':
-                        status = '🚨'
-                    elif severity == 'warning':
-                        status = '⚠️'
-                    else:
-                        status = '✅'
-
-                    psi_data_list.append({
-                        '特征': feat.replace('_stats', '').replace('_dist', ''),
-                        'PSI 值': psi_val,
-                        '状态': status
-                    })
-
-                psi_data = pd.DataFrame(psi_data_list)
+                psi_data = build_psi_dataframe(features)
+                if psi_data.empty:
+                    st.info(drift_report.get('message', '暂无 PSI 明细数据。'))
             else:
                 st.warning("无法获取 PSI 数据，使用模拟数据展示")
-                # 模拟 PSI 数据（降级展示）
-                psi_data = pd.DataFrame({
-                    '特征': ['age', 'income', 'city_code', 'order_count', 'credit_score'],
-                    'PSI 值': [0.05, 0.12, 0.08, 0.25, 0.03],
-                    '状态': ['✅', '⚠️', '✅', '🚨', '✅']
-                })
+                psi_data = fallback_psi_dataframe()
         except Exception as e:
             st.warning(f"获取 PSI 数据失败：{e}")
-            # 模拟 PSI 数据（降级展示）
-            psi_data = pd.DataFrame({
-                '特征': ['age', 'income', 'city_code', 'order_count', 'credit_score'],
-                'PSI 值': [0.05, 0.12, 0.08, 0.25, 0.03],
-                '状态': ['✅', '⚠️', '✅', '🚨', '✅']
-            })
+            psi_data = fallback_psi_dataframe()
         
         # 用颜色标记
         def color_psi(val):
@@ -137,8 +154,11 @@ if models_response.status_code == 200:
             else:
                 return 'background-color: #d4edda'  # 正常 - 绿色
         
-        styled_psi = psi_data.style.applymap(color_psi, subset=['PSI 值'])
-        st.dataframe(styled_psi, use_container_width=True, hide_index=True)
+        if psi_data.empty:
+            st.dataframe(psi_data, use_container_width=True, hide_index=True)
+        else:
+            styled_psi = psi_data.style.map(color_psi, subset=['PSI 值'])
+            st.dataframe(styled_psi, use_container_width=True, hide_index=True)
         
         # 严重漂移告警
         critical_features = psi_data[psi_data['PSI 值'] >= 0.2]
@@ -156,7 +176,7 @@ if models_response.status_code == 200:
     
     else:
         st.warning("暂无可用模型")
-else:
+elif models_response is not None:
     st.error("无法获取模型列表")
 
 # 模型健康度

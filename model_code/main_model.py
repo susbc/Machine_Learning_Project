@@ -69,6 +69,8 @@ class BuildingModel:
         self.X_test = None
         self.y_train = None
         self.y_test = None
+        self.X_predict = None
+        self.predict_key = None
         
     def _load_data(self) -> None:
         """加载数据"""
@@ -197,18 +199,22 @@ class BuildingModel:
         self._identify_fields()
         self._fields_stype()
 
+        if self.key not in self.data.columns:
+            raise ValueError(f"预测数据缺少 key 字段：{self.key}")
+
+        self.predict_key = self.data[self.key].copy()
         feature_cols = [c for c in self.data.columns if c not in [self.label, self.key]]
 
         if self.preprocessor is not None:
             # 使用训练时 fit 好的预处理器 (推荐路径)
-            self.data = self.preprocessor.transform(self.data[feature_cols])
+            self.X_predict = self.preprocessor.transform(self.data[feature_cols])
             print("使用训练时 fit 好的预处理器进行预测")
         else:
             # 仅运行预测模式：全量 fit + transform
             print("预处理器尚未初始化，对全量数据 fit + transform")
             self.preprocessor = ConfigDrivenPreprocessor(self.df_field)
             self.preprocessor.fit(self.data[feature_cols])
-            self.data = self.preprocessor.transform(self.data[feature_cols])
+            self.X_predict = self.preprocessor.transform(self.data[feature_cols])
     
     def model_train(self) -> Dict[str, Any]:
         """
@@ -265,14 +271,13 @@ class BuildingModel:
         print("=" * 60)
         
         self._prepare_data_for_predict()
-        
-        # 准备预测数据
-        key = self.data[self.key]
-        features = self.data.drop([self.label, self.key], axis=1)
+
+        if self.X_predict is None or self.predict_key is None:
+            raise RuntimeError("预测数据准备失败：缺少预处理后的特征或 key")
         
         # 预测
         results = load_and_predict(
-            features, key, self.data_month,
+            self.X_predict, self.predict_key, self.data_month,
             self.model_dir, self.output_dir
         )
         

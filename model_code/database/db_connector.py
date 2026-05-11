@@ -9,6 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from typing import Optional, Dict, Any, List
 import pandas as pd
 import logging
+import re
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -212,6 +213,22 @@ class DatabaseConnector:
         except SQLAlchemyError as e:
             logger.error(f"查询执行失败：{str(e)}")
             return pd.DataFrame()
+
+    def _quote_identifier(self, identifier: str) -> str:
+        """
+        安全引用表名/列名。
+
+        只允许常见的 schema.table / column 标识符格式，避免用户输入拼入 SQL。
+        """
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?", identifier):
+            raise ValueError(f"无效的 SQL 标识符：{identifier}")
+
+        if self.engine is None:
+            if not self.connect():
+                raise RuntimeError("数据库连接失败")
+
+        preparer = self.engine.dialect.identifier_preparer
+        return ".".join(preparer.quote(part) for part in identifier.split("."))
     
     def read_table(self, table: str, limit: int = 1000, columns: Optional[List[str]] = None) -> pd.DataFrame:
         """
@@ -225,13 +242,24 @@ class DatabaseConnector:
         Returns:
             表数据 DataFrame
         """
+        safe_table = self._quote_identifier(table)
+        safe_limit = max(1, min(int(limit), 100000))
+
         if columns:
-            cols = ", ".join(columns)
-            sql = f"SELECT {cols} FROM {table} LIMIT {limit}"
+            cols = ", ".join(self._quote_identifier(column) for column in columns)
+            sql = f"SELECT {cols} FROM {safe_table} LIMIT {safe_limit}"  # nosec B608
         else:
-            sql = f"SELECT * FROM {table} LIMIT {limit}"
+            sql = f"SELECT * FROM {safe_table} LIMIT {safe_limit}"  # nosec B608
         
         return self.query(sql)
+
+    def count_table(self, table: str) -> int:
+        """安全统计表行数。"""
+        safe_table = self._quote_identifier(table)
+        df = self.query(f"SELECT COUNT(*) as count FROM {safe_table}")  # nosec B608
+        if len(df) == 0:
+            return 0
+        return int(df["count"].iloc[0])
     
     def get_table_columns(self, table: str) -> List[Dict[str, Any]]:
         """

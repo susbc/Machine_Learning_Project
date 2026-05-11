@@ -495,13 +495,18 @@ class ConfigDrivenPreprocessor(BaseEstimator, TransformerMixin):
             if field not in X.columns:
                 continue
             
+            scaler = None
             if std_type == 'z-score':
-                self.scalers_[field] = StandardScaler()
+                scaler = StandardScaler()
             elif std_type == 'min-max':
-                self.scalers_[field] = MinMaxScaler()
+                scaler = MinMaxScaler()
             elif std_type == 'robust':
-                self.scalers_[field] = RobustScaler()
-            
+                scaler = RobustScaler()
+
+            if scaler is None:
+                continue
+
+            self.scalers_[field] = scaler
             self.scalers_[field].fit(X[[field]])
     
     def _fit_encoders(self, X: pd.DataFrame):
@@ -516,7 +521,10 @@ class ConfigDrivenPreprocessor(BaseEstimator, TransformerMixin):
                 continue
             
             if ecode_type != 'one-hot':  # one-hot 不需要 fit
-                self.encoders_[field] = OrdinalEncoder()
+                self.encoders_[field] = OrdinalEncoder(
+                    handle_unknown='use_encoded_value',
+                    unknown_value=-1,
+                )
                 self.encoders_[field].fit(X[[field]])
 
     def save(self, path: str) -> None:
