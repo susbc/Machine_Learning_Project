@@ -204,19 +204,31 @@ class QueryBuilder:
     def order_by(
         self,
         column: str,
-        direction: OrderDirection = OrderDirection.ASC
+        direction: Union[OrderDirection, str] = OrderDirection.ASC
     ) -> 'QueryBuilder':
         """
         添加 ORDER BY 子句
         
         Args:
             column: 排序列
-            direction: 排序方向
+            direction: 排序方向，支持 OrderDirection 枚举或 "ASC"/"DESC" 字符串
         
         Returns:
             self
         """
-        self._order_by_cols.append(f"{column} {direction.value}")
+        if isinstance(direction, OrderDirection):
+            direction_value = direction.value
+        elif isinstance(direction, str):
+            normalized = direction.upper()
+            try:
+                direction_value = OrderDirection[normalized].value
+            except KeyError as exc:
+                valid = ", ".join(item.name for item in OrderDirection)
+                raise ValueError(f"不支持的排序方向：{direction}，支持：{valid}") from exc
+        else:
+            raise TypeError("direction 必须是 OrderDirection 或字符串")
+
+        self._order_by_cols.append(f"{column} {direction_value}")
         return self
     
     def limit(self, limit: int) -> 'QueryBuilder':

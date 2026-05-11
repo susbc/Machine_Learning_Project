@@ -114,7 +114,7 @@ class TestFAISSClient:
             
             # 验证文件存在
             assert os.path.exists(temp_path)
-            assert os.path.exists(temp_path.replace(".index", ".meta.pkl"))
+            assert os.path.exists(temp_path.replace(".index", ".meta.json"))
             
             # 加载到新客户端
             new_client = FAISSClient(dimension=384)
@@ -128,7 +128,7 @@ class TestFAISSClient:
             # 清理临时文件
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-            meta_path = temp_path.replace(".index", ".meta.pkl")
+            meta_path = temp_path.replace(".index", ".meta.json")
             if os.path.exists(meta_path):
                 os.remove(meta_path)
     

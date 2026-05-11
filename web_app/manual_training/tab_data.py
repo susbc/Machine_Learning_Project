@@ -227,12 +227,11 @@ def _render_db_tables(db, tables, pd) -> None:
     with cols[1]:
         st.metric("列数", len(columns))
     try:
-        count_df = db.query(f"SELECT COUNT(*) as count FROM {selected_table}")
-        row_count = count_df["count"].iloc[0] if len(count_df) > 0 else 0
+        row_count = db.count_table(selected_table)
         with cols[2]:
             st.metric("行数", f"{row_count:,}")
-    except Exception:
-        pass
+    except Exception as e:
+        st.caption(f"行数统计失败：{e}")
 
     st.markdown("**列信息**")
     if columns:

@@ -23,6 +23,61 @@ from model_code.predict import (
 )
 
 
+class TestBuildingModelPredict:
+    """测试 BuildingModel 预测数据准备流程"""
+
+    def test_model_predict_keeps_key_after_preprocessing(self, tmp_path, monkeypatch):
+        """预处理后的特征矩阵不应覆盖原始数据导致 key 丢失"""
+        from model_code.main_model import BuildingModel
+
+        data_path = tmp_path / "predict.csv"
+        config_path = tmp_path / "field_config.xlsx"
+
+        pd.DataFrame({
+            "user_id": [101, 102, 103],
+            "age": [20, 30, 40],
+            "label": [0, 1, 0],
+        }).to_csv(data_path, sep="|", index=False)
+
+        pd.DataFrame([
+            {"field_name": "user_id", "field_type": "key"},
+            {"field_name": "age", "field_type": "num"},
+            {"field_name": "label", "field_type": "label"},
+        ]).assign(
+            missing_value=np.nan,
+            outlier_value=np.nan,
+            standardize_type=np.nan,
+            ecode_type=np.nan,
+        ).to_excel(config_path, index=False)
+
+        captured = {}
+
+        def fake_load_and_predict(data, key, data_month, model_dir=None, output_dir=None, threshold=None):
+            captured["columns"] = list(data.columns)
+            captured["key"] = list(key)
+            return pd.DataFrame({
+                "key": list(key),
+                "probability": [0.1, 0.8, 0.2],
+                "prediction": [0, 1, 0],
+            })
+
+        monkeypatch.setattr("model_code.main_model.load_and_predict", fake_load_and_predict)
+
+        model = BuildingModel(
+            data_path=str(data_path),
+            config_path=str(config_path),
+            data_month="202605",
+            output_dir=str(tmp_path / "output"),
+            model_dir=str(tmp_path / "models"),
+        )
+
+        result = model.model_predict()
+
+        assert captured["columns"] == ["age"]
+        assert captured["key"] == [101, 102, 103]
+        assert result["key"].tolist() == [101, 102, 103]
+
+
 class TestLoadAndPredict:
     """测试加载模型并预测函数"""
     

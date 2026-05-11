@@ -81,6 +81,7 @@ class ConnectionManager:
             
             with open(self.storage_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            self.storage_file.chmod(0o600)
             
             logger.info(f"连接配置已保存到 {self.storage_file}")
             return True
@@ -107,7 +108,7 @@ class ConnectionManager:
             config.get('user', '')
         ]
         key_string = "|".join(key_parts)
-        return hashlib.md5(key_string.encode()).hexdigest()[:8]
+        return hashlib.sha256(key_string.encode()).hexdigest()[:8]
     
     def add_connection(self, name: str, config: Dict[str, Any], 
                        description: str = "", tags: Optional[List[str]] = None) -> str:

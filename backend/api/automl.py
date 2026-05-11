@@ -7,8 +7,9 @@ AutoML API - FastAPI 后端接口
 import asyncio
 import json
 import logging
+import re
 from typing import Dict, Any, Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from concurrent.futures import ThreadPoolExecutor
 import queue
@@ -23,6 +24,14 @@ executor = ThreadPoolExecutor(max_workers=2)
 
 # 全局存储运行中的优化任务
 running_optimizations: Dict[str, Dict] = {}
+
+STUDY_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def validate_study_id(study_id: str) -> str:
+    if not STUDY_ID_PATTERN.fullmatch(study_id):
+        raise HTTPException(status_code=400, detail="无效的 study_id")
+    return study_id
 
 
 class TrialCallback:
@@ -111,6 +120,7 @@ def run_optuna_optimization(
     n_trials: int,
     queue: asyncio.Queue,
     study_id: str,
+    loop: asyncio.AbstractEventLoop,
     X,
     y,
     config: Dict[str, Any]
@@ -131,9 +141,6 @@ def run_optuna_optimization(
     from core.automl import AutoMLOptimizer
 
     try:
-        # 获取当前 event loop (用于回调)
-        loop = asyncio.get_running_loop()
-
         # 创建优化器
         optimizer = AutoMLOptimizer(X, y, config, cv_splits=5, n_jobs=-1)
 
@@ -174,14 +181,14 @@ def run_optuna_optimization(
                 queue.put(None),
                 loop
             )
-        except:
-            pass
+        except Exception as notify_error:
+            logger.warning(f"发送优化结束信号失败：{notify_error}")
 
 
 @router.get("/automl/optimize/stream")
 async def stream_optimization(
-    study_id: str,
-    n_trials: int = 30,
+    study_id: Optional[str] = Query(None, min_length=1, max_length=64),
+    n_trials: int = Query(30, ge=10, le=100),
     X_col: str = None,
     y_col: str = None
 ):
@@ -203,6 +210,7 @@ async def stream_optimization(
     # 生成唯一研究 ID
     if not study_id:
         study_id = str(uuid.uuid4())
+    study_id = validate_study_id(study_id)
     
     # 创建异步队列
     queue_obj = asyncio.Queue()
@@ -252,6 +260,7 @@ async def stream_optimization(
             n_trials,
             queue_obj,
             study_id,
+            loop,
             X,
             y,
             config

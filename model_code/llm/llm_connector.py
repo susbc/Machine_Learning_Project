@@ -301,7 +301,7 @@ class BaiduProvider(LLMProvider):
             "client_secret": self.secret_key
         }
         
-        response = requests.post(url, params=params)
+        response = requests.post(url, params=params, timeout=30)
         data = response.json()
         return data.get("access_token")
     
@@ -324,7 +324,7 @@ class BaiduProvider(LLMProvider):
             }
             
             headers = {'Content-Type': 'application/json'}
-            response = requests.post(url, json=payload, headers=headers)
+            response = requests.post(url, json=payload, headers=headers, timeout=60)
             result = response.json()
             return result.get('result', '')
         except Exception as e:
@@ -452,7 +452,7 @@ class LLMManager:
         Returns:
             配置 ID
         """
-        config_id = hashlib.md5(f"{name}_{provider_type}".encode()).hexdigest()[:8]
+        config_id = hashlib.sha256(f"{name}_{provider_type}".encode()).hexdigest()[:8]
         
         self.configs[config_id] = {
             'id': config_id,
