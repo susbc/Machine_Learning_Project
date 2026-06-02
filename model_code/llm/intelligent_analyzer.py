@@ -9,9 +9,12 @@ AI 智能分析模块
 
 import json
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 from datetime import datetime
+
+from model_code.analysis.registry import ensure_within_project, record_analysis
+from model_code.analysis.schemas import AnalysisResult, coerce_analysis_result
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -594,7 +597,23 @@ class IntelligentAnalyzer:
         messages = [{"role": "user", "content": prompt}]
         return self.llm_manager.chat(messages, temperature=0.3)
     
-    def save_analysis(self, analysis_type: str, content: str,
+    def to_structured_result(
+        self,
+        analysis_type: str,
+        content: str,
+        base_result: Optional[AnalysisResult] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> AnalysisResult:
+        """Coerce LLM text into a structured analysis result."""
+        return coerce_analysis_result(
+            content,
+            analysis_type=analysis_type,
+            fallback_summary=f"{analysis_type} 分析已完成。",
+            base_result=base_result,
+            metadata=metadata,
+        )
+
+    def save_analysis(self, analysis_type: str, content: Union[str, AnalysisResult],
                      metadata: Dict = None) -> str:
         """
         保存分析结果
@@ -607,14 +626,24 @@ class IntelligentAnalyzer:
         Returns:
             保存的文件路径
         """
-        from pathlib import Path
-        
-        output_dir = Path(__file__).parent.parent / "analysis_reports"
+        output_dir = ensure_within_project(Path(__file__).parent.parent / "analysis_reports")
         output_dir.mkdir(exist_ok=True)
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{analysis_type}_{timestamp}.md"
-        filepath = output_dir / filename
+        filepath = ensure_within_project(output_dir / filename)
+
+        if isinstance(content, AnalysisResult):
+            report_content = content.to_markdown(include_raw=True)
+            registry_result = content
+        else:
+            report_content = str(content)
+            registry_result = coerce_analysis_result(
+                report_content,
+                analysis_type=analysis_type,
+                fallback_summary=f"{analysis_type} 分析报告已保存。",
+                metadata=metadata,
+            )
         
         # 构建报告
         report = f"""# AI 智能分析报告
@@ -632,7 +661,7 @@ class IntelligentAnalyzer:
 
 ## 分析结果
 
-{content}
+{report_content}
 
 ---
 
@@ -642,6 +671,7 @@ class IntelligentAnalyzer:
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(report)
         
+        record_analysis(registry_result, report_path=str(filepath), extra={"analysis_type": analysis_type})
         logger.info(f"分析报告已保存：{filepath}")
         return str(filepath)
 
