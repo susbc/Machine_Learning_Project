@@ -25,6 +25,9 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from model_code.llm import get_intelligent_analyzer, get_llm_manager
+from model_code.analysis.report_builder import build_composite_report, save_composite_report
+from model_code.analysis.rule_engine import diagnose_dataset, diagnose_prediction, diagnose_training
+from model_code.analysis.schemas import AnalysisResult
 from web_app.utils.session_state import init_session_state
 
 
@@ -129,15 +132,49 @@ def _data_quality_snapshot(df: pd.DataFrame, target_col: str) -> Dict[str, Any]:
     }
 
 
-def _save_analysis_button(key: str, analysis_type: str, content_key: str, metadata: Dict[str, Any], analyzer) -> None:
-    disabled = not st.session_state.get(content_key)
+def _save_analysis_button(
+    key: str,
+    analysis_type: str,
+    content_key: str,
+    metadata: Dict[str, Any],
+    analyzer,
+    structured_key: Optional[str] = None,
+) -> None:
+    content = st.session_state.get(structured_key) if structured_key else None
+    if content is None:
+        content = st.session_state.get(content_key)
+    disabled = not bool(content)
     if st.button("保存报告", key=key, use_container_width=True, disabled=disabled):
         filepath = analyzer.save_analysis(
             analysis_type,
-            st.session_state[content_key],
+            content,
             metadata,
         )
         st.success(f"报告已保存：{filepath}")
+
+
+def _render_analysis_result(result: AnalysisResult, title: str = "规则诊断") -> None:
+    st.subheader(title)
+    col1, col2 = st.columns(2)
+    col1.metric("风险等级", result.risk_level)
+    col2.metric("置信度", f"{result.confidence:.2f}")
+    st.caption(result.summary)
+
+    if result.risks:
+        risk_df = pd.DataFrame([item.to_dict() for item in result.risks])
+        st.dataframe(risk_df, use_container_width=True, hide_index=True)
+    else:
+        st.success("规则诊断未发现明显风险")
+
+    with st.expander("查看诊断证据", expanded=False):
+        if result.evidence:
+            st.dataframe(
+                pd.DataFrame([item.to_dict() for item in result.evidence]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("暂无证据项")
 
 
 def _training_context_from_session() -> Optional[Tuple[Dict[str, Any], Dict[str, Any], List[Tuple[str, float]]]]:
@@ -156,6 +193,7 @@ def _training_context_from_session() -> Optional[Tuple[Dict[str, Any], Dict[str,
         "train_size": results.get("train_size", 0),
         "val_size": results.get("test_size", 0),
         "n_features": len(results.get("feature_names", [])),
+        "best_threshold": results.get("best_threshold"),
     }
 
     feature_names = list(results.get("feature_names") or [])
@@ -212,6 +250,19 @@ def _prediction_series_from_session() -> Tuple[Optional[pd.Series], str]:
     return None, ""
 
 
+def _reference_prediction_series_from_training() -> Optional[pd.Series]:
+    training_results = st.session_state.get("training_results")
+    if not isinstance(training_results, dict) or training_results.get("y_pred_proba") is None:
+        return None
+
+    proba = np.asarray(training_results["y_pred_proba"])
+    if proba.ndim == 2 and proba.shape[1] >= 2:
+        proba = proba[:, 1] if proba.shape[1] == 2 else np.max(proba, axis=1)
+    values = pd.Series(np.asarray(proba).reshape(-1))
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    return values if not values.empty else None
+
+
 def render_data_analysis_tab(analyzer) -> None:
     st.header("数据集智能分析")
 
@@ -238,6 +289,10 @@ def render_data_analysis_tab(analyzer) -> None:
     with st.expander("数据预览", expanded=False):
         st.dataframe(df.head(30), use_container_width=True)
 
+    data_rule_result = diagnose_dataset(df, target_col)
+    st.session_state.data_rule_result = data_rule_result
+    _render_analysis_result(data_rule_result, title="数据规则诊断")
+
     st.subheader("业务与模型偏好")
     business_context = st.text_area(
         "业务场景",
@@ -263,6 +318,12 @@ def render_data_analysis_tab(analyzer) -> None:
             )
             if result:
                 st.session_state.data_analysis = result
+                st.session_state.data_analysis_structured = analyzer.to_structured_result(
+                    "data_analysis",
+                    result,
+                    base_result=data_rule_result,
+                    metadata={"target": target_col, "snapshot": snapshot},
+                )
     with col2:
         if st.button("推荐模型", use_container_width=True, key="ai_recommend_model_btn"):
             requirements = {
@@ -276,6 +337,12 @@ def render_data_analysis_tab(analyzer) -> None:
             )
             if result:
                 st.session_state.model_recommendation = result
+                st.session_state.model_recommendation_structured = analyzer.to_structured_result(
+                    "model_recommendation",
+                    result,
+                    base_result=data_rule_result,
+                    metadata={"target": target_col, "requirements": requirements},
+                )
     with col3:
         _save_analysis_button(
             "ai_data_report_btn",
@@ -283,6 +350,7 @@ def render_data_analysis_tab(analyzer) -> None:
             "data_analysis",
             {"dataset_shape": df.shape, "target": target_col, "snapshot": snapshot},
             analyzer,
+            structured_key="data_analysis_structured",
         )
 
     if st.session_state.get("data_analysis"):
@@ -348,6 +416,10 @@ def render_training_analysis_tab(analyzer) -> None:
                     hide_index=True,
                 )
 
+    training_rule_result = diagnose_training(metrics, params, feature_importance)
+    st.session_state.training_rule_result = training_rule_result
+    _render_analysis_result(training_rule_result, title="训练规则诊断")
+
     col1, col2 = st.columns(2)
     with col1:
         if st.button("分析训练结果", type="primary", use_container_width=True, key="ai_train_analyze_btn"):
@@ -357,6 +429,12 @@ def render_training_analysis_tab(analyzer) -> None:
             )
             if result:
                 st.session_state.training_analysis = result
+                st.session_state.training_analysis_structured = analyzer.to_structured_result(
+                    "training_analysis",
+                    result,
+                    base_result=training_rule_result,
+                    metadata={"metrics": metrics, "params": params},
+                )
     with col2:
         _save_analysis_button(
             "ai_train_report_btn",
@@ -364,6 +442,7 @@ def render_training_analysis_tab(analyzer) -> None:
             "training_analysis",
             {"metrics": metrics, "params": params, "source": "manual_input" if manual_mode else "training_results"},
             analyzer,
+            structured_key="training_analysis_structured",
         )
 
     if st.session_state.get("training_analysis"):
@@ -418,6 +497,7 @@ def render_hyperparameter_tab(analyzer) -> None:
             return
 
         history = list(auto_history)
+        skipped_history_lines = 0
         for line in history_text.strip().splitlines():
             if "→" not in line or "AUC" not in line:
                 continue
@@ -425,8 +505,10 @@ def render_hyperparameter_tab(analyzer) -> None:
                 params_part, score_part = line.split("→", 1)
                 auc = float(score_part.split(":")[-1].strip())
                 history.append({"params": params_part.strip(), "auc": auc})
-            except Exception:
-                continue
+            except (IndexError, ValueError):
+                skipped_history_lines += 1
+        if skipped_history_lines:
+            st.caption(f"已跳过 {skipped_history_lines} 条无法解析的历史记录。")
 
         constraints = {"max_train_time": max_time, "compute_resources": compute}
         result = _run_llm_task(
@@ -482,6 +564,14 @@ def render_prediction_analysis_tab(analyzer) -> None:
     }).set_index("概率区间")
     st.bar_chart(hist_df, use_container_width=True)
 
+    prediction_rule_result = diagnose_prediction(
+        predictions,
+        threshold=threshold,
+        reference_predictions=_reference_prediction_series_from_training(),
+    )
+    st.session_state.prediction_rule_result = prediction_rule_result
+    _render_analysis_result(prediction_rule_result, title="预测规则诊断")
+
     if st.button("分析预测结果", type="primary", use_container_width=True, key="ai_pred_analyze_btn"):
         result = _run_llm_task(
             "分析预测结果",
@@ -489,11 +579,94 @@ def render_prediction_analysis_tab(analyzer) -> None:
         )
         if result:
             st.session_state.prediction_analysis = result
+            st.session_state.prediction_analysis_structured = analyzer.to_structured_result(
+                "prediction_analysis",
+                result,
+                base_result=prediction_rule_result,
+                metadata={"threshold": threshold, "source": source},
+            )
 
     if st.session_state.get("prediction_analysis"):
         st.markdown("---")
         st.subheader("预测结果分析")
         st.markdown(st.session_state.prediction_analysis)
+
+
+def _collect_current_rule_results() -> List[AnalysisResult]:
+    results: List[AnalysisResult] = []
+
+    df = _get_uploaded_data()
+    if df is not None:
+        target_col = st.session_state.get("ai_data_target_col")
+        if target_col not in df.columns:
+            target_col = _detect_target_col(df)
+        results.append(diagnose_dataset(df, target_col))
+
+    training_context = _training_context_from_session()
+    if training_context is not None:
+        metrics, params, feature_importance = training_context
+        results.append(diagnose_training(metrics, params, feature_importance))
+
+    predictions, _ = _prediction_series_from_session()
+    if predictions is not None:
+        threshold = float(st.session_state.get("ai_prediction_threshold", st.session_state.get("prediction_threshold", 0.5)))
+        results.append(
+            diagnose_prediction(
+                predictions,
+                threshold=threshold,
+                reference_predictions=_reference_prediction_series_from_training(),
+            )
+        )
+
+    return results
+
+
+def _collect_llm_sections() -> Dict[str, str]:
+    return {
+        "数据集分析": st.session_state.get("data_analysis", ""),
+        "模型推荐": st.session_state.get("model_recommendation", ""),
+        "训练结果分析": st.session_state.get("training_analysis", ""),
+        "调参建议": st.session_state.get("tuning_analysis", ""),
+        "预测结果分析": st.session_state.get("prediction_analysis", ""),
+    }
+
+
+def render_comprehensive_tab() -> None:
+    st.header("综合诊断报告")
+    st.caption("汇总当前数据、训练和预测上下文，生成可保存、可追踪的诊断报告。")
+
+    rule_results = _collect_current_rule_results()
+    if not rule_results:
+        st.info("暂无可诊断上下文。请先加载数据、完成训练或执行预测。")
+        return
+
+    llm_sections = _collect_llm_sections()
+    metadata = {
+        "has_data": _get_uploaded_data() is not None,
+        "has_training_results": st.session_state.get("training_results") is not None,
+        "has_predict_results": st.session_state.get("predict_results") is not None,
+    }
+    composite = build_composite_report(
+        "AI 智能分析综合诊断",
+        rule_results=rule_results,
+        llm_sections=llm_sections,
+        metadata=metadata,
+    )
+    _render_analysis_result(composite, title="综合风险结论")
+
+    with st.expander("分项规则诊断", expanded=True):
+        for result in rule_results:
+            st.markdown(result.to_markdown())
+            st.markdown("---")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("保存综合诊断报告", type="primary", use_container_width=True, key="ai_save_composite_report"):
+            path = save_composite_report(composite, llm_sections=llm_sections)
+            st.success(f"综合诊断报告已保存：{path}")
+    with col2:
+        if st.button("刷新诊断上下文", use_container_width=True, key="ai_refresh_composite_context"):
+            st.rerun()
 
 
 def main() -> None:
@@ -507,7 +680,7 @@ def main() -> None:
     else:
         st.warning("当前没有激活的大模型。页面可查看上下文，但分析按钮需要可用 LLM。")
 
-    tabs = st.tabs(["数据集分析", "训练结果分析", "超参数调优", "预测结果分析"])
+    tabs = st.tabs(["数据集分析", "训练结果分析", "超参数调优", "预测结果分析", "综合诊断"])
     with tabs[0]:
         render_data_analysis_tab(analyzer)
     with tabs[1]:
@@ -516,6 +689,8 @@ def main() -> None:
         render_hyperparameter_tab(analyzer)
     with tabs[3]:
         render_prediction_analysis_tab(analyzer)
+    with tabs[4]:
+        render_comprehensive_tab()
 
     with st.sidebar:
         st.header("上下文状态")
@@ -530,6 +705,7 @@ def main() -> None:
             - 训练分析优先读取手动训练/AutoML 结果。
             - 调参建议会复用最近一次随机搜索记录。
             - 预测分析优先读取预测页结果。
+            - 综合诊断会保存 Markdown 报告并写入 registry。
             """
         )
 
