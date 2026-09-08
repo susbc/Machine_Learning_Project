@@ -125,13 +125,83 @@ class ProblemSpec:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ProblemSpec":
+        """Parse the canonical serialized form without accepting input aliases.
+
+        Artifact metadata is a persisted contract, not a user-input surface: case
+        variants, aliases, partial target profiles, and stale capability maps must
+        therefore fail instead of being normalized into apparently valid state.
+        """
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec schema_version 必须为 1")
+
+        canonical_types = {item.value for item in ProblemType}
+        requested_raw = payload.get("requested_type")
+        resolved_raw = payload.get("resolved_type")
+        if requested_raw not in canonical_types or resolved_raw not in canonical_types - {ProblemType.AUTO.value}:
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec 必须使用规范任务类型")
+        requested_type = ProblemType(requested_raw)
+        resolved_type = ProblemType(resolved_raw)
+        if requested_type != ProblemType.AUTO and requested_type != resolved_type:
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec 的请求类型与解析类型不一致")
+
+        source = payload.get("source")
+        reason = payload.get("reason")
+        explanation = payload.get("explanation")
+        if source not in {"auto_inferred", "user_override"} or not isinstance(reason, str) or not reason:
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec 缺少有效来源或原因")
+        if not isinstance(explanation, str) or not explanation:
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec 缺少可展示说明")
+        expected_source = "auto_inferred" if requested_type == ProblemType.AUTO else "user_override"
+        if source != expected_source:
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec 来源与请求类型不一致")
+
+        target_payload = payload.get("target")
+        if not isinstance(target_payload, dict):
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec 缺少目标画像")
+        required_target = {"column", "dtype", "valid_rows", "unique_count", "unique_ratio", "integer_like"}
+        if not required_target.issubset(target_payload):
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec 目标画像不完整")
+        try:
+            target = TargetProfile(**{key: target_payload[key] for key in required_target})
+        except (TypeError, ValueError) as exc:
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec 目标画像无效") from exc
+        if (
+            not isinstance(target.column, str)
+            or not target.column
+            or not isinstance(target.dtype, str)
+            or not target.dtype
+            or isinstance(target.valid_rows, bool)
+            or not isinstance(target.valid_rows, int)
+            or isinstance(target.unique_count, bool)
+            or not isinstance(target.unique_count, int)
+            or not isinstance(target.unique_ratio, (int, float))
+            or isinstance(target.integer_like, np.bool_)
+            or not isinstance(target.integer_like, bool)
+            or target.valid_rows < 1
+            or target.unique_count < 1
+            or target.unique_count > target.valid_rows
+            or not math.isfinite(float(target.unique_ratio))
+            or not 0 <= float(target.unique_ratio) <= 1
+        ):
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec 目标画像无效")
+
+        capabilities = payload.get("capabilities")
+        expected_capabilities = {
+            "algorithms": list(ALGORITHMS[resolved_type]),
+            "metrics": list(METRICS[resolved_type]),
+            "default_metric": DEFAULT_METRIC[resolved_type],
+            "metric_directions": {metric: METRIC_DIRECTION[metric] for metric in METRICS[resolved_type]},
+        }
+        if capabilities != expected_capabilities:
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec capabilities 与任务类型不一致")
+
         return cls(
-            requested_type=normalize_problem_type(payload["requested_type"]),
-            resolved_type=normalize_problem_type(payload["resolved_type"]),
-            source=payload["source"],
-            reason=payload["reason"],
-            explanation=payload["explanation"],
-            target=TargetProfile(**payload["target"]),
+            requested_type=requested_type,
+            resolved_type=resolved_type,
+            source=source,
+            reason=reason,
+            explanation=explanation,
+            target=target,
         )
 
 

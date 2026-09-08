@@ -27,7 +27,6 @@ from core.automl.problem_spec import (
     ProblemSpec,
     ProblemSpecError,
     ProblemType,
-    normalize_problem_type,
     resolve_problem_spec,
     validate_train_test_split,
 )
@@ -77,10 +76,10 @@ def _read_csv_bytes(raw: bytes) -> pd.DataFrame:
 
 async def read_uploaded_dataframe(file: UploadFile) -> pd.DataFrame:
     """读取上传的 CSV/Excel 文件为 DataFrame。"""
-    raw = await file.read()
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in SUPPORTED_DATA_SUFFIXES:
         raise HTTPException(status_code=400, detail="仅支持 CSV、TXT、XLSX 或 XLS 数据文件")
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
     if not raw:
         raise HTTPException(status_code=400, detail="上传文件为空")
     if len(raw) > MAX_UPLOAD_BYTES:
@@ -424,51 +423,71 @@ def feature_importance_rows(model: Any, feature_names: List[str], top_n: int = 3
     return sorted(rows, key=lambda item: item["importance"], reverse=True)[:top_n]
 
 
-def resolve_artifact_problem_type(artifact: Dict[str, Any]) -> Optional[ProblemType]:
-    """校验 schema-v3 的持久化任务语义；旧产物返回 None。"""
+@dataclass(frozen=True)
+class ArtifactProblemMetadata:
+    schema_version: int
+    problem_type: ProblemType
+    problem_spec: ProblemSpec
+    metric_directions: Dict[str, str]
+
+
+def _artifact_metadata_error(code: str, field: str, message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail={"code": code, "field": field, "message": message})
+
+
+def parse_artifact_problem_metadata(artifact: Dict[str, Any]) -> Optional[ArtifactProblemMetadata]:
+    """Strictly parse schema-v3 metadata; return ``None`` only for legacy artifacts."""
     if "artifact_schema_version" not in artifact:
         return None
     schema_version = artifact["artifact_schema_version"]
     if isinstance(schema_version, bool) or not isinstance(schema_version, (int, np.integer)):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "invalid_artifact_schema_version",
-                "field": "artifact_schema_version",
-                "message": "模型产物的 schema 版本必须是整数",
-            },
+        raise _artifact_metadata_error(
+            "invalid_artifact_schema_version", "artifact_schema_version", "模型产物的 schema 版本必须是整数"
         )
     if int(schema_version) < 3:
         return None
+    if int(schema_version) != 3:
+        raise _artifact_metadata_error(
+            "unsupported_artifact_schema_version", "artifact_schema_version", "不支持该模型产物 schema 版本"
+        )
 
     persisted_type = artifact.get("problem_type")
-    if persisted_type is None:
-        saved_spec = artifact.get("problem_spec")
-        if isinstance(saved_spec, ProblemSpec):
-            persisted_type = saved_spec.resolved_type
-        elif isinstance(saved_spec, dict):
-            persisted_type = saved_spec.get("resolved_type")
-    try:
-        resolved = normalize_problem_type(persisted_type)
-    except ProblemSpecError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "invalid_artifact_problem_type",
-                "field": "problem_type",
-                "message": f"模型产物的任务类型无效：{exc.message}",
-            },
-        ) from exc
-    if resolved == ProblemType.AUTO:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "invalid_artifact_problem_type",
-                "field": "problem_type",
-                "message": "schema-v3 模型产物必须保存已解析的任务类型，不能使用 auto",
-            },
+    canonical_resolved_types = {item.value for item in ProblemType if item != ProblemType.AUTO}
+    if not isinstance(persisted_type, str) or persisted_type not in canonical_resolved_types:
+        raise _artifact_metadata_error(
+            "invalid_artifact_problem_type", "problem_type", "schema-v3 模型产物必须保存规范的已解析任务类型"
         )
-    return resolved
+    resolved = ProblemType(persisted_type)
+
+    saved_spec = artifact.get("problem_spec")
+    try:
+        if isinstance(saved_spec, ProblemSpec):
+            spec = ProblemSpec.from_dict(saved_spec.to_dict())
+        elif isinstance(saved_spec, dict):
+            spec = ProblemSpec.from_dict(saved_spec)
+        else:
+            raise ProblemSpecError("invalid_problem_spec", "problem_spec", "problem_spec 缺失")
+    except (ProblemSpecError, KeyError, TypeError, ValueError) as exc:
+        raise _artifact_metadata_error(
+            "invalid_artifact_problem_spec", "problem_spec", "schema-v3 模型产物的 problem_spec 不完整或无效"
+        ) from exc
+    if resolved != spec.resolved_type:
+        raise _artifact_metadata_error(
+            "inconsistent_artifact_problem_type", "problem_type", "模型产物的重复任务类型字段不一致"
+        )
+
+    metric_directions = artifact.get("metric_directions")
+    if not isinstance(metric_directions, dict) or metric_directions != spec.metric_directions:
+        raise _artifact_metadata_error(
+            "invalid_artifact_metric_directions", "metric_directions", "模型产物的指标方向缺失或与任务类型不一致"
+        )
+    return ArtifactProblemMetadata(int(schema_version), resolved, spec, dict(metric_directions))
+
+
+def resolve_artifact_problem_type(artifact: Dict[str, Any]) -> Optional[ProblemType]:
+    """校验 schema-v3 的持久化任务语义；旧产物返回 None。"""
+    metadata = parse_artifact_problem_metadata(artifact)
+    return metadata.problem_type if metadata is not None else None
 
 
 def predict_with_artifact(artifact: Dict[str, Any], features_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

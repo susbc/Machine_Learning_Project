@@ -3,11 +3,17 @@
 覆盖：先划分后拟合（无泄漏）、小数据集、高基数类别限爆、指标省略语义、
 统一推理（v2/executor/legacy 三形态）、特征重要性命名。
 """
+import asyncio
+import copy
+from io import BytesIO
+
 import numpy as np
 import pandas as pd
 import pytest
 from fastapi import HTTPException
+from starlette.datastructures import UploadFile
 
+import backend.api._dataset as dataset_api
 from backend.api._dataset import (
     TrainBundle,
     _normalise_dataframe,
@@ -20,6 +26,7 @@ from backend.api._dataset import (
     feature_importance_rows,
     prepare_train_pipeline,
     predict_with_artifact,
+    read_uploaded_dataframe,
     resolve_artifact_problem_type,
 )
 from core.automl.problem_spec import ProblemType, resolve_problem_spec
@@ -35,6 +42,15 @@ def _sample_df(n: int = 80) -> pd.DataFrame:
             "label": rng.choice([0, 1], n),
         }
     )
+
+
+def _complete_v3_metadata(spec):
+    return {
+        "artifact_schema_version": 3,
+        "problem_type": spec.resolved_type.value,
+        "problem_spec": spec.to_dict(),
+        "metric_directions": spec.metric_directions,
+    }
 
 
 # ---------- prepare_train_pipeline / build_preprocessor ----------
@@ -120,6 +136,30 @@ def test_csv_reader_supports_gb18030_and_pipe_separator():
 
     assert frame.columns.tolist() == ["城市", "金额", "label"]
     assert frame.loc[1, "城市"] == "上海"
+
+
+def test_upload_reader_never_consumes_beyond_size_limit(monkeypatch):
+    class BoundedReader(BytesIO):
+        def __init__(self, payload: bytes, maximum_read: int):
+            super().__init__(payload)
+            self.maximum_read = maximum_read
+            self.read_sizes: list[int] = []
+
+        def read(self, size: int = -1) -> bytes:
+            self.read_sizes.append(size)
+            if size < 0 or size > self.maximum_read:
+                raise AssertionError(f"unbounded upload read: {size}")
+            return super().read(size)
+
+    monkeypatch.setattr(dataset_api, "MAX_UPLOAD_BYTES", 8)
+    reader = BoundedReader(b"x,target\n1,2\n", maximum_read=9)
+    upload = UploadFile(file=reader, filename="oversized.csv")
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(read_uploaded_dataframe(upload))
+
+    assert error.value.status_code == 413
+    assert reader.read_sizes == [9]
 
 
 def test_quality_report_exposes_actionable_data_issues():
@@ -354,12 +394,12 @@ def test_predict_v2_string_labels_roundtrip():
 def test_schema_v3_regression_prediction_has_no_class_fields():
     from sklearn.linear_model import LinearRegression
 
+    spec = resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "price", "regression")
     model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
 
     result = predict_with_artifact(
         {
-            "artifact_schema_version": 3,
-            "problem_type": "regression",
+            **_complete_v3_metadata(spec),
             "model": model,
             "feature_columns": ["x"],
         },
@@ -369,6 +409,64 @@ def test_schema_v3_regression_prediction_has_no_class_fields():
     assert result["prediction"] == pytest.approx(7.5)
     assert result["encoded_prediction"] is None
     assert result["probability"] is None
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_code", "expected_field"),
+    [
+        (lambda item: item.pop("problem_spec"), "invalid_artifact_problem_spec", "problem_spec"),
+        (
+            lambda item: item.__setitem__("problem_type", "REGRESSION"),
+            "invalid_artifact_problem_type",
+            "problem_type",
+        ),
+        (
+            lambda item: item.__setitem__("problem_type", "binary_classification"),
+            "inconsistent_artifact_problem_type",
+            "problem_type",
+        ),
+        (
+            lambda item: item.pop("metric_directions"),
+            "invalid_artifact_metric_directions",
+            "metric_directions",
+        ),
+        (
+            lambda item: item["metric_directions"].__setitem__("rmse", "maximize"),
+            "invalid_artifact_metric_directions",
+            "metric_directions",
+        ),
+        (
+            lambda item: item["problem_spec"].pop("target"),
+            "invalid_artifact_problem_spec",
+            "problem_spec",
+        ),
+        (
+            lambda item: item.__setitem__("artifact_schema_version", 4),
+            "unsupported_artifact_schema_version",
+            "artifact_schema_version",
+        ),
+    ],
+)
+def test_schema_v3_prediction_rejects_incomplete_or_contradictory_metadata(
+    mutate, expected_code, expected_field
+):
+    from sklearn.linear_model import LinearRegression
+
+    spec = resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "price", "regression")
+    metadata = copy.deepcopy(_complete_v3_metadata(spec))
+    mutate(metadata)
+    artifact = {
+        **metadata,
+        "model": LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5]),
+        "feature_columns": ["x"],
+    }
+
+    with pytest.raises(HTTPException) as error:
+        predict_with_artifact(artifact, [{"x": 3}])
+
+    assert error.value.status_code == 400
+    assert error.value.detail["code"] == expected_code
+    assert error.value.detail["field"] == expected_field
 
 
 class _ClassificationPoisonedRegressor:
@@ -387,10 +485,10 @@ class _ClassificationPoisonedLabelEncoder:
 
 
 def test_schema_v3_regression_bypasses_all_classification_only_mechanisms():
+    spec = resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "price", "regression")
     result = predict_with_artifact(
         {
-            "artifact_schema_version": 3,
-            "problem_type": "regression",
+            **_complete_v3_metadata(spec),
             "model": _ClassificationPoisonedRegressor(),
             "label_encoder": _ClassificationPoisonedLabelEncoder(),
             "decision_threshold": 0.99,
@@ -407,7 +505,7 @@ def test_schema_v3_regression_bypasses_all_classification_only_mechanisms():
     }
 
 
-def test_schema_v3_regression_prediction_uses_nested_persisted_problem_spec():
+def test_schema_v3_regression_prediction_uses_complete_persisted_problem_spec():
     from sklearn.linear_model import LinearRegression
 
     target = pd.Series([1.5, 3.5, 5.5], name="price")
@@ -416,8 +514,7 @@ def test_schema_v3_regression_prediction_uses_nested_persisted_problem_spec():
 
     result = predict_with_artifact(
         {
-            "artifact_schema_version": 3,
-            "problem_spec": spec.to_dict(),
+            **_complete_v3_metadata(spec),
             "model": model,
             "feature_columns": ["x"],
         },
@@ -437,12 +534,7 @@ def test_resolve_artifact_problem_type_uses_persisted_schema_semantics():
 
     assert resolve_artifact_problem_type({}) is None
     assert resolve_artifact_problem_type({"artifact_schema_version": np.int64(2)}) is None
-    assert resolve_artifact_problem_type(
-        {"artifact_schema_version": 3, "problem_type": "REGRESSION"}
-    ) == ProblemType.REGRESSION
-    assert resolve_artifact_problem_type(
-        {"artifact_schema_version": 3, "problem_spec": spec}
-    ) == ProblemType.REGRESSION
+    assert resolve_artifact_problem_type(_complete_v3_metadata(spec)) == ProblemType.REGRESSION
 
 
 @pytest.mark.parametrize(
@@ -476,12 +568,12 @@ def test_schema_v3_prediction_rejects_missing_or_invalid_persisted_problem_type(
 def test_schema_v3_classification_prediction_accepts_canonical_persisted_type():
     from sklearn.linear_model import LogisticRegression
 
+    spec = resolve_problem_spec(pd.Series([0, 0, 1, 1]), "target", "binary_classification")
     model = LogisticRegression().fit([[0], [1], [2], [3]], [0, 0, 1, 1])
 
     result = predict_with_artifact(
         {
-            "artifact_schema_version": 3,
-            "problem_type": "binary_classification",
+            **_complete_v3_metadata(spec),
             "model": model,
             "feature_columns": ["x"],
         },
