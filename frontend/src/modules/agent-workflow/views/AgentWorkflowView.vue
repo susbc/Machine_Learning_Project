@@ -22,7 +22,14 @@
     </div>
 
     <el-alert v-if="infoMessage" type="info" :title="infoMessage" show-icon :closable="true" @close="infoMessage = ''" />
-    <el-alert v-if="errorMessage" type="error" :title="errorMessage" show-icon :closable="false" />
+    <el-alert
+      v-if="errorMessage"
+      data-testid="workflow-error-alert"
+      type="error"
+      :title="errorMessage"
+      show-icon
+      :closable="false"
+    />
 
     <section class="workflow-status-strip">
       <div class="status-item">
@@ -95,12 +102,20 @@
         </div>
         <el-form label-position="top" @submit.prevent>
           <el-form-item label="业务查询">
-            <el-input v-model="retrieveForm.user_query" type="textarea" :rows="4" />
+            <el-input v-model="retrieveForm.user_query" type="textarea" :rows="4" :disabled="training" />
           </el-form-item>
           <el-form-item label="目标列">
-            <el-input v-model="retrieveForm.target_col" />
+            <el-input v-model="retrieveForm.target_col" :disabled="training" />
           </el-form-item>
-          <el-button type="primary" :loading="retrieving" @click="runRetrieve">生成 SQL 并提取数据</el-button>
+          <el-button
+            data-testid="workflow-retrieve-button"
+            type="primary"
+            :loading="retrieving"
+            :disabled="training"
+            @click="runRetrieve"
+          >
+            生成 SQL 并提取数据
+          </el-button>
         </el-form>
       </section>
 
@@ -130,15 +145,21 @@
         <div class="train-controls">
           <label class="train-field">
             <span>问题类型</span>
-          <el-select v-model="problemType" aria-label="工作流问题类型" @change="handleProblemTypeChange">
+            <el-select
+              v-model="problemType"
+              data-testid="workflow-problem-type-select"
+              aria-label="工作流问题类型"
+              :disabled="training"
+              @change="handleProblemTypeChange"
+            >
               <el-option label="自动识别" value="auto" />
               <el-option label="二分类" value="binary_classification" />
               <el-option label="多分类" value="multiclass_classification" />
               <el-option label="回归" value="regression" />
             </el-select>
           </label>
-          <el-input-number v-model="trainConfig.nTrials" :min="10" :max="100" controls-position="right" />
-          <el-input-number v-model="trainConfig.cvFolds" :min="3" :max="10" controls-position="right" />
+          <el-input-number v-model="trainConfig.nTrials" :min="10" :max="100" controls-position="right" :disabled="training" />
+          <el-input-number v-model="trainConfig.cvFolds" :min="3" :max="10" controls-position="right" :disabled="training" />
           <el-button type="warning" :loading="training" :disabled="!canTrain" @click="startTraining">开始训练</el-button>
         </div>
         <el-progress :percentage="trainingProgress" :status="trainingProgress === 100 ? 'success' : undefined" />
@@ -148,7 +169,7 @@
           <el-table-column label="最佳指标" width="160">
             <template #default="{ row }">{{ metricLabel(row.metric ?? row.best_metric) }} {{ formatMetric(row.value ?? row.best_value) }}</template>
           </el-table-column>
-          <el-table-column prop="msg" label="消息" />
+          <el-table-column prop="error" label="消息" />
         </el-table>
       </section>
 
@@ -325,7 +346,7 @@ async function runFeatureGeneration() {
 }
 
 function startTraining() {
-  if (!taskId.value) return
+  if (!taskId.value || training.value) return
   closeTrainingStream()
   const expectedTaskId = taskId.value
   const generation = contextGeneration
@@ -352,7 +373,12 @@ function startTraining() {
     }
     if (payload.status === 'ERROR') {
       training.value = false
-      errorMessage.value = payload.msg ?? '训练失败'
+      errorMessage.value = payload.error ?? '训练失败'
+      closeTrainingStream(controller)
+    }
+    if (payload.status === 'CANCELLED') {
+      training.value = false
+      errorMessage.value = payload.error ?? '训练已取消'
       closeTrainingStream(controller)
     }
   }, controller.signal).catch((error: unknown) => {
@@ -375,6 +401,9 @@ async function refreshTask(expectedTaskId = taskId.value, generation = contextGe
     const status = await workflowApi.getTaskStatus(expectedTaskId)
     if (!isCurrentContext(expectedTaskId, generation)) return
     taskStatus.value = status
+    if ((status.status === 'failed' || status.status === 'cancelled') && status.error) {
+      errorMessage.value = status.error
+    }
     infoMessage.value = '任务状态已刷新'
   } catch (error) {
     if (!isCurrentContext(expectedTaskId, generation)) return

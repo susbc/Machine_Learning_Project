@@ -16,7 +16,7 @@ from sklearn.preprocessing import LabelEncoder
 import backend.api.workflow as workflow
 from backend.main import app
 from core.automl.automl_agent import AutoMLAgent, extract_data_features
-from core.automl.automl_optimizer import AutoMLOptimizer
+from core.automl.automl_optimizer import AutoMLOptimizer, OptimizationCancelled
 from core.automl.problem_spec import resolve_problem_spec
 from core.llm.agent_schemas import FeatureAction, FeatureStrategy
 from model_code.feature_executor import FeatureEngineeringExecutor
@@ -642,4 +642,43 @@ def test_workflow_rejects_overlapping_run_and_keeps_original_run_id(tmp_path, mo
     assert second.json()["detail"]["code"] == "workflow_run_active"
     assert state_after_overlap["run_id"] == original_state["run_id"]
     assert state_after_overlap["requested_type"] == "auto"
+    assert not thread.is_alive()
+
+
+def test_workflow_cancel_endpoint_propagates_to_optimizer_and_persists_cancelled_state(
+    tmp_path, monkeypatch
+):
+    task_id = _prepare_workflow_task(tmp_path)
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    entered = threading.Event()
+    observed_cancel_event: list[threading.Event] = []
+
+    def cancellable_optimize(self, **kwargs):
+        observed_cancel_event.append(self.cancel_event)
+        entered.set()
+        assert self.cancel_event.wait(timeout=5)
+        raise OptimizationCancelled("cancelled by test")
+
+    monkeypatch.setattr(AutoMLOptimizer, "optimize", cancellable_optimize)
+    events: list[dict] = []
+
+    def consume_stream():
+        events.extend(_read_workflow_sse(task_id, "auto", 10, 3))
+
+    thread = threading.Thread(target=consume_stream)
+    thread.start()
+    assert entered.wait(timeout=5)
+    state_path = tmp_path / "output" / task_id / "workflow_state.json"
+    run_id = json.loads(state_path.read_text(encoding="utf-8"))["run_id"]
+
+    response = TestClient(app).post(f"/api/workflow/task/{task_id}/run/{run_id}/cancel")
+    thread.join(timeout=5)
+
+    assert response.status_code == 200
+    assert observed_cancel_event[0].is_set()
+    assert events == [{"status": "CANCELLED", "error": "训练已取消", "run_id": run_id}]
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["status"] == "cancelled"
+    assert persisted["error"] == "训练已取消"
     assert not thread.is_alive()
