@@ -47,6 +47,11 @@ output/
 
 # 敏感配置
 config/saved_connections.json
+config/.db_config_secret
+config/llm_providers.json
+
+# 运行时生成的分析报告
+model_code/analysis_reports/
 
 # 文档规划文件
 docs/superpowers/

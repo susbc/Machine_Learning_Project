@@ -26,6 +26,15 @@ DISPLAY_NAMES = {
     "logistic_regression": "逻辑回归",
 }
 
+# CatBoost 中与文件系统写入相关的训练参数。训练参数来自 API 调用方，
+# 若允许这些键，调用方可让 fit() 在任意目录创建文件（train_dir 会被
+# 自动创建并写入训练日志），构成目录污染/受限文件写入原语。
+FORBIDDEN_FILESYSTEM_TRAINING_PARAMS = {
+    "train_dir",
+    "allow_writing_files",
+    "snapshot_file",
+}
+
 
 class ModelFactory:
     """静态方法算法工厂"""
@@ -173,7 +182,6 @@ class ModelFactory:
             },
             "logistic_regression": {
                 "max_iter": 1000,
-                "n_jobs": -1,
                 "random_state": 42,
                 "class_weight": "balanced",
             },
@@ -191,7 +199,11 @@ class ModelFactory:
         import lightgbm as lgb
         defaults = ModelFactory.get_default_params("lightgbm", task_type)
         if task_type == "multiclass":
-            defaults["num_classes"] = params.pop("num_classes", None)
+            # LightGBM 参数名为 num_class（num_classes 仅为别名）；仅在显式提供时注入，
+            # 否则由 LGBMClassifier.fit 根据 y 自动推断，避免传入 None。
+            num_class = params.pop("num_class", None) or params.pop("num_classes", None)
+            if num_class is not None:
+                defaults["num_class"] = num_class
         defaults.update(params)
         return lgb.LGBMClassifier(**defaults)
 
@@ -200,16 +212,23 @@ class ModelFactory:
         import xgboost as xgb
         defaults = ModelFactory.get_default_params("xgboost", task_type)
         if task_type == "multiclass":
-            defaults["num_class"] = params.pop("num_class", None)
+            num_class = params.pop("num_class", None)
+            if num_class is not None:
+                defaults["num_class"] = num_class
         defaults.update(params)
         return xgb.XGBClassifier(**defaults)
 
     @staticmethod
     def _build_catboost(task_type: str, params: Dict) -> Any:
         from catboost import CatBoostClassifier
+        forbidden = FORBIDDEN_FILESYSTEM_TRAINING_PARAMS.intersection(params)
+        if forbidden:
+            raise ValueError(f"禁止使用文件系统相关的训练参数：{', '.join(sorted(forbidden))}")
         defaults = ModelFactory.get_default_params("catboost", task_type)
         if task_type == "multiclass":
-            defaults["classes_count"] = params.pop("classes_count", None)
+            classes_count = params.pop("classes_count", None)
+            if classes_count is not None:
+                defaults["classes_count"] = classes_count
         if "auto_class_weights" in params:
             defaults["auto_class_weights"] = params.pop("auto_class_weights")
         defaults.update(params)

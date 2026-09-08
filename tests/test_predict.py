@@ -245,7 +245,7 @@ class TestLoadAndPredict:
         assert 'probability' in result_df.columns
         assert 'prediction' in result_df.columns
     
-    def test_predict_model_not_found(self, sample_data, temp_output_dir):
+    def test_predict_model_not_found(self, sample_data, temp_model_dir, temp_output_dir):
         """测试模型文件不存在的情况"""
         data_df, field_config = sample_data
         

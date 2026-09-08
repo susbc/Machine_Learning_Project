@@ -273,17 +273,20 @@ async def get_mlops_status():
         Dict: 系统状态信息
     """
     from backend.scheduler import scheduler
+    jobs = scheduler.get_jobs()
+    next_runs = [job.next_run_time for job in jobs if job.next_run_time]
+    next_run = min(next_runs) if next_runs else None
 
     return {
         "scheduler_running": scheduler.running,
         "active_task_id": None,  # 从 scheduler 获取
-        "next_run": str(scheduler.next_run_time) if scheduler.next_run_time else None,
+        "next_run": str(next_run) if next_run else None,
         "jobs": [
             {
                 "id": job.id,
                 "name": job.name,
                 "next_run": str(job.next_run_time) if job.next_run_time else None
             }
-            for job in scheduler.get_jobs()
+            for job in jobs
         ]
     }

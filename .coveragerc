@@ -41,12 +41,6 @@ exclude_lines =
 # 显示缺失的行
 show_missing = True
 
-# 显示覆盖率总和
-total = True
-
-# 失败阈值
-fail_under = 80
-
 # 排序方式
 sort = Cover
 

@@ -58,9 +58,15 @@ class OpenAIProvider(LLMProvider):
         if self._client is None:
             try:
                 from openai import OpenAI
+                import httpx
+
+                # 安全：禁用 HTTP 重定向跟随。否则 base_url 指向的服务器可以
+                # 302 跳转到内网/元数据地址，把受控的 API 调用变成任意内网探测
+                # （SSRF 加重路径）。合法的 LLM 服务不需要跨域重定向。
                 self._client = OpenAI(
                     api_key=self.api_key,
-                    base_url=self.base_url
+                    base_url=self.base_url,
+                    http_client=httpx.Client(follow_redirects=False),
                 )
             except ImportError:
                 logger.error("请安装 openai 库：pip install openai")

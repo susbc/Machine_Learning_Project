@@ -47,7 +47,7 @@ def load_and_predict(
     # 加载训练摘要 (获取算法名)
     summary_path = model_dir / "train_summary.joblib"
     if not summary_path.exists():
-        raise FileNotFoundError(f"训练摘要文件不存在：{summary_path}")
+        raise FileNotFoundError(f"模型文件不存在或模型目录不完整（缺少训练摘要）：{summary_path}")
 
     try:
         summary = joblib.load(summary_path)
@@ -94,7 +94,8 @@ def load_and_predict(
     result_df = pd.DataFrame({
         'key': key_values,
         'probability': predictions_proba,
-        'prediction': predictions
+        'prediction': predictions,
+        'threshold_used': best_threshold,
     })
     
     # 统计预测分布
@@ -112,9 +113,8 @@ def load_and_predict(
     result_df.to_csv(output_path, index=False)
     print(f"\n✅ 预测结果已保存：{output_path}")
     
-    # 保存详细结果 (包含阈值分析)
+    # 保存详细结果（与返回值保持同一 schema）
     detail_path = output_dir / f"predict_res_{data_month}_detail.csv"
-    result_df['threshold_used'] = best_threshold
     result_df.to_csv(detail_path, index=False)
     print(f"✅ 详细结果已保存：{detail_path}")
     
@@ -143,6 +143,12 @@ def batch_predict(
     """
     from model_code.main_model import BuildingModel
     
+    if len(data_paths) != len(data_months):
+        raise ValueError("data_paths 与 data_months 数量必须一致")
+
+    output_dir = Path(output_dir) if output_dir else Path("../output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = Path(model_dir) if model_dir else Path("saved")
     results = {}
     
     for data_path, data_month in zip(data_paths, data_months):
@@ -150,15 +156,35 @@ def batch_predict(
         print(f"处理月份：{data_month}")
         print(f"{'='*60}")
         
-        model = BuildingModel(
-            data_path=data_path,
-            config_path=config_path,
-            data_month=data_month,
-            output_dir=output_dir,
-            model_dir=model_dir
-        )
-        
-        result = model.model_predict()
+        if config_path:
+            model = BuildingModel(
+                data_path=data_path,
+                config_path=config_path,
+                data_month=data_month,
+                output_dir=output_dir,
+                model_dir=model_dir
+            )
+            result = model.model_predict()
+        else:
+            # 已预处理数据无需伪造配置表；按训练摘要中的列顺序直接推理。
+            frame = pd.read_csv(data_path, sep=None, engine="python")
+            summary_path = model_dir / "train_summary.joblib"
+            if not summary_path.exists():
+                raise FileNotFoundError(f"训练摘要文件不存在：{summary_path}")
+            summary = joblib.load(summary_path)
+            feature_names = [str(col) for col in summary.get("feature_names", [])]
+            missing = [col for col in feature_names if col not in frame.columns]
+            if missing:
+                raise ValueError(f"预测数据缺少训练特征：{', '.join(missing)}")
+            key_candidates = [col for col in frame.columns if any(token in str(col).lower() for token in ("id", "key", "编号"))]
+            key = frame[key_candidates[0]] if key_candidates else pd.Series(frame.index, index=frame.index)
+            result = load_and_predict(
+                data=frame.reindex(columns=feature_names),
+                key=key,
+                data_month=data_month,
+                model_dir=model_dir,
+                output_dir=output_dir,
+            )
         results[data_month] = result
     
     # 合并所有结果

@@ -157,8 +157,8 @@ class AutoMLOptimizer:
         
         # 多分类任务
         if self.task_type == "multiclass_classification":
-            # 需要知道类别数
-            default_params["num_classes"] = len(np.unique(self.y))
+            # 需要知道类别数（LightGBM 参数名为 num_class）
+            default_params["num_class"] = len(np.unique(self.y))
         
         default_params.update(params)
         return lgb.LGBMClassifier(**default_params)
@@ -229,7 +229,6 @@ class AutoMLOptimizer:
         # 默认配置
         default_params = {
             "max_iter": 1000,
-            "n_jobs": -1,
             "random_state": 42,
             "class_weight": "balanced"
         }
@@ -264,8 +263,12 @@ class AutoMLOptimizer:
             
             # 3. 交叉验证 (防止过拟合，保证稳定性)
             if self.task_type in ["binary_classification", "multiclass_classification"]:
+                min_class_count = int(np.min(np.unique(self.y, return_counts=True)[1]))
+                safe_splits = min(self.cv_splits, min_class_count)
+                if safe_splits < 2:
+                    raise ValueError("每个类别至少需要 2 条记录才能执行交叉验证")
                 cv = StratifiedKFold(
-                    n_splits=self.cv_splits,
+                    n_splits=safe_splits,
                     shuffle=True,
                     random_state=42
                 )
@@ -294,10 +297,16 @@ class AutoMLOptimizer:
             
         except Exception as e:
             logger.warning(f"Trial 失败：{e}")
-            return 0.0  # 返回最低分
+            trial.set_user_attr("failure", str(e))
+            import optuna
+            raise optuna.TrialPruned(str(e)) from e
     
     def _get_scoring_metric(self) -> str:
-        """获取 sklearn 评分指标名称"""
+        """获取 sklearn 评分指标名称（多分类 roc_auc 自动切换为 OVR 加权）"""
+        if self.metric == "roc_auc" and self.task_type == "multiclass_classification":
+            return "roc_auc_ovr_weighted"
+        if self.task_type == "multiclass_classification" and self.metric in {"f1", "precision", "recall"}:
+            return f"{self.metric}_weighted"
         metric_mapping = {
             "roc_auc": "roc_auc",
             "accuracy": "accuracy",
@@ -313,27 +322,29 @@ class AutoMLOptimizer:
     
     def optimize(self, n_trials: Optional[int] = None,
                  timeout: Optional[int] = None,
-                 show_progress: bool = True) -> Tuple:
+                 show_progress: bool = True,
+                 callbacks: Optional[List] = None) -> Tuple:
         """
         启动贝叶斯搜索
-        
+
         Args:
             n_trials: Trial 次数 (默认使用配置中的值)
             timeout: 超时时间 (秒)
             show_progress: 是否显示进度条
-            
+            callbacks: 额外的 Optuna 回调（如 SSE 实时进度推送），逐个 Trial 触发
+
         Returns:
             Tuple: (study, best_model)
         """
         import optuna
-        
+
         # 设置 Trial 次数
         if n_trials is None:
             n_trials = self.config.get("n_trials", 30)
         
         # 确定优化方向
-        direction = "maximize" if self.metric in ["roc_auc", "accuracy", "f1", 
-                                                   "precision", "recall", "r2"] else "minimize"
+        # sklearn 的误差 scorer 也返回负值，因此这里统一“越大越好”。
+        direction = "maximize"
         
         # 创建 Study
         self.best_study = optuna.create_study(
@@ -357,30 +368,39 @@ class AutoMLOptimizer:
             callback = TQDMProgressCallback(n_trials)
         else:
             callback = None
-        
+
+        # 合并进度条回调与调用方回调（如 SSE 实时推送）
+        optuna_callbacks = ([callback] if callback else []) + list(callbacks or [])
+
         # 启动寻优
         logger.info(f"开始贝叶斯优化，{n_trials} 次 Trial...")
-        
-        try:
-            self.best_study.optimize(
-                self.objective,
-                n_trials=n_trials,
-                timeout=timeout,
-                callbacks=[callback] if callback else [],
-                show_progress_bar=show_progress
-            )
-        except Exception as e:
-            logger.error(f"优化过程中断：{e}")
+
+        self.best_study.optimize(
+            self.objective,
+            n_trials=n_trials,
+            timeout=timeout,
+            callbacks=optuna_callbacks,
+            show_progress_bar=False
+        )
+
+        successful_trials = [
+            trial for trial in self.best_study.trials
+            if trial.value is not None and not trial.user_attrs.get("failure")
+        ]
+        if not successful_trials:
+            failures = [trial.user_attrs.get("failure") for trial in self.best_study.trials if trial.user_attrs.get("failure")]
+            detail = failures[0] if failures else "没有完成的 Trial"
+            raise RuntimeError(f"所有 AutoML Trial 均失败：{detail}")
         
         # 输出最佳结果
         logger.info(f"最佳 Trial 分数：{self.best_study.best_value:.4f}")
         logger.info(f"最佳模型与参数：{self.best_study.best_params}")
         
         # 保存最佳参数
-        self.best_params = self.best_study.best_params
+        self.best_params = dict(self.best_study.best_params)
 
         # 用全量训练集重新训练最佳模型
-        best_model_name = self.best_params.pop("model_type", None)
+        best_model_name = self.best_params.get("model_type")
 
         # 如果没有 model_type，尝试从候选模型中获取
         if best_model_name is None:
@@ -404,12 +424,8 @@ class AutoMLOptimizer:
                 logger.info(f"模型训练完成，最佳得分：{self.best_score:.4f}")
             except Exception as e:
                 logger.error(f"模型训练失败：{e}")
-                # 尝试使用默认参数创建模型
-                try:
-                    self.best_model = self._build_model(self.best_study.best_trial, best_model_name)
-                    # 不使用 fit，直接返回
-                except:
-                    self.best_model = None
+                self.best_model = None
+                raise RuntimeError(f"最佳模型全量训练失败：{e}") from e
         else:
             logger.warning("无法确定最佳模型类型")
 

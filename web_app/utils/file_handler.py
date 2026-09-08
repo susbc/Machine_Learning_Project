@@ -550,6 +550,12 @@ def infer_field_type(series: pd.Series) -> str:
     Returns:
         推断的类型 ('num', 'str', 'key', 'label')
     """
+    # 字段名和唯一率优先识别 ID；纯数字 ID 不能先被误判成普通数值特征。
+    name = str(series.name or '').strip().lower()
+    unique_ratio = series.nunique(dropna=True) / max(int(series.notna().sum()), 1)
+    if unique_ratio > 0.9 and any(token in name for token in ('id', 'uuid', 'key', '编号', '序号')):
+        return "key"
+
     # 检查是否全为数值
     if pd.api.types.is_numeric_dtype(series):
         return "num"
@@ -563,7 +569,7 @@ def infer_field_type(series: pd.Series) -> str:
         pass
     
     # 检查是否为 ID 类（唯一值比例高）
-    if series.nunique() / len(series) > 0.9:
+    if unique_ratio > 0.9:
         return "key"
     
     # 默认为字符串

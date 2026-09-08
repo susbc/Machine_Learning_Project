@@ -1,0 +1,17 @@
+{
+  "providers": {
+    "example": {
+      "id": "example",
+      "name": "OpenAI compatible provider",
+      "type": "openai",
+      "config": {
+        "api_key": "",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini"
+      },
+      "description": "Copy this file to llm_providers.json and configure it locally.",
+      "enabled": false
+    }
+  },
+  "active_provider": null
+}

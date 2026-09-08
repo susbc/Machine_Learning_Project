@@ -159,7 +159,12 @@ with tab1:
             
             # 获取行数
             try:
-                count_df = db.query(f"SELECT COUNT(*) as count FROM {selected_table}")
+                from model_code.database.query_builder import QueryBuilder
+
+                count_sql, count_params = (
+                    QueryBuilder(selected_table).select("COUNT(*) AS count").build()
+                )
+                count_df = db.query(count_sql, count_params)
                 row_count = count_df['count'].iloc[0] if len(count_df) > 0 else 0
                 with cols[2]:
                     st.metric("行数", f"{row_count:,}")
@@ -210,7 +215,8 @@ with tab2:
     st.header("🔍 SQL 查询编辑器")
     
     # 查询编辑器
-    default_query = f"SELECT * FROM {tables[0] if tables else 'table_name'} LIMIT 100"
+    # 表名来自数据库元数据，仅用于预填充可编辑查询框。
+    default_query = f"SELECT * FROM {tables[0] if tables else 'table_name'} LIMIT 100"  # nosec B608
     
     sql_query = st.text_area(
         "SQL 查询",

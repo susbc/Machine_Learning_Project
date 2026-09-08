@@ -19,6 +19,7 @@ from sklearn.metrics import (
     classification_report, confusion_matrix
 )
 import lightgbm as lgb
+from sklearn.base import clone
 
 
 def lgbm_train_with_random_search(
@@ -60,6 +61,14 @@ def lgbm_train_with_random_search(
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 60)
+
+    if X.select_dtypes(exclude=[np.number, "bool"]).shape[1]:
+        bad_columns = X.select_dtypes(exclude=[np.number, "bool"]).columns.tolist()
+        raise ValueError(f"训练特征必须完成数值编码，非数值列：{', '.join(map(str, bad_columns))}")
+    X = X.replace([np.inf, -np.inf], np.nan)
+    class_counts = pd.Series(y).value_counts()
+    if len(class_counts) != 2 or int(class_counts.min()) < 2:
+        raise ValueError("二分类训练要求两个类别，且每个类别至少 2 条记录")
     print("LightGBM 随机网格搜索训练")
     print("=" * 60)
     
@@ -67,6 +76,9 @@ def lgbm_train_with_random_search(
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
+    safe_cv = min(cv, int(pd.Series(y_train).value_counts().min()))
+    if safe_cv < 2:
+        raise ValueError("训练集中的每个类别至少需要 2 条记录才能执行交叉验证")
     
     print(f"\n数据集划分:")
     print(f"  训练集：{X_train.shape[0]:,} 行，{X_train.shape[1]} 特征")
@@ -79,7 +91,7 @@ def lgbm_train_with_random_search(
         metric='auc',
         verbose=-1,
         random_state=random_state,
-        n_jobs=-1
+        n_jobs=1
     )
     
     param_grid = {
@@ -99,7 +111,7 @@ def lgbm_train_with_random_search(
         estimator=lgb_clf,
         param_distributions=param_grid,
         n_iter=n_iter,
-        cv=cv,
+        cv=safe_cv,
         scoring='roc_auc',
         n_jobs=-1,
         verbose=1,
@@ -145,13 +157,28 @@ def lgbm_train_with_random_search(
     print(f"  TN={cm[0,0]:,}  FP={cm[0,1]:,}")
     print(f"  FN={cm[1,0]:,}  TP={cm[1,1]:,}")
     
-    # 6. 计算不同阈值的指标 - 优化：使用向量化 precision_recall_curve
+    # 6. 在训练集内部留出的校准集选择阈值，测试集只做最终评估。
     print("\n" + "=" * 60)
     print("计算阈值 - 查准率/查全率曲线")
     print("=" * 60)
     
-    # 向量化计算 (替代 for 循环，速度快 100x)
-    precisions, recalls, thresholds = precision_recall_curve(y_test, y_test_proba)
+    if int(pd.Series(y_train).value_counts().min()) >= 3:
+        calibration_size = max(2, int(np.ceil(len(X_train) * 0.2)))
+        X_fit, X_cal, y_fit, y_cal = train_test_split(
+            X_train,
+            y_train,
+            test_size=calibration_size,
+            random_state=random_state,
+            stratify=y_train,
+        )
+        calibration_model = clone(best_model).fit(X_fit, y_fit)
+        calibration_proba = calibration_model.predict_proba(X_cal)[:, 1]
+        calibration_source = 'training_calibration_split'
+    else:
+        X_cal, y_cal = X_train, y_train
+        calibration_proba = best_model.predict_proba(X_cal)[:, 1]
+        calibration_source = 'training_fit_fallback'
+    precisions, recalls, thresholds = precision_recall_curve(y_cal, calibration_proba)
     
     # 构建结果 DataFrame
     metric_df = pd.DataFrame({
@@ -194,6 +221,7 @@ def lgbm_train_with_random_search(
     # 7. 保存训练摘要
     train_summary = {
         'model': best_model,
+        'algorithm': 'lightgbm',
         'test_auc': test_auc,
         'test_ap': test_ap,
         'best_threshold': best_threshold,
@@ -204,7 +232,11 @@ def lgbm_train_with_random_search(
         'metric_df': metric_df,
         'train_size': len(X_train),
         'test_size': len(X_test),
-        'feature_names': X.columns.tolist()
+        'feature_names': X.columns.tolist(),
+        'threshold_calibration': {
+            'source': calibration_source,
+            'calibration_size': int(len(y_cal)),
+        }
     }
     
     summary_path = model_dir / "train_summary.joblib"

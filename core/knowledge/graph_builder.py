@@ -19,12 +19,27 @@
 from typing import Dict, List, Optional, Any
 from abc import ABC, abstractmethod
 import logging
+import re
 
 from .neo4j_client import Neo4jClient
 from .schema_embedder import SchemaEmbedder
 from .faiss_client import FAISSClient
 
 logger = logging.getLogger(__name__)
+
+_IDENTIFIER_PATH = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+
+
+def _require_identifier_path(value: str) -> str:
+    """Validate identifiers used by dialects that cannot bind object names."""
+    if not _IDENTIFIER_PATH.fullmatch(str(value)):
+        raise ValueError(f"非法数据库标识符：{value!r}")
+    return str(value)
+
+
+def _quote_mysql_identifier(value: str) -> str:
+    """Quote a MySQL identifier returned by trusted metadata queries."""
+    return f"`{str(value).replace('`', '``')}`"
 
 
 # ==================== 基础接口定义 ====================
@@ -183,10 +198,10 @@ class MySQLMetadataExtractor(BaseMetadataExtractor):
             self.connection.close()
             logger.info("MySQL 连接已关闭")
     
-    def _query(self, sql: str) -> List[Dict]:
+    def _query(self, sql: str, params: Optional[tuple] = None) -> List[Dict]:
         """执行 SQL 查询"""
         with self.connection.cursor() as cursor:
-            cursor.execute(sql)
+            cursor.execute(sql, params)
             return cursor.fetchall()
     
     def extract_tables(self) -> List[Dict]:
@@ -198,10 +213,8 @@ class MySQLMetadataExtractor(BaseMetadataExtractor):
             ENGINE as engine
         FROM information_schema.TABLES
         WHERE TABLE_SCHEMA = %s
-        """ % self.db_name
-        
-        # 注意：实际使用时应该用参数化查询，这里简化演示
-        tables = self._query(sql)
+        """
+        tables = self._query(sql, (self.db_name,))
         
         return [
             {
@@ -214,9 +227,7 @@ class MySQLMetadataExtractor(BaseMetadataExtractor):
         ]
     
     def extract_columns(self, table_name: Optional[str] = None) -> List[Dict]:
-        table_filter = f"AND TABLE_NAME = '{table_name}'" if table_name else ""
-        
-        sql = f"""
+        sql = """
         SELECT 
             TABLE_NAME as table_name,
             COLUMN_NAME as column_name,
@@ -227,12 +238,27 @@ class MySQLMetadataExtractor(BaseMetadataExtractor):
             COLUMN_KEY as column_key,
             COLUMN_DEFAULT as default_value
         FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = '{self.db_name}'
-        {table_filter}
+        WHERE TABLE_SCHEMA = %s
         ORDER BY TABLE_NAME, ORDINAL_POSITION
         """
-        
-        columns = self._query(sql)
+        params = (self.db_name,)
+        if table_name:
+            sql = """
+            SELECT
+                TABLE_NAME as table_name,
+                COLUMN_NAME as column_name,
+                DATA_TYPE as data_type,
+                COLUMN_TYPE as column_type,
+                COLUMN_COMMENT as comment,
+                IS_NULLABLE as is_nullable,
+                COLUMN_KEY as column_key,
+                COLUMN_DEFAULT as default_value
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+            ORDER BY TABLE_NAME, ORDINAL_POSITION
+            """
+            params = (self.db_name, table_name)
+        columns = self._query(sql, params)
         
         result = []
         for col in columns:
@@ -252,16 +278,18 @@ class MySQLMetadataExtractor(BaseMetadataExtractor):
     def _get_sample_value(self, table_name: str, column_name: str) -> Optional[str]:
         """获取字段样例值 (可选，抽样 3 条取第一条)"""
         try:
-            sql = f"SELECT `{column_name}` FROM `{table_name}` LIMIT 3"
+            quoted_column = _quote_mysql_identifier(column_name)
+            quoted_table = _quote_mysql_identifier(table_name)
+            sql = f"SELECT {quoted_column} FROM {quoted_table} LIMIT 3"  # nosec B608
             result = self._query(sql)
             if result:
                 return str(result[0][column_name])
-        except:
-            pass
+        except Exception as exc:
+            logger.debug("获取字段样例失败：%s.%s: %s", table_name, column_name, exc)
         return None
     
     def extract_foreign_keys(self) -> List[Dict]:
-        sql = f"""
+        sql = """
         SELECT 
             TABLE_NAME as table,
             COLUMN_NAME as column,
@@ -269,11 +297,10 @@ class MySQLMetadataExtractor(BaseMetadataExtractor):
             REFERENCED_COLUMN_NAME as ref_column,
             CONSTRAINT_NAME as constraint_name
         FROM information_schema.KEY_COLUMN_USAGE
-        WHERE TABLE_SCHEMA = '{self.db_name}'
+        WHERE TABLE_SCHEMA = %s
         AND REFERENCED_TABLE_NAME IS NOT NULL
         """
-        
-        fks = self._query(sql)
+        fks = self._query(sql, (self.db_name,))
         
         return [
             {
@@ -319,10 +346,10 @@ class OracleMetadataExtractor(BaseMetadataExtractor):
             self.connection.close()
             logger.info("Oracle 连接已关闭")
     
-    def _query(self, sql: str) -> List[Dict]:
+    def _query(self, sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict]:
         """执行 SQL 查询"""
         cursor = self.connection.cursor()
-        cursor.execute(sql)
+        cursor.execute(sql, params or {})
         columns = [col[0] for col in cursor.description]
         results = []
         for row in cursor:
@@ -350,9 +377,7 @@ class OracleMetadataExtractor(BaseMetadataExtractor):
         ]
     
     def extract_columns(self, table_name: Optional[str] = None) -> List[Dict]:
-        table_filter = f"WHERE t.TABLE_NAME = '{table_name}'" if table_name else ""
-        
-        sql = f"""
+        sql = """
         SELECT 
             t.TABLE_NAME as table_name,
             t.COLUMN_NAME as column_name,
@@ -363,11 +388,26 @@ class OracleMetadataExtractor(BaseMetadataExtractor):
         FROM USER_TAB_COLUMNS t
         LEFT JOIN USER_COL_COMMENTS c 
             ON t.TABLE_NAME = c.TABLE_NAME AND t.COLUMN_NAME = c.COLUMN_NAME
-        {table_filter}
         ORDER BY t.TABLE_NAME, t.COLUMN_ID
         """
-        
-        columns = self._query(sql)
+        params = None
+        if table_name:
+            sql = """
+            SELECT
+                t.TABLE_NAME as table_name,
+                t.COLUMN_NAME as column_name,
+                t.DATA_TYPE as data_type,
+                c.COMMENTS as comment,
+                t.NULLABLE as is_nullable,
+                t.DATA_DEFAULT as default_value
+            FROM USER_TAB_COLUMNS t
+            LEFT JOIN USER_COL_COMMENTS c
+                ON t.TABLE_NAME = c.TABLE_NAME AND t.COLUMN_NAME = c.COLUMN_NAME
+            WHERE t.TABLE_NAME = :table_name
+            ORDER BY t.TABLE_NAME, t.COLUMN_ID
+            """
+            params = {"table_name": table_name}
+        columns = self._query(sql, params)
         
         # 查询主键信息
         pk_sql = """
@@ -469,10 +509,10 @@ class HiveMetadataExtractor(BaseMetadataExtractor):
         
         result = []
         for row in tables_result:
-            table_name = list(row.values())[0]
+            table_name = _require_identifier_path(str(list(row.values())[0]))
             
             # 获取表信息
-            desc = self._query(f"DESCRIBE FORMATTED {table_name}")
+            desc = self._query(f"DESCRIBE FORMATTED {table_name}")  # nosec B608
             
             # 解析描述获取注释
             comment = ""
@@ -485,8 +525,8 @@ class HiveMetadataExtractor(BaseMetadataExtractor):
                 elif "numRows:" in key:
                     try:
                         row_count = int(value)
-                    except:
-                        pass
+                    except (TypeError, ValueError):
+                        logger.debug("Hive 表 %s 的 numRows 无法解析：%r", table_name, value)
             
             result.append({
                 "table_name": table_name,
@@ -511,7 +551,8 @@ class HiveMetadataExtractor(BaseMetadataExtractor):
     
     def _extract_columns_for_table(self, table_name: str) -> List[Dict]:
         """提取单个表的字段"""
-        desc = self._query(f"DESCRIBE {table_name}")
+        table_name = _require_identifier_path(table_name)
+        desc = self._query(f"DESCRIBE {table_name}")  # nosec B608
         
         result = []
         for row in desc:

@@ -150,7 +150,7 @@ def render_provider_form(manager: LLMManager, edit_id: Optional[str] = None):
             with col1:
                 config_fields['api_key'] = st.text_input("API Key", type="password",
                     value=edit_data['config'].get('api_key', '') if edit_data else "",
-                    help="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+                    help="密钥仅保存在本地配置中，请勿提交到版本控制")
             with col2:
                 config_fields['base_url'] = st.text_input("Base URL",
                     value=edit_data['config'].get('base_url', 'https://api.openai.com/v1') if edit_data else "https://api.openai.com/v1")
@@ -171,7 +171,7 @@ def render_provider_form(manager: LLMManager, edit_id: Optional[str] = None):
         elif provider_type == 'anthropic':
             config_fields['api_key'] = st.text_input("API Key", type="password",
                 value=edit_data['config'].get('api_key', '') if edit_data else "",
-                help="sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+                help="密钥仅保存在本地配置中，请勿提交到版本控制")
 
             saved_model = edit_data['config'].get('model', 'claude-3-sonnet-20240229') if edit_data else 'claude-3-sonnet-20240229'
             preset_index = template['models'].index(saved_model) if saved_model in template['models'] else 0

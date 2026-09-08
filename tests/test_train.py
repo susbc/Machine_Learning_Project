@@ -55,7 +55,8 @@ class TestLGBMTrainWithRandomSearch:
         assert 'best_params' in result
         
         # 验证 AUC 在合理范围内
-        assert 0.5 <= result['test_auc'] <= 1.0
+        # fixture 标签与特征独立，AUC 应只校验合法范围，不能强行要求随机结果 >= 0.5
+        assert 0.0 <= result['test_auc'] <= 1.0
         assert 0.0 <= result['test_ap'] <= 1.0
         
         # 验证文件保存
@@ -122,7 +123,7 @@ class TestLGBMTrainWithRandomSearch:
         
         assert len(predictions) == 10
         assert predictions_proba.shape == (10, 2)
-        assert np.all(predictions.isin([0, 1]))
+        assert np.all(np.isin(predictions, [0, 1]))
         assert np.all((predictions_proba >= 0).all(axis=1))
         assert np.all((predictions_proba <= 1).all(axis=1))
     
