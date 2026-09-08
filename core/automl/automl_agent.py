@@ -13,6 +13,8 @@ from typing import Dict, Any, List, Optional
 import logging
 import json
 
+from core.automl.problem_spec import resolve_problem_spec
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,6 +55,11 @@ class AutoMLAgent:
             "description": "Logistic Regression - 逻辑回归，可解释性强",
             "best_for": ["线性可分", "需要可解释性", "基线对比"],
             "weakness": ["非线性关系", "特征工程要求高"]
+        },
+        "linear_regression": {
+            "description": "Linear Regression - 线性回归，确定性回归基线",
+            "best_for": ["连续目标", "线性关系", "可解释基线"],
+            "weakness": ["非线性关系", "异常值敏感"]
         }
     }
     
@@ -194,7 +201,7 @@ class AutoMLAgent:
         )
         
         # 2. 调用 LLM
-        llm_response = self._call_llm(prompt)
+        llm_response = self._call_llm(prompt, data_features)
         
         # 3. 解析 JSON 响应
         config = self._parse_config(llm_response, data_features)
@@ -220,40 +227,38 @@ class AutoMLAgent:
         
         return "\n".join(lines)
     
-    def _call_llm(self, prompt: str) -> str:
+    def _call_llm(self, prompt: str, data_features: Dict[str, Any]) -> str:
         """调用 LLM 生成配置"""
         if not self.llm_provider:
             logger.warning("未配置 LLM，使用规则引擎生成 AutoML 配置")
-            return self._rule_based_config()
+            return self._rule_based_config(data_features)
         
         try:
             response = self.llm_provider.generate(prompt)
             return response
         except Exception as e:
             logger.error(f"LLM 调用失败：{e}")
-            return self._rule_based_config()
+            return self._rule_based_config(data_features)
     
-    def _rule_based_config(self) -> str:
+    def _rule_based_config(self, data_features: Dict[str, Any]) -> str:
         """基于规则的 AutoML 配置 (LLM 不可用时的降级方案)"""
-        # 返回默认配置
+        task_type = data_features["task_type"]
+        if task_type == "regression":
+            metric = "rmse"
+            candidates = ["random_forest", "linear_regression"]
+        else:
+            metric = "roc_auc" if task_type == "binary_classification" else "accuracy"
+            candidates = ["lightgbm", "catboost", "random_forest"]
+
         default_config = {
-            "task_type": "binary_classification",
-            "optimization_metric": "roc_auc",
-            "candidate_models": ["lightgbm", "catboost"],
+            "task_type": task_type,
+            "optimization_metric": metric,
+            "candidate_models": candidates,
             "n_trials": 30,
-            "rationale": "默认配置：LightGBM 训练速度快，CatBoost 处理类别特征效果好",
+            "rationale": "LLM 不可用或配置无效，使用与已解析任务类型兼容的确定性默认配置",
             "search_spaces": {
-                "lightgbm": {
-                    "learning_rate": {"type": "loguniform", "low": 0.01, "high": 0.2},
-                    "num_leaves": {"type": "int", "low": 15, "high": 127},
-                    "n_estimators": {"type": "int", "low": 100, "high": 500}
-                },
-                "catboost": {
-                    "depth": {"type": "int", "low": 4, "high": 10},
-                    "l2_leaf_reg": {"type": "int", "low": 1, "high": 10},
-                    "n_estimators": {"type": "int", "low": 100, "high": 500}
-                }
-            }
+                model: self._get_default_search_space(model) for model in candidates
+            },
         }
         return json.dumps(default_config)
     
@@ -289,11 +294,11 @@ class AutoMLAgent:
                 return validated_config
             else:
                 logger.error(f"无法从响应中提取 JSON: {llm_response[:200]}")
-                return json.loads(self._rule_based_config())
+                return json.loads(self._rule_based_config(data_features))
                 
         except Exception as e:
             logger.error(f"JSON 解析失败：{e}")
-            return json.loads(self._rule_based_config())
+            return json.loads(self._rule_based_config(data_features))
     
     def _validate_config(self, config: Dict,
                          data_features: Dict) -> Dict:
@@ -311,32 +316,23 @@ class AutoMLAgent:
         required_fields = ["task_type", "optimization_metric", "candidate_models", 
                           "n_trials", "rationale", "search_spaces"]
         
-        for field in required_fields:
-            if field not in config:
-                logger.warning(f"配置缺少必填字段：{field}，使用默认值")
-                if field == "task_type":
-                    config[field] = "binary_classification"
-                elif field == "optimization_metric":
-                    config[field] = "roc_auc"
-                elif field == "candidate_models":
-                    config[field] = ["lightgbm", "catboost"]
-                elif field == "n_trials":
-                    config[field] = 30
-                elif field == "rationale":
-                    config[field] = "默认配置"
-                elif field == "search_spaces":
-                    config[field] = {}
+        missing_fields = [field for field in required_fields if field not in config]
+        if missing_fields:
+            logger.warning("配置缺少必填字段：%s，使用任务感知默认配置", ", ".join(missing_fields))
+            return json.loads(self._rule_based_config(data_features))
         
         # 验证模型是否在支持列表中
         valid_models = set(self.SUPPORTED_MODELS.keys())
-        for model in config["candidate_models"]:
-            if model not in valid_models:
-                logger.warning(f"不支持的模型：{model}，已移除")
-                config["candidate_models"].remove(model)
+        invalid_models = [model for model in config["candidate_models"] if model not in valid_models]
+        for model in invalid_models:
+            logger.warning(f"不支持的模型：{model}，已移除")
+        config["candidate_models"] = [
+            model for model in config["candidate_models"] if model in valid_models
+        ]
         
         # 确保至少有 1 个候选模型
         if not config["candidate_models"]:
-            config["candidate_models"] = ["lightgbm"]
+            return json.loads(self._rule_based_config(data_features))
         
         # 验证搜索空间
         for model in config["candidate_models"]:
@@ -368,7 +364,9 @@ class AutoMLAgent:
                 "n_estimators": {"type": "int", "low": 100, "high": 500},
                 "max_depth": {"type": "int", "low": 3, "high": 15},
                 "min_samples_split": {"type": "int", "low": 2, "high": 20}
-            }
+            },
+            "logistic_regression": {},
+            "linear_regression": {},
         }
         return defaults.get(model, defaults["lightgbm"])
     
@@ -416,22 +414,6 @@ def extract_data_features(df, target_col: str) -> Dict[str, Any]:
         "n_categorical": n_categorical,
         "categorical_ratio": n_categorical / n_features if n_features > 0 else 0,
         "class_imbalance_ratio": class_imbalance_ratio,
-        "task_type": _infer_task_type(df, target_col),
+        "task_type": resolve_problem_spec(df[target_col], target_col, "auto").resolved_type.value,
         "target_col": target_col
     }
-
-
-def _infer_task_type(df, target_col: str) -> str:
-    """推断任务类型"""
-    if target_col not in df.columns:
-        return "unknown"
-    
-    target_data = df[target_col]
-    n_unique = target_data.nunique()
-    
-    if n_unique == 2:
-        return "binary_classification"
-    elif n_unique < 20:
-        return "multiclass_classification"
-    else:
-        return "regression"
