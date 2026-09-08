@@ -85,6 +85,45 @@ def get_task_dir(task_id: str) -> Path:
 def get_saved_path(filename: str) -> Path:
     return _safe_child_path(SAVED_DIR, filename)
 
+
+WORKFLOW_STATE_FILENAME = "workflow_state.json"
+
+
+def _write_workflow_state(task_id: str, payload: Dict[str, Any]) -> None:
+    """Atomically persist one task's restart-safe workflow status."""
+    task_dir = get_task_dir(task_id)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    state_path = _safe_child_path(task_dir, WORKFLOW_STATE_FILENAME)
+    temporary = _safe_child_path(
+        task_dir, f".workflow_state.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    state = {"task_id": validate_task_id(task_id), **payload}
+    serialized = json.dumps(
+        state, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    )
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, state_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_workflow_state(task_id: str) -> Optional[Dict[str, Any]]:
+    """Load persisted task state without relying on process-local runtime data."""
+    state_path = _safe_child_path(get_task_dir(task_id), WORKFLOW_STATE_FILENAME)
+    if not state_path.is_file():
+        return None
+    try:
+        with open(state_path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError) as exc:
+        logger.warning("读取工作流状态失败 task_id=%s error=%s", task_id, exc)
+        return None
+    return state if isinstance(state, dict) else None
+
 # 初始化 LLM 编排器 (从环境变量读取 API Key)
 orchestrator = create_orchestrator(
     model_name="qwen-plus",
@@ -180,9 +219,15 @@ def _coordinate_automl_config(
                 }
             )
     else:
-        search_spaces = {
-            model_name: suggested_spaces.get(model_name, {}) for model_name in candidates
-        }
+        search_spaces = {}
+        for model_name in candidates:
+            safe_space, space_corrections = _validate_search_space(
+                model_name,
+                resolved_type,
+                suggested_spaces.get(model_name, {}),
+            )
+            search_spaces[model_name] = safe_space
+            corrections.extend(space_corrections)
     return (
         {
             "task_type": resolved_type,
@@ -195,6 +240,93 @@ def _coordinate_automl_config(
         suggested_type,
         corrections,
     )
+
+
+def _validate_search_space(
+    model_name: str, resolved_type: str, search_space: Any
+) -> tuple[Dict[str, Any], list[Dict[str, Any]]]:
+    """Drop estimator-unknown or malformed Optuna rules before optimization."""
+    from model_code.model_factory import ModelFactory
+
+    corrections: list[Dict[str, Any]] = []
+    if not isinstance(search_space, dict):
+        return {}, [
+            {
+                "field": f"search_spaces.{model_name}",
+                "suggested": search_space,
+                "resolved": {},
+                "reason": "搜索空间必须是参数到规则的对象",
+            }
+        ]
+
+    allowed_params = set(ModelFactory.get_param_grid(model_name))
+    if model_name == "catboost":
+        allowed_params.add("n_estimators")
+        if resolved_type != ProblemType.REGRESSION.value:
+            allowed_params.add("auto_class_weights")
+    if (
+        model_name in {"lightgbm", "xgboost"}
+        and resolved_type != ProblemType.REGRESSION.value
+    ):
+        allowed_params.add("scale_pos_weight")
+
+    safe_space: Dict[str, Any] = {}
+    for param_name, rule in search_space.items():
+        field = f"search_spaces.{model_name}.{param_name}"
+        reason = _search_rule_error(param_name, rule, allowed_params)
+        if reason is None:
+            safe_space[param_name] = rule
+        else:
+            corrections.append(
+                {
+                    "field": field,
+                    "suggested": rule,
+                    "resolved": None,
+                    "reason": reason,
+                }
+            )
+    return safe_space, corrections
+
+
+def _search_rule_error(
+    param_name: str, rule: Any, allowed_params: set[str]
+) -> Optional[str]:
+    if param_name not in allowed_params:
+        return "参数不受该任务对应的 estimator 支持，已移除"
+    if not isinstance(rule, dict):
+        return "搜索规则必须是对象，已移除"
+    rule_type = rule.get("type")
+    if rule_type not in {"int", "float", "loguniform", "categorical"}:
+        return "搜索规则类型无效，已移除"
+    if rule_type == "categorical":
+        choices = rule.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return "categorical 规则必须提供非空 choices，已移除"
+        return None
+
+    low = rule.get("low")
+    high = rule.get("high")
+    if rule_type == "int":
+        valid_bounds = (
+            isinstance(low, int)
+            and not isinstance(low, bool)
+            and isinstance(high, int)
+            and not isinstance(high, bool)
+        )
+    else:
+        valid_bounds = (
+            isinstance(low, (int, float))
+            and not isinstance(low, bool)
+            and isinstance(high, (int, float))
+            and not isinstance(high, bool)
+            and np.isfinite(low)
+            and np.isfinite(high)
+        )
+    if not valid_bounds or low > high:
+        return "数值搜索规则必须提供有效且有序的 low/high，已移除"
+    if rule_type == "loguniform" and low <= 0:
+        return "loguniform 的 low 必须大于 0，已移除"
+    return None
 
 
 def _with_residual_categorical_encoding(
@@ -444,6 +576,7 @@ async def train_stream(
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
     completion_payload: Dict[str, Any] = {}
+    state_metadata: Dict[str, Any] = {"requested_type": problem_type}
     
     def background_training_task():
         """后台训练任务 (在线程池中运行)"""
@@ -452,6 +585,7 @@ async def train_stream(
 
             # 1. 加载前置数据
             task_dir = get_task_dir(task_id)
+            _write_workflow_state(task_id, {"status": "running", **state_metadata})
             data_path = task_dir / "raw_data.parquet"
             if not os.path.exists(data_path):
                 raise FileNotFoundError(f"未找到数据文件：{data_path}")
@@ -503,6 +637,15 @@ async def train_stream(
             optuna_config, suggested_type, agent_corrections = _coordinate_automl_config(
                 suggested_config, spec, n_trials
             )
+            state_metadata.update(
+                {
+                    "problem_spec": problem_spec,
+                    "suggested_type": suggested_type,
+                    "agent_corrections": agent_corrections,
+                    "best_metric": optuna_config["optimization_metric"],
+                }
+            )
+            _write_workflow_state(task_id, {"status": "running", **state_metadata})
             logger.info(
                 "任务 %s: resolved_type=%s suggested_type=%s metric=%s candidates=%s corrections=%s",
                 task_id,
@@ -540,6 +683,7 @@ async def train_stream(
                     payload = {
                         "status": "RUNNING",
                         "trial": trial.number,
+                        "metric": optuna_config["optimization_metric"],
                         "value": float(trial.value) if trial.value is not None else None,
                         "best_value": current_best,
                         "best_metric": optuna_config["optimization_metric"],
@@ -564,6 +708,9 @@ async def train_stream(
                     n_trials=n_trials, show_progress=False, callbacks=[sse_callback]
                 )
                 best_value = float(study.best_value)
+                selected_algorithm = study.best_params.get("model_type") or optuna_config[
+                    "candidate_models"
+                ][0]
             except Exception as e:
                 logger.error(f"Optuna 优化失败：{e}")
                 raise
@@ -585,6 +732,7 @@ async def train_stream(
                 "best_metric": best_metric,
                 "best_value": best_value,
                 "metrics": {best_metric: best_value},
+                "selected_algorithm": selected_algorithm,
                 "suggested_type": suggested_type,
                 "agent_corrections": agent_corrections,
                 "feature_columns": list(X.columns),
@@ -592,14 +740,33 @@ async def train_stream(
             joblib.dump(artifact, artifact_path)
 
             logger.info(f"模型已保存：{artifact_path}")
+            completed_state = {
+                "status": "completed",
+                **state_metadata,
+                "best_metric": best_metric,
+                "best_value": best_value,
+                "selected_algorithm": selected_algorithm,
+            }
+            _write_workflow_state(task_id, completed_state)
+            logger.info(
+                "workflow_training_completed task_id=%s resolved_type=%s "
+                "selected_algorithm=%s metric=%s",
+                task_id,
+                spec.resolved_type.value,
+                selected_algorithm,
+                best_metric,
+            )
             completion_payload.update(
                 {
                     "status": "DONE",
+                    "metric": best_metric,
+                    "value": best_value,
                     "problem_spec": problem_spec,
                     "suggested_type": suggested_type,
                     "agent_corrections": agent_corrections,
                     "best_metric": best_metric,
                     "best_value": best_value,
+                    "selected_algorithm": selected_algorithm,
                 }
             )
 
@@ -617,9 +784,17 @@ async def train_stream(
                 logger.warning(f"保存基线数据失败：{e}，MLOps 监控将无法工作")
 
         except Exception as e:
-            logger.error(f"训练失败：{e}")
+            canonical_error = str(e)
+            try:
+                _write_workflow_state(
+                    task_id,
+                    {"status": "failed", **state_metadata, "error": canonical_error},
+                )
+            except Exception as state_error:
+                logger.error("工作流失败状态持久化失败 task_id=%s error=%s", task_id, state_error)
+            logger.error("训练失败：%s", canonical_error)
             asyncio.run_coroutine_threadsafe(
-                queue.put({"status": "ERROR", "msg": str(e)}),
+                queue.put({"status": "ERROR", "error": canonical_error}),
                 loop
             )
         finally:
@@ -745,14 +920,26 @@ async def get_task_status(task_id: str):
         "status": "in_progress",
         "files": files
     }
+    persisted_state = _read_workflow_state(task_id)
+    if persisted_state:
+        status.update(
+            {
+                key: value
+                for key, value in persisted_state.items()
+                if key not in {"task_id", "files"}
+            }
+        )
 
     if "raw_data.parquet" in files:
         status["step1"] = "done"
     if "feature_strategy.json" in files:
         status["step2"] = "done"
+    if status["status"] == "completed":
+        status["step3"] = "done"
 
     model_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
-    if model_path.exists():
+    can_restore_from_artifact = persisted_state is None or status["status"] == "completed"
+    if model_path.exists() and can_restore_from_artifact:
         status["step3"] = "done"
         status["status"] = "completed"
 
