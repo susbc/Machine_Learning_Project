@@ -13,7 +13,7 @@
       <section class="setup-panel">
         <div class="panel-title">
           <h3>训练输入</h3>
-          <span>{{ selectedFile?.name ?? '未选择数据' }}</span>
+          <span>{{ datasetFile?.name ?? '未选择数据' }}</span>
         </div>
 
         <el-upload
@@ -38,7 +38,22 @@
           @change="handleNativeFileChange"
         />
 
+        <div v-if="capabilityStatusMessage" class="capability-alert" role="alert">
+          <span>{{ capabilityStatusMessage }}</span>
+          <el-button text type="primary" :loading="capabilitiesLoading" @click="loadCapabilities">重试加载能力</el-button>
+        </div>
+
         <div class="form-grid">
+          <label>
+            <span>问题类型</span>
+            <el-select v-model="problemType" aria-label="问题类型" :loading="capabilitiesLoading" @change="applyProblemType">
+              <el-option label="自动推断" value="auto" />
+              <el-option label="二分类" value="binary_classification" />
+              <el-option label="多分类" value="multiclass_classification" />
+              <el-option label="回归" value="regression" />
+            </el-select>
+          </label>
+
           <label>
             <span>目标列</span>
             <el-input v-model="targetCol" placeholder="留空则自动识别 label / target / 最后一列" clearable />
@@ -46,10 +61,14 @@
 
           <label>
             <span>优化指标</span>
-            <el-select v-model="optimizationMetric">
-              <el-option label="ROC-AUC" value="roc_auc" />
-              <el-option label="Accuracy" value="accuracy" />
-              <el-option label="F1" value="f1" />
+            <el-select v-model="optimizationMetric" aria-label="优化指标" :disabled="problemType === 'auto' || explicitActionsBlocked">
+              <el-option v-if="problemType === 'auto'" label="自动选择（后端）" value="auto" />
+              <el-option
+                v-for="metric in compatibleMetrics"
+                :key="metric"
+                :label="metricOptionLabel(metric)"
+                :value="metric"
+              />
             </el-select>
           </label>
 
@@ -66,14 +85,24 @@
 
         <label class="full-field">
           <span>候选模型</span>
-          <el-select v-model="candidateModels" multiple collapse-tags collapse-tags-tooltip placeholder="留空则后端自动推荐">
-            <el-option label="LightGBM" value="lightgbm" />
-            <el-option label="XGBoost" value="xgboost" />
-            <el-option label="CatBoost" value="catboost" />
-            <el-option label="随机森林" value="random_forest" />
-            <el-option label="逻辑回归" value="logistic_regression" />
+          <el-select
+            v-model="candidateModels"
+            aria-label="候选模型"
+            multiple
+            collapse-tags
+            collapse-tags-tooltip
+            :disabled="problemType === 'auto' || explicitActionsBlocked"
+            :placeholder="problemType === 'auto' ? '自动模式由后端推荐' : '选择兼容模型'"
+          >
+            <el-option
+              v-for="model in compatibleModels"
+              :key="model"
+              :label="modelLabel(model)"
+              :value="model"
+            />
           </el-select>
         </label>
+        <el-alert v-if="selectionResetMessage" type="warning" :title="selectionResetMessage" show-icon :closable="false" />
 
         <label class="full-field">
           <span>业务场景</span>
@@ -133,7 +162,18 @@
           striped-flow
         />
 
+        <p v-if="resolvedMetric !== 'auto'" class="metric-direction" aria-live="polite">
+          优化指标：{{ chartMetricLabel }}
+        </p>
         <div ref="chartRef" class="automl-chart"></div>
+
+        <div v-if="activeProblemSpec" class="problem-spec-card" aria-live="polite">
+          <strong>已解析任务：{{ problemTypeLabel(activeProblemSpec.resolved_type) }}</strong>
+          <span>来源：{{ problemSourceLabel(activeProblemSpec.source) }}</span>
+          <span>依据：{{ activeProblemSpec.reason }}</span>
+          <span>说明：{{ activeProblemSpec.explanation }}</span>
+          <span>目标列 {{ activeProblemSpec.target.column }}（{{ activeProblemSpec.target.dtype }}）</span>
+        </div>
 
         <el-alert
           v-if="errorMessage || job?.error"
@@ -150,9 +190,16 @@
             <el-button type="success" plain :loading="savingResult" @click="saveResult">保存模型</el-button>
           </div>
           <div class="result-grid">
-            <span>ROC-AUC：{{ metricLabel('roc_auc') }}</span>
-            <span>Accuracy：{{ metricLabel('accuracy') }}</span>
-            <span>F1：{{ metricLabel('f1') }}</span>
+            <template v-if="isRegressionResult">
+              <span>RMSE：{{ metricLabel('rmse') }}</span>
+              <span>MAE：{{ metricLabel('mae') }}</span>
+              <span>R²：{{ metricLabel('r2') }}</span>
+            </template>
+            <template v-else>
+              <span>ROC-AUC：{{ metricLabel('roc_auc') }}</span>
+              <span>Accuracy：{{ metricLabel('accuracy') }}</span>
+              <span>F1：{{ metricLabel('f1') }}</span>
+            </template>
           </div>
           <pre>{{ JSON.stringify(result.best_params, null, 2) }}</pre>
           <el-alert
@@ -223,12 +270,15 @@ import {
   type AutoMLStatus,
   type AutoMLTrialEvent,
 } from '@/api/automl'
+import { trainingApi } from '@/api/training'
+import type { MetricDirection, ProblemCapabilities, ProblemCapabilitiesResponse, ProblemSpec, ProblemType } from '@/api/problem'
 
 const STORAGE_KEY = 'agentic-automl.currentJobId'
 
-const selectedFile = ref<File | null>(null)
+const datasetFile = ref<File | null>(null)
 const targetCol = ref('')
-const optimizationMetric = ref<AutoMLMetric>('roc_auc')
+const problemType = ref<ProblemType>('auto')
+const optimizationMetric = ref<AutoMLMetric>('auto')
 const nTrials = ref(10)
 const cvFolds = ref(3)
 const candidateModels = ref<AutoMLModel[]>([])
@@ -242,12 +292,47 @@ const creatingJob = ref(false)
 const savingResult = ref(false)
 const errorMessage = ref('')
 const savedArtifactPath = ref('')
+const capabilities = ref<ProblemCapabilitiesResponse | null>(null)
+const capabilitiesLoading = ref(false)
+const capabilitiesUnavailable = ref(false)
+const capabilitiesError = ref('')
+const selectionResetMessage = ref('')
 const streamController = ref<AbortController | null>(null)
 const chartRef = ref<HTMLElement | null>(null)
 let chartInstance: ECharts | null = null
 
 const currentJobId = computed(() => job.value?.job_id ?? localStorage.getItem(STORAGE_KEY) ?? '')
-const canStart = computed(() => Boolean(selectedFile.value) && !creatingJob.value && !isRunningStatus(job.value?.status))
+const explicitCapabilities = computed<ProblemCapabilities | null>(() => {
+  if (problemType.value === 'auto') return null
+  return capabilities.value?.problem_types?.[problemType.value] ?? null
+})
+const compatibleModels = computed<AutoMLModel[]>(() => explicitCapabilities.value?.algorithms.filter(isAutoMLModel) ?? [])
+const compatibleMetrics = computed<Exclude<AutoMLMetric, 'auto'>[]>(() => explicitCapabilities.value?.metrics.filter(isExplicitAutoMLMetric) ?? [])
+const explicitCapabilitiesReady = computed(() => problemType.value === 'auto' || (compatibleModels.value.length > 0 && compatibleMetrics.value.length > 0))
+const explicitActionsBlocked = computed(() => problemType.value !== 'auto' && (capabilitiesLoading.value || !explicitCapabilitiesReady.value))
+const capabilityStatusMessage = computed(() => {
+  if (capabilitiesUnavailable.value && capabilitiesError.value) return capabilitiesError.value
+  if (problemType.value !== 'auto' && !capabilitiesLoading.value && !explicitCapabilitiesReady.value) {
+    return `无法验证显式任务能力：${problemTypeLabel(problemType.value)}没有可用模型或指标。请重试加载能力。`
+  }
+  return ''
+})
+const activeProblemSpec = computed<ProblemSpec | null>(() => result.value?.problem_spec ?? job.value?.problem_spec ?? null)
+const isRegressionResult = computed(() => result.value?.problem_spec.resolved_type === 'regression')
+const resolvedMetric = computed<AutoMLMetric>(() => {
+  const metric = job.value?.optimization_metric ?? result.value?.problem_spec.capabilities.default_metric
+  if (isAutoMLMetric(metric)) return metric
+  if (problemType.value !== 'auto' && optimizationMetric.value !== 'auto') return optimizationMetric.value
+  return 'auto'
+})
+const resolvedMetricDirection = computed<MetricDirection | null>(() => {
+  if (resolvedMetric.value === 'auto') return null
+  return activeProblemSpec.value?.capabilities.metric_directions[resolvedMetric.value]
+    ?? explicitCapabilities.value?.metric_directions[resolvedMetric.value]
+    ?? null
+})
+const chartMetricLabel = computed(() => metricOptionLabel(resolvedMetric.value, resolvedMetricDirection.value))
+const canStart = computed(() => Boolean(datasetFile.value) && !creatingJob.value && !isRunningStatus(job.value?.status) && !explicitActionsBlocked.value)
 const canCancel = computed(() => Boolean(job.value && isRunningStatus(job.value.status)))
 const statusLabel = computed(() => statusText(job.value?.status))
 const statusTagType = computed(() => {
@@ -290,26 +375,137 @@ function modelLabel(model?: AutoMLModel): string {
   return model ? labels[model] : '-'
 }
 
+function metricOptionLabel(metric: AutoMLMetric, direction?: MetricDirection | null): string {
+  const labels: Record<AutoMLMetric, string> = {
+    auto: '自动选择（后端）',
+    roc_auc: 'ROC-AUC',
+    accuracy: 'Accuracy',
+    f1: 'F1',
+    rmse: 'RMSE',
+    mae: 'MAE',
+    r2: 'R²',
+  }
+  if (!direction) return labels[metric]
+  return `${labels[metric]}（${direction === 'minimize' ? '越小越好' : '越大越好'}）`
+}
+
 function metricLabel(name: string): string {
   const value = result.value?.metrics?.[name]
   return typeof value === 'number' ? value.toFixed(5) : '-'
 }
 
+function isAutoMLModel(value: string): value is AutoMLModel {
+  return [
+    'lightgbm',
+    'xgboost',
+    'catboost',
+    'random_forest',
+    'logistic_regression',
+    'linear_regression',
+  ].includes(value)
+}
+
+function isAutoMLMetric(value: string | undefined): value is AutoMLMetric {
+  return value === 'auto' || value === 'roc_auc' || value === 'accuracy' || value === 'f1'
+    || value === 'rmse' || value === 'mae' || value === 'r2'
+}
+
+function isExplicitAutoMLMetric(value: string): value is Exclude<AutoMLMetric, 'auto'> {
+  return value !== 'auto' && isAutoMLMetric(value)
+}
+
+function problemTypeLabel(value: ProblemType): string {
+  const labels: Record<ProblemType, string> = {
+    auto: '自动推断',
+    binary_classification: '二分类',
+    multiclass_classification: '多分类',
+    regression: '回归',
+  }
+  return labels[value]
+}
+
+function problemSourceLabel(source: ProblemSpec['source']): string {
+  const labels: Record<ProblemSpec['source'], string> = {
+    auto_inferred: '自动推断',
+    user_override: '用户指定',
+    legacy_compatibility: '旧模型兼容',
+  }
+  return labels[source]
+}
+
+function hasUsableCapabilities(response: ProblemCapabilitiesResponse | undefined | null): response is ProblemCapabilitiesResponse {
+  return Boolean(response && Object.values(response.problem_types ?? {}).some((capability) =>
+    Array.isArray(capability.algorithms) && capability.algorithms.some(isAutoMLModel)
+      && Array.isArray(capability.metrics) && capability.metrics.some(isExplicitAutoMLMetric),
+  ))
+}
+
+function applyProblemType() {
+  selectionResetMessage.value = ''
+  if (problemType.value === 'auto') {
+    const hadExplicitSelection = candidateModels.value.length > 0 || optimizationMetric.value !== 'auto'
+    candidateModels.value = []
+    optimizationMetric.value = 'auto'
+    if (hadExplicitSelection) selectionResetMessage.value = '任务类型切换为自动推断后，候选模型和优化指标已重置为后端自动选择。'
+    return
+  }
+
+  const models = compatibleModels.value
+  const metrics = compatibleMetrics.value
+  if (!models.length || !metrics.length) return
+  const retainedModels = candidateModels.value.filter((model) => models.includes(model))
+  const nextModels = retainedModels.length ? retainedModels : [models[0]]
+  const nextMetric = metrics.includes(optimizationMetric.value as Exclude<AutoMLMetric, 'auto'>)
+    ? optimizationMetric.value
+    : metrics.includes(explicitCapabilities.value?.default_metric as Exclude<AutoMLMetric, 'auto'>)
+      ? explicitCapabilities.value?.default_metric as Exclude<AutoMLMetric, 'auto'>
+      : metrics[0]
+  const modelsChanged = nextModels.length !== candidateModels.value.length
+    || nextModels.some((model, index) => model !== candidateModels.value[index])
+  const metricChanged = nextMetric !== optimizationMetric.value
+  candidateModels.value = nextModels
+  optimizationMetric.value = nextMetric
+  if (modelsChanged || metricChanged) selectionResetMessage.value = '任务类型切换后，候选模型和优化指标已重置为兼容的后端能力。'
+}
+
+async function loadCapabilities() {
+  capabilitiesLoading.value = true
+  capabilitiesUnavailable.value = false
+  capabilitiesError.value = ''
+  try {
+    const response = await trainingApi.getCapabilities()
+    if (!hasUsableCapabilities(response)) {
+      capabilities.value = null
+      capabilitiesUnavailable.value = true
+      capabilitiesError.value = '无法验证显式任务能力：能力接口未返回可用模型和指标。请重试加载能力。'
+      return
+    }
+    capabilities.value = response
+    applyProblemType()
+  } catch {
+    capabilities.value = null
+    capabilitiesUnavailable.value = true
+    capabilitiesError.value = '无法验证显式任务能力：加载失败。请重试加载能力。'
+  } finally {
+    capabilitiesLoading.value = false
+  }
+}
+
 function handleFileChange(uploadFile: UploadFile) {
-  selectedFile.value = uploadFile.raw ?? null
+  datasetFile.value = uploadFile.raw ?? null
 }
 
 function handleNativeFileChange(event: Event) {
   const input = event.target as HTMLInputElement
-  selectedFile.value = input.files?.[0] ?? null
+  datasetFile.value = input.files?.[0] ?? null
 }
 
 function handleFileRemove() {
-  selectedFile.value = null
+  datasetFile.value = null
 }
 
 async function startJob() {
-  if (!selectedFile.value) return
+  if (!datasetFile.value || explicitActionsBlocked.value) return
   creatingJob.value = true
   errorMessage.value = ''
   result.value = null
@@ -318,12 +514,18 @@ async function startJob() {
   closeStream()
   try {
     job.value = await automlApi.createJob({
-      file: selectedFile.value,
+      file: datasetFile.value,
       targetCol: targetCol.value,
+      problemType: problemType.value,
       nTrials: nTrials.value,
       cvFolds: cvFolds.value,
-      candidateModels: candidateModels.value,
-      optimizationMetric: optimizationMetric.value,
+      ...(problemType.value === 'auto' ? {
+        candidateModels: undefined,
+        optimizationMetric: 'auto' as const,
+      } : {
+        candidateModels: candidateModels.value,
+        optimizationMetric: optimizationMetric.value,
+      }),
       useLlm: useLlm.value,
       businessContext: businessContext.value,
     })
@@ -388,6 +590,7 @@ function connectStream(jobId: string) {
   const controller = new AbortController()
   streamController.value = controller
   void automlApi.streamJob(jobId, async (event: AutoMLTrialEvent) => {
+    if (event.problem_spec && job.value) job.value.problem_spec = event.problem_spec
     if (event.event === 'trial') {
       upsertTrial(event)
       if (typeof event.progress === 'number' && job.value) {
@@ -442,11 +645,14 @@ function updateChart() {
     .map((item) => [item.trial_number ?? 0, item.best_value])
   chartInstance.setOption({
     backgroundColor: 'transparent',
-    tooltip: { trigger: 'axis' },
+    tooltip: {
+      trigger: 'axis',
+      valueFormatter: (value: number | string) => `${value}（${resolvedMetricDirection.value === 'minimize' ? '越小越好' : '越大越好'}）`,
+    },
     legend: { top: 8, right: 12, data: ['Trial 分数', '历史最佳'] },
     grid: { left: 44, right: 24, top: 56, bottom: 36, containLabel: true },
     xAxis: { type: 'value', name: 'Trial', minInterval: 1 },
-    yAxis: { type: 'value', name: optimizationMetric.value },
+    yAxis: { type: 'value', name: chartMetricLabel.value },
     series: [
       { name: 'Trial 分数', type: 'scatter', data: trialData, symbolSize: 10, itemStyle: { color: '#2563eb' } },
       { name: '历史最佳', type: 'line', data: bestData, step: 'start', lineStyle: { color: '#dc2626', width: 3 } },
@@ -454,7 +660,7 @@ function updateChart() {
   })
 }
 
-watch(trialHistory, updateChart, { deep: true })
+watch([trialHistory, chartMetricLabel], updateChart, { deep: true })
 
 const resizeChart = () => chartInstance?.resize()
 
@@ -462,6 +668,7 @@ onMounted(async () => {
   await nextTick()
   initChart()
   window.addEventListener('resize', resizeChart)
+  void loadCapabilities()
   await refreshJob()
 })
 
@@ -602,6 +809,12 @@ label,
 
 .progress-bar {
   margin: 16px 0;
+}
+
+.metric-direction {
+  margin: 14px 0 -4px;
+  color: #475569;
+  font-size: 13px;
 }
 
 .automl-chart {
