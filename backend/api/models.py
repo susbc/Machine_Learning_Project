@@ -10,10 +10,10 @@ import joblib
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from core.automl.problem_spec import ProblemSpec, ProblemType
+from core.automl.problem_spec import ProblemType
 
 from ._common import validate_entity_id
-from ._dataset import predict_with_artifact, resolve_artifact_problem_type
+from ._dataset import parse_artifact_problem_metadata, predict_with_artifact, resolve_artifact_problem_type
 
 router = APIRouter(prefix="/api/models", tags=["Model Registry"])
 
@@ -86,14 +86,14 @@ def _try_load_registry_metadata(path: Path) -> Dict[str, Any]:
         }
 
     try:
-        problem_type = resolve_artifact_problem_type(artifact)
+        problem_metadata = parse_artifact_problem_metadata(artifact)
     except HTTPException as exc:
         metadata["legacy"] = False
         metadata["metadata_error"] = exc.detail
         return metadata
 
-    metadata["legacy"] = problem_type is None
-    if problem_type is None:
+    metadata["legacy"] = problem_metadata is None
+    if problem_metadata is None:
         return metadata
 
     decision_summary = artifact.get("decision_summary")
@@ -109,12 +109,8 @@ def _try_load_registry_metadata(path: Path) -> Dict[str, Any]:
     if isinstance(persisted_best_metric, str) and persisted_best_metric.strip():
         metadata["best_metric"] = persisted_best_metric.strip()
 
-    problem_spec = artifact.get("problem_spec")
-    if isinstance(problem_spec, ProblemSpec):
-        metadata["problem_spec"] = problem_spec.to_dict()
-    elif isinstance(problem_spec, dict):
-        metadata["problem_spec"] = problem_spec
-    metadata["problem_type"] = problem_type.value
+    metadata["problem_spec"] = problem_metadata.problem_spec.to_dict()
+    metadata["problem_type"] = problem_metadata.problem_type.value
     return metadata
 
 

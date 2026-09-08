@@ -14,6 +14,16 @@ import backend.api.models as model_registry
 from core.automl.problem_spec import ProblemSpec, resolve_problem_spec
 
 
+def _complete_v3_metadata(spec: ProblemSpec | dict):
+    payload = spec.to_dict() if isinstance(spec, ProblemSpec) else spec
+    return {
+        "artifact_schema_version": 3,
+        "problem_type": payload["resolved_type"],
+        "problem_spec": payload,
+        "metric_directions": payload["capabilities"]["metric_directions"],
+    }
+
+
 def test_model_registry_lists_saved_models_with_sources():
     response = TestClient(app).get("/api/models")
 
@@ -45,9 +55,7 @@ def test_registry_exposes_only_persisted_metric_identity(tmp_path, monkeypatch):
     automl_dir.mkdir(parents=True)
     joblib.dump(
         {
-            "artifact_schema_version": 3,
-            "problem_type": "regression",
-            "problem_spec": spec,
+            **_complete_v3_metadata(spec),
             "model": model,
             "metrics": {"rmse": 0.2, "mae": 0.1, "r2": 0.9},
             "decision_summary": {"optimization_metric": "mae"},
@@ -58,9 +66,7 @@ def test_registry_exposes_only_persisted_metric_identity(tmp_path, monkeypatch):
     workflow_dir = tmp_path / "saved"
     joblib.dump(
         {
-            "artifact_schema_version": 3,
-            "problem_type": "regression",
-            "problem_spec": spec,
+            **_complete_v3_metadata(spec),
             "model": model,
             "metrics": {"rmse": 0.2},
             "best_metric": "rmse",
@@ -152,11 +158,10 @@ def test_registry_exposes_regression_metadata_and_null_class_summary(tmp_path, m
     artifact_dir = tmp_path / "saved" / "manual_training"
     artifact_dir.mkdir(parents=True)
     model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+    spec = resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression")
     joblib.dump(
         {
-            "artifact_schema_version": 3,
-            "problem_type": "regression",
-            "problem_spec": resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression").to_dict(),
+            **_complete_v3_metadata(spec),
             "model": model,
             "feature_columns": ["x"],
             "metrics": {"rmse": 0.1, "mae": 0.08, "r2": 0.99},
@@ -187,10 +192,12 @@ def test_registry_treats_integer_schema_v3_as_non_legacy(tmp_path, monkeypatch):
     artifact_dir = tmp_path / "saved" / "manual_training"
     artifact_dir.mkdir(parents=True)
     model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+    spec = resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression")
+    metadata = _complete_v3_metadata(spec)
+    metadata["artifact_schema_version"] = np.int64(3)
     joblib.dump(
         {
-            "artifact_schema_version": np.int64(3),
-            "problem_spec": resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression").to_dict(),
+            **metadata,
             "model": model,
             "feature_columns": ["x"],
         },
@@ -203,16 +210,17 @@ def test_registry_treats_integer_schema_v3_as_non_legacy(tmp_path, monkeypatch):
     assert listed["problem_type"] == "regression"
 
 
-def test_registry_batch_summary_matches_normalized_v3_regression_semantics(tmp_path, monkeypatch):
+def test_registry_rejects_noncanonical_v3_type_in_registry_and_prediction(tmp_path, monkeypatch):
     monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
     artifact_dir = tmp_path / "saved" / "manual_training"
     artifact_dir.mkdir(parents=True)
     model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+    spec = resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression")
+    metadata = _complete_v3_metadata(spec)
+    metadata["problem_type"] = "REGRESSION"
     joblib.dump(
         {
-            "artifact_schema_version": 3,
-            "problem_type": "REGRESSION",
-            "problem_spec": resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression").to_dict(),
+            **metadata,
             "model": model,
             "feature_columns": ["x"],
         },
@@ -221,15 +229,17 @@ def test_registry_batch_summary_matches_normalized_v3_regression_semantics(tmp_p
 
     client = TestClient(app)
     listed = client.get("/api/models").json()["models"][0]
-    assert listed["problem_type"] == "regression"
+    assert listed["legacy"] is False
+    assert listed["problem_type"] is None
+    assert listed["metadata_error"]["code"] == "invalid_artifact_problem_type"
 
     response = client.post(
         "/api/models/manual%3Amanual_training_normalized_regression/batch-predict",
         json={"rows": [{"x": 3}, {"x": 4}]},
     )
 
-    assert response.status_code == 200
-    assert response.json()["summary"] == {"count": 2, "positive_rate": None, "average_probability": None}
+    assert response.status_code == 400
+    assert response.json()["detail"] == listed["metadata_error"]
 
 
 @pytest.mark.parametrize(
@@ -240,6 +250,7 @@ def test_registry_batch_summary_matches_normalized_v3_regression_semantics(tmp_p
         ({"artifact_schema_version": 3, "problem_type": "auto"}, "invalid_artifact_problem_type", "problem_type"),
         ({"artifact_schema_version": 3, "problem_type": "clustering"}, "invalid_artifact_problem_type", "problem_type"),
         ({"artifact_schema_version": 3, "problem_spec": {"resolved_type": 17}}, "invalid_artifact_problem_type", "problem_type"),
+        ({"artifact_schema_version": 3, "problem_type": "regression"}, "invalid_artifact_problem_spec", "problem_spec"),
     ],
 )
 def test_registry_exposes_invalid_v3_metadata_and_matches_batch_error(
@@ -286,7 +297,7 @@ def test_registry_and_batch_accept_nested_persisted_problem_spec_object(tmp_path
     assert isinstance(spec, ProblemSpec)
     joblib.dump(
         {
-            "artifact_schema_version": 3,
+            **_complete_v3_metadata(spec),
             "problem_spec": spec,
             "model": model,
             "feature_columns": ["x"],
