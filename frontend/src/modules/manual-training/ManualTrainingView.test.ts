@@ -1,6 +1,6 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import ElementPlus from 'element-plus'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import ManualTrainingView from './views/ManualTrainingView.vue'
 
@@ -94,7 +94,204 @@ const regressionResult = {
   problem_spec: regressionSpec,
 } as const
 
+const classificationSpec = {
+  schema_version: 1,
+  requested_type: 'auto',
+  resolved_type: 'binary_classification',
+  source: 'auto_inferred',
+  reason: 'string_target',
+  explanation: '字符串目标列自动解析为二分类任务',
+  target: { column: 'label', dtype: 'object', valid_rows: 80, unique_count: 2, unique_ratio: 0.025, integer_like: false },
+  capabilities: capabilities.problem_types.binary_classification,
+} as const
+
+const classificationDataset = {
+  dataset_id: 'dataset_cls',
+  filename: 'class.csv',
+  rows: 80,
+  columns: 2,
+  target_col: 'label',
+  created_at: '2026-09-09T00:00:00',
+  preview: [],
+  problem_spec: classificationSpec,
+} as const
+
+const classificationResult = {
+  job_id: 'job_cls',
+  dataset_id: 'dataset_cls',
+  algorithm: 'logistic_regression',
+  params: {},
+  metrics: { roc_auc: 0.91, accuracy: 0.88, f1: 0.86, best_threshold: 0.5 },
+  confusion_matrix: [[10, 2], [1, 7]],
+  feature_importance: [],
+  train_size: 60,
+  test_size: 20,
+  feature_columns: ['x'],
+  problem_spec: classificationSpec,
+} as const
+
+function actionButton(wrapper: ReturnType<typeof mount>, label: string) {
+  const button = wrapper.findAll('button').find((candidate) => candidate.text().trim() === label)
+  if (!button) throw new Error(`Expected ${label} action`)
+  return button
+}
+
+async function selectOption(wrapper: ReturnType<typeof mount>, controlLabel: string, optionLabel: string) {
+  await wrapper.get(`[aria-label="${controlLabel}"]`).trigger('click')
+  const option = Array.from(document.querySelectorAll<HTMLElement>('.el-select-dropdown__item'))
+    .reverse()
+    .find((candidate) => candidate.textContent?.trim() === optionLabel)
+  if (!option) throw new Error(`Expected ${optionLabel} option`)
+  option.click()
+  await flushPromises()
+}
+
+async function optionLabels(wrapper: ReturnType<typeof mount>, controlLabel: string) {
+  const control = wrapper.get(`[aria-label="${controlLabel}"]`)
+  await control.trigger('click')
+  await flushPromises()
+  const listbox = document.getElementById(control.attributes('aria-controls')!)
+  return Array.from(listbox?.querySelectorAll<HTMLElement>('.el-select-dropdown__item') ?? [])
+    .map((option) => option.textContent?.trim())
+}
+
+async function chooseFile(wrapper: ReturnType<typeof mount>, filename = 'train.csv') {
+  const fileInput = wrapper.get('[data-testid="manual-training-file-input"]').element as HTMLInputElement
+  Object.defineProperty(fileInput, 'files', {
+    configurable: true,
+    value: [new File(['x,target\n1,0'], filename, { type: 'text/csv' })],
+  })
+  await wrapper.get('[data-testid="manual-training-file-input"]').trigger('change')
+}
+
 describe('ManualTrainingView', () => {
+  beforeEach(() => {
+    trainingMocks.getCapabilities.mockReset()
+    trainingMocks.uploadDataset.mockReset()
+    trainingMocks.getFieldConfig.mockReset()
+    trainingMocks.createJob.mockReset()
+    trainingMocks.getJob.mockReset()
+    trainingMocks.getResult.mockReset()
+    trainingMocks.cancelJob.mockReset()
+    trainingMocks.getCapabilities.mockResolvedValue(capabilities)
+    trainingMocks.getFieldConfig.mockResolvedValue({ dataset_id: 'dataset_cls', fields: [] })
+    trainingMocks.cancelJob.mockResolvedValue({
+      job_id: 'job_1',
+      dataset_id: 'dataset_1',
+      algorithm: 'logistic_regression',
+      status: 'cancelled',
+      progress: 60,
+    })
+  })
+
+  it('keeps default auto in the upload and job payloads', async () => {
+    trainingMocks.uploadDataset.mockResolvedValue(classificationDataset)
+    trainingMocks.createJob.mockResolvedValue({
+      job_id: 'job_cls', dataset_id: 'dataset_cls', algorithm: 'logistic_regression', status: 'queued', progress: 0, problem_spec: classificationSpec,
+    })
+    const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await chooseFile(wrapper)
+    await actionButton(wrapper, '上传').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '开始训练').trigger('click')
+    await flushPromises()
+
+    expect(trainingMocks.uploadDataset).toHaveBeenCalledWith(expect.objectContaining({ problemType: 'auto' }))
+    expect(trainingMocks.createJob).toHaveBeenCalledWith(expect.objectContaining({ problemType: 'auto' }))
+    wrapper.unmount()
+  })
+
+  it('keeps explicit actions disabled after a capability failure until retry succeeds', async () => {
+    trainingMocks.getCapabilities.mockRejectedValueOnce(new Error('capability network failure')).mockResolvedValue(capabilities)
+    const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await selectOption(wrapper, '问题类型', '回归')
+    await chooseFile(wrapper)
+
+    expect(wrapper.text()).toContain('无法验证显式任务能力')
+    expect(actionButton(wrapper, '上传').attributes('disabled')).toBeDefined()
+    expect(actionButton(wrapper, '开始训练').attributes('disabled')).toBeDefined()
+
+    await actionButton(wrapper, '重试加载能力').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('无法验证显式任务能力')
+    expect(actionButton(wrapper, '上传').attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('keeps explicit actions disabled when the capability response is empty until retry succeeds', async () => {
+    trainingMocks.getCapabilities.mockResolvedValueOnce({ problem_types: {} }).mockResolvedValue(capabilities)
+    const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await selectOption(wrapper, '问题类型', '回归')
+    await chooseFile(wrapper)
+
+    expect(wrapper.text()).toContain('无法验证显式任务能力')
+    expect(actionButton(wrapper, '上传').attributes('disabled')).toBeDefined()
+
+    await actionButton(wrapper, '重试加载能力').trigger('click')
+    await flushPromises()
+
+    expect(actionButton(wrapper, '上传').attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('filters algorithms for each explicit type without overwriting compatible edited params', async () => {
+    const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await selectOption(wrapper, '问题类型', '二分类')
+    expect(await optionLabels(wrapper, '训练算法')).toEqual(['逻辑回归', '随机森林'])
+    const paramsInput = wrapper.get('[aria-label="模型参数 JSON"]')
+    await paramsInput.setValue('{\n  "C": 7\n}')
+    await selectOption(wrapper, '问题类型', '多分类')
+
+    expect(wrapper.text()).toContain('逻辑回归')
+    expect((paramsInput.element as HTMLTextAreaElement).value).toBe('{\n  "C": 7\n}')
+    expect(wrapper.text()).not.toContain('模型参数 JSON 已重置')
+
+    await selectOption(wrapper, '问题类型', '回归')
+    expect(await optionLabels(wrapper, '训练算法')).toEqual(['线性回归', '随机森林'])
+    expect(wrapper.text()).toContain('线性回归')
+    expect(wrapper.text()).toContain('算法已从逻辑回归重置为线性回归')
+    expect(wrapper.text()).toContain('模型参数 JSON 已重置')
+    expect((paramsInput.element as HTMLTextAreaElement).value).toBe('{}')
+    wrapper.unmount()
+  })
+
+  it('keeps classification result metrics when optional calibration fields are absent', async () => {
+    trainingMocks.uploadDataset.mockResolvedValue(classificationDataset)
+    trainingMocks.createJob.mockResolvedValue({
+      job_id: 'job_cls', dataset_id: 'dataset_cls', algorithm: 'logistic_regression', status: 'queued', progress: 0, problem_spec: classificationSpec,
+    })
+    trainingMocks.getJob.mockResolvedValue({
+      job_id: 'job_cls', dataset_id: 'dataset_cls', algorithm: 'logistic_regression', status: 'completed', progress: 100, problem_spec: classificationSpec,
+    })
+    trainingMocks.getResult.mockResolvedValue(classificationResult)
+    const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await chooseFile(wrapper, 'class.csv')
+    await actionButton(wrapper, '上传').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '开始训练').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '刷新任务').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('ROC-AUC')
+    expect(wrapper.text()).toContain('Accuracy')
+    expect(wrapper.text()).toContain('最佳阈值')
+    expect(wrapper.text()).not.toContain('RMSE')
+    expect(wrapper.text()).not.toContain('阈值来源')
+    wrapper.unmount()
+  })
+
   it('uses a regression override for compatible training and regression-only results', async () => {
     trainingMocks.getCapabilities.mockResolvedValue(capabilities)
     trainingMocks.uploadDataset.mockResolvedValue(regressionDataset)
@@ -120,20 +317,10 @@ describe('ManualTrainingView', () => {
     const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
     await flushPromises()
 
-    await wrapper.get('[aria-label="问题类型"]').trigger('click')
-    const regressionOption = Array.from(document.querySelectorAll<HTMLElement>('.el-select-dropdown__item'))
-      .find((option) => option.textContent?.trim() === '回归')
-    expect(regressionOption).toBeDefined()
-    regressionOption!.click()
-    await wrapper.vm.$nextTick()
+    await selectOption(wrapper, '问题类型', '回归')
 
-    const fileInput = wrapper.get('[data-testid="manual-training-file-input"]').element as HTMLInputElement
-    Object.defineProperty(fileInput, 'files', {
-      configurable: true,
-      value: [new File(['x,price\n1,10'], 'reg.csv', { type: 'text/csv' })],
-    })
-    await wrapper.get('[data-testid="manual-training-file-input"]').trigger('change')
-    await wrapper.findAll('button').find((button) => button.text() === '上传')!.trigger('click')
+    await chooseFile(wrapper, 'reg.csv')
+    await actionButton(wrapper, '上传').trigger('click')
     await flushPromises()
 
     expect(wrapper.text()).toContain('用户显式选择了回归任务')
@@ -141,9 +328,9 @@ describe('ManualTrainingView', () => {
     expect(wrapper.text()).toContain('线性回归')
     expect(trainingMocks.uploadDataset).toHaveBeenCalledWith(expect.objectContaining({ problemType: 'regression' }))
 
-    await wrapper.findAll('button').find((button) => button.text() === '开始训练')!.trigger('click')
+    await actionButton(wrapper, '开始训练').trigger('click')
     await flushPromises()
-    await wrapper.findAll('button').find((button) => button.text() === '刷新任务')!.trigger('click')
+    await actionButton(wrapper, '刷新任务').trigger('click')
     await flushPromises()
 
     expect(trainingMocks.createJob).toHaveBeenCalledWith(expect.objectContaining({

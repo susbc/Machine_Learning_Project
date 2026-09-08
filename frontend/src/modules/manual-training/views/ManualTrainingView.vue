@@ -12,6 +12,10 @@
     </div>
 
     <el-alert v-if="visibleError" type="error" :title="visibleError" show-icon :closable="false" />
+    <div v-if="capabilityStatusMessage" class="capability-alert" role="alert">
+      <span>{{ capabilityStatusMessage }}</span>
+      <el-button text type="primary" :loading="capabilitiesLoading" @click="loadCapabilities">重试加载能力</el-button>
+    </div>
 
     <el-steps :active="activeStep" finish-status="success" class="training-steps">
       <el-step title="数据" />
@@ -48,7 +52,7 @@
         />
         <div class="inline-form">
           <el-input v-model="targetCol" placeholder="目标列，例如 label" clearable />
-          <el-button type="primary" :loading="uploading" :disabled="!datasetFile" @click="uploadDataset">上传</el-button>
+          <el-button type="primary" :loading="uploading" :disabled="!datasetFile || explicitActionsBlocked" @click="uploadDataset">上传</el-button>
         </div>
 
         <div v-if="dataset" class="dataset-summary">
@@ -107,7 +111,7 @@
           </label>
           <label>
             <span>算法</span>
-            <el-select v-model="algorithm" @change="applyAlgorithmPreset">
+            <el-select v-model="algorithm" aria-label="训练算法" @change="applyAlgorithmPreset">
               <el-option
                 v-for="candidate in compatibleAlgorithms"
                 :key="candidate"
@@ -127,11 +131,12 @@
         </div>
         <label class="params-field">
           <span>模型参数 JSON</span>
-          <el-input v-model="paramsJson" type="textarea" :rows="8" />
+          <el-input v-model="paramsJson" aria-label="模型参数 JSON" type="textarea" :rows="8" />
           <small v-if="paramsError" class="field-error">{{ paramsError }}</small>
         </label>
+        <el-alert v-if="algorithmResetMessage" type="warning" :title="algorithmResetMessage" show-icon :closable="false" />
         <div class="actions">
-          <el-button type="primary" :disabled="!dataset || isRunning || Boolean(paramsError)" :loading="creatingJob" @click="createJob">
+          <el-button type="primary" :disabled="!dataset || isRunning || Boolean(paramsError) || explicitActionsBlocked" :loading="creatingJob" @click="createJob">
             开始训练
           </el-button>
           <el-button plain :disabled="!job" @click="refreshJob">刷新任务</el-button>
@@ -243,6 +248,9 @@ const edaLoading = ref(false)
 const creatingJob = ref(false)
 const saving = ref(false)
 const capabilitiesLoading = ref(false)
+const capabilitiesUnavailable = ref(false)
+const capabilitiesError = ref('')
+const algorithmResetMessage = ref('')
 
 const problemType = ref<ProblemType>('auto')
 const algorithm = ref<TrainingAlgorithm>('logistic_regression')
@@ -278,12 +286,26 @@ const activeStep = computed(() => {
   return 0
 })
 const activeProblemSpec = computed<ProblemSpec | null>(() => result.value?.problem_spec ?? job.value?.problem_spec ?? dataset.value?.problem_spec ?? null)
+const explicitCapabilities = computed(() => {
+  if (problemType.value === 'auto') return null
+  return capabilities.value?.problem_types?.[problemType.value]
+})
 const compatibleAlgorithms = computed<TrainingAlgorithm[]>(() => {
-  const selectedCapabilities = problemType.value === 'auto'
-    ? activeProblemSpec.value?.capabilities
-    : capabilities.value?.problem_types[problemType.value]
+  if (problemType.value !== 'auto') {
+    return explicitCapabilities.value?.algorithms.filter(isTrainingAlgorithm) ?? []
+  }
+  const selectedCapabilities = activeProblemSpec.value?.capabilities
   const allowed = selectedCapabilities?.algorithms.filter(isTrainingAlgorithm)
   return allowed?.length ? allowed : ALL_ALGORITHMS
+})
+const explicitCapabilitiesReady = computed(() => problemType.value === 'auto' || compatibleAlgorithms.value.length > 0)
+const explicitActionsBlocked = computed(() => problemType.value !== 'auto' && (capabilitiesLoading.value || !explicitCapabilitiesReady.value))
+const capabilityStatusMessage = computed(() => {
+  if (capabilitiesUnavailable.value && capabilitiesError.value) return capabilitiesError.value
+  if (problemType.value !== 'auto' && !capabilitiesLoading.value && !explicitCapabilitiesReady.value) {
+    return `无法验证显式任务能力：${problemTypeLabel(problemType.value)}没有可用算法。请重试加载能力。`
+  }
+  return ''
 })
 const isRegressionResult = computed(() => result.value?.problem_spec.resolved_type === 'regression')
 const isRunning = computed(() => ['queued', 'running', 'cancelling'].includes(job.value?.status ?? ''))
@@ -330,29 +352,47 @@ function setDatasetFile(file: File | null) {
 
 function applyAlgorithmPreset() {
   paramsJson.value = JSON.stringify(PARAM_PRESETS[algorithm.value], null, 2)
+  algorithmResetMessage.value = ''
 }
 
 function applyProblemType() {
-  if (!compatibleAlgorithms.value.includes(algorithm.value)) {
-    algorithm.value = compatibleAlgorithms.value[0]
-    applyAlgorithmPreset()
+  const nextAlgorithm = compatibleAlgorithms.value[0]
+  if (!nextAlgorithm) return
+  if (compatibleAlgorithms.value.includes(algorithm.value)) {
+    algorithmResetMessage.value = ''
+    return
   }
+  const previousAlgorithm = algorithm.value
+  algorithm.value = nextAlgorithm
+  paramsJson.value = JSON.stringify(PARAM_PRESETS[nextAlgorithm], null, 2)
+  algorithmResetMessage.value = `任务类型切换后，算法已从${algorithmLabel(previousAlgorithm)}重置为${algorithmLabel(nextAlgorithm)}，模型参数 JSON 已重置。`
 }
 
 async function loadCapabilities() {
   capabilitiesLoading.value = true
+  capabilitiesUnavailable.value = false
+  capabilitiesError.value = ''
   try {
-    capabilities.value = await trainingApi.getCapabilities()
+    const response = await trainingApi.getCapabilities()
+    if (!hasUsableCapabilities(response)) {
+      capabilities.value = null
+      capabilitiesUnavailable.value = true
+      capabilitiesError.value = '无法验证显式任务能力：能力接口未返回可用算法。请重试加载能力。'
+      return
+    }
+    capabilities.value = response
     applyProblemType()
-  } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '加载任务能力失败'
+  } catch {
+    capabilities.value = null
+    capabilitiesUnavailable.value = true
+    capabilitiesError.value = '无法验证显式任务能力：加载失败。请重试加载能力。'
   } finally {
     capabilitiesLoading.value = false
   }
 }
 
 async function uploadDataset() {
-  if (!datasetFile.value) return
+  if (!datasetFile.value || explicitActionsBlocked.value) return
   uploading.value = true
   errorMessage.value = ''
   try {
@@ -392,7 +432,7 @@ async function runEda() {
 }
 
 async function createJob() {
-  if (!dataset.value || paramsError.value) return
+  if (!dataset.value || paramsError.value || explicitActionsBlocked.value) return
   creatingJob.value = true
   errorMessage.value = ''
   result.value = null
@@ -493,6 +533,12 @@ function metricLabel(name: string): string {
 
 function isTrainingAlgorithm(value: string): value is TrainingAlgorithm {
   return ALL_ALGORITHMS.includes(value as TrainingAlgorithm)
+}
+
+function hasUsableCapabilities(response: ProblemCapabilitiesResponse | undefined | null): response is ProblemCapabilitiesResponse {
+  return Boolean(response && Object.values(response.problem_types ?? {}).some((capability) =>
+    Array.isArray(capability.algorithms) && capability.algorithms.some(isTrainingAlgorithm),
+  ))
 }
 
 function problemTypeLabel(value: ProblemType): string {
@@ -613,6 +659,19 @@ function algorithmLabel(value: TrainingAlgorithm): string {
   display: flex;
   gap: 10px;
   margin-top: 14px;
+}
+
+.capability-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: #991b1b;
+  background: #fef2f2;
+  font-size: 13px;
 }
 
 .dataset-summary,
