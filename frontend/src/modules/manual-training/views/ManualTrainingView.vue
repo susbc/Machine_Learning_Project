@@ -136,7 +136,7 @@
         </label>
         <el-alert v-if="algorithmResetMessage" type="warning" :title="algorithmResetMessage" show-icon :closable="false" />
         <div class="actions">
-          <el-button type="primary" :disabled="!dataset || isRunning || Boolean(paramsError) || explicitActionsBlocked" :loading="creatingJob" @click="createJob">
+          <el-button type="primary" :disabled="!canCreateJob" :loading="creatingJob" @click="createJob">
             开始训练
           </el-button>
           <el-button plain :disabled="!job" @click="refreshJob">刷新任务</el-button>
@@ -234,6 +234,7 @@ import {
 import type { ProblemCapabilitiesResponse, ProblemSpec, ProblemType } from '@/api/problem'
 
 const datasetFile = ref<File | null>(null)
+const uploadedDatasetFile = ref<File | null>(null)
 const targetCol = ref('')
 const dataset = ref<TrainingDataset | null>(null)
 const fields = ref<TrainingField[]>([])
@@ -258,6 +259,7 @@ const testSize = ref(0.3)
 const randomState = ref(42)
 const paramsJson = ref(JSON.stringify({ C: 1.0, solver: 'liblinear', max_iter: 1000 }, null, 2))
 let pollGeneration = 0
+let datasetGeneration = 0
 
 const ALL_ALGORITHMS: TrainingAlgorithm[] = [
   'lightgbm',
@@ -309,6 +311,14 @@ const capabilityStatusMessage = computed(() => {
 })
 const isRegressionResult = computed(() => result.value?.problem_spec.resolved_type === 'regression')
 const isRunning = computed(() => ['queued', 'running', 'cancelling'].includes(job.value?.status ?? ''))
+const canCreateJob = computed(() => Boolean(
+  dataset.value
+  && datasetFile.value
+  && uploadedDatasetFile.value === datasetFile.value
+  && !isRunning.value
+  && !paramsError.value
+  && !explicitActionsBlocked.value,
+))
 const visibleError = computed(() => errorMessage.value || (job.value?.status === 'failed' ? job.value.error || '训练任务失败' : ''))
 const paramsError = computed(() => {
   try {
@@ -320,6 +330,7 @@ const paramsError = computed(() => {
 })
 
 onBeforeUnmount(() => {
+  datasetGeneration += 1
   pollGeneration += 1
 })
 
@@ -337,17 +348,60 @@ function handleNativeFileChange(event: Event) {
 }
 
 function handleFileRemove() {
-  datasetFile.value = null
+  setDatasetFile(null)
 }
 
 function setDatasetFile(file: File | null) {
   if (file && file.size > 50 * 1024 * 1024) {
     datasetFile.value = null
+    invalidateDatasetContext()
     errorMessage.value = '文件超过 50 MB 上传限制'
     return
   }
-  datasetFile.value = file
+  if (datasetFile.value !== file) {
+    datasetFile.value = file
+    invalidateDatasetContext()
+  }
   errorMessage.value = ''
+}
+
+function invalidateDatasetContext() {
+  datasetGeneration += 1
+  pollGeneration += 1
+  uploadedDatasetFile.value = null
+  dataset.value = null
+  fields.value = []
+  eda.value = null
+  job.value = null
+  result.value = null
+  savedArtifactPath.value = ''
+  uploading.value = false
+  edaLoading.value = false
+  creatingJob.value = false
+  saving.value = false
+}
+
+function isCurrentFileContext(generation: number, file: File) {
+  return datasetGeneration === generation && datasetFile.value === file
+}
+
+function isCurrentDatasetContext(generation: number, datasetId: string) {
+  return datasetGeneration === generation
+    && dataset.value?.dataset_id === datasetId
+    && datasetFile.value !== null
+    && uploadedDatasetFile.value === datasetFile.value
+}
+
+function isCurrentJobContext(
+  generation: number,
+  datasetId: string,
+  jobId: string,
+  expectedPollGeneration: number,
+) {
+  return pollGeneration === expectedPollGeneration
+    && isCurrentDatasetContext(generation, datasetId)
+    && job.value?.job_id === jobId
+    && job.value.dataset_id === datasetId
 }
 
 function applyAlgorithmPreset() {
@@ -393,15 +447,21 @@ async function loadCapabilities() {
 
 async function uploadDataset() {
   if (!datasetFile.value || explicitActionsBlocked.value) return
+  const file = datasetFile.value
+  const generation = datasetGeneration
   uploading.value = true
   errorMessage.value = ''
   try {
-    dataset.value = await trainingApi.uploadDataset({
-      file: datasetFile.value,
+    const uploaded = await trainingApi.uploadDataset({
+      file,
       targetCol: targetCol.value,
       problemType: problemType.value,
     })
-    const config = await trainingApi.getFieldConfig(dataset.value.dataset_id)
+    if (!isCurrentFileContext(generation, file)) return
+    const config = await trainingApi.getFieldConfig(uploaded.dataset_id)
+    if (!isCurrentFileContext(generation, file) || config.dataset_id !== uploaded.dataset_id) return
+    dataset.value = uploaded
+    uploadedDatasetFile.value = file
     fields.value = config.fields
     result.value = null
     job.value = null
@@ -411,118 +471,156 @@ async function uploadDataset() {
     applyProblemType()
     ElMessage.success('数据上传完成')
   } catch (error) {
+    if (!isCurrentFileContext(generation, file)) return
     errorMessage.value = error instanceof Error ? error.message : '数据上传失败'
   } finally {
-    uploading.value = false
+    if (isCurrentFileContext(generation, file)) uploading.value = false
   }
 }
 
 async function runEda() {
-  if (!dataset.value) return
+  if (!dataset.value || uploadedDatasetFile.value !== datasetFile.value) return
+  const generation = datasetGeneration
+  const datasetId = dataset.value.dataset_id
   edaLoading.value = true
   errorMessage.value = ''
   try {
-    eda.value = await trainingApi.runEda(dataset.value.dataset_id)
-    fields.value = eda.value.columns
+    const response = await trainingApi.runEda(datasetId)
+    if (!isCurrentDatasetContext(generation, datasetId) || response.dataset_id !== datasetId) return
+    eda.value = response
+    fields.value = response.columns
   } catch (error) {
+    if (!isCurrentDatasetContext(generation, datasetId)) return
     errorMessage.value = error instanceof Error ? error.message : 'EDA 失败'
   } finally {
-    edaLoading.value = false
+    if (isCurrentDatasetContext(generation, datasetId)) edaLoading.value = false
   }
 }
 
 async function createJob() {
-  if (!dataset.value || paramsError.value || explicitActionsBlocked.value) return
+  if (!canCreateJob.value || !dataset.value) return
+  const generation = datasetGeneration
+  const datasetId = dataset.value.dataset_id
   creatingJob.value = true
   errorMessage.value = ''
   result.value = null
   savedArtifactPath.value = ''
   try {
     const params = JSON.parse(paramsJson.value || '{}') as Record<string, unknown>
-    job.value = await trainingApi.createJob({
-      dataset_id: dataset.value.dataset_id,
+    const created = await trainingApi.createJob({
+      dataset_id: datasetId,
       algorithm: algorithm.value,
       params,
       test_size: testSize.value,
       random_state: randomState.value,
       problemType: problemType.value,
     })
+    if (!isCurrentDatasetContext(generation, datasetId) || created.dataset_id !== datasetId) return
+    job.value = created
     ElMessage.success('训练任务已创建')
-    void pollJob(job.value.job_id)
+    void pollJob(created.job_id, datasetId, generation)
   } catch (error) {
+    if (!isCurrentDatasetContext(generation, datasetId)) return
     errorMessage.value = error instanceof Error ? error.message : '训练任务创建失败'
   } finally {
-    creatingJob.value = false
+    if (isCurrentDatasetContext(generation, datasetId)) creatingJob.value = false
   }
 }
 
-async function pollJob(jobId: string) {
-  const generation = ++pollGeneration
+async function pollJob(jobId: string, datasetId: string, generation: number) {
+  const activePollGeneration = ++pollGeneration
   const deadline = Date.now() + 10 * 60 * 1000
   let delay = 500
-  while (generation === pollGeneration && Date.now() < deadline) {
+  while (isCurrentJobContext(generation, datasetId, jobId, activePollGeneration) && Date.now() < deadline) {
     await new Promise((resolve) => window.setTimeout(resolve, delay))
-    if (generation !== pollGeneration) return
+    if (!isCurrentJobContext(generation, datasetId, jobId, activePollGeneration)) return
     let current: TrainingJob
     try {
       current = await trainingApi.getJob(jobId)
     } catch (error) {
-      if (generation === pollGeneration) {
+      if (isCurrentJobContext(generation, datasetId, jobId, activePollGeneration)) {
         errorMessage.value = error instanceof Error ? error.message : '任务状态轮询失败'
       }
       return
     }
-    if (generation !== pollGeneration) return
+    if (!isCurrentJobContext(generation, datasetId, jobId, activePollGeneration)) return
+    if (current.job_id !== jobId || current.dataset_id !== datasetId) return
     job.value = current
     if (current.status === 'completed') {
-      result.value = await trainingApi.getResult(jobId)
+      const completedResult = await trainingApi.getResult(jobId)
+      if (!isCurrentJobContext(generation, datasetId, jobId, activePollGeneration)) return
+      if (completedResult.job_id !== jobId || completedResult.dataset_id !== datasetId) return
+      result.value = completedResult
       return
     }
     if (current.status === 'failed' || current.status === 'cancelled') return
     delay = Math.min(Math.round(delay * 1.35), 2000)
   }
-  if (generation === pollGeneration) {
+  if (isCurrentJobContext(generation, datasetId, jobId, activePollGeneration)) {
     errorMessage.value = '训练仍在后台运行，请稍后点击“刷新任务”查看结果'
   }
 }
 
 async function refreshJob() {
-  if (!job.value) return
+  if (!job.value || !dataset.value) return
+  const generation = datasetGeneration
+  const datasetId = dataset.value.dataset_id
+  const jobId = job.value.job_id
+  const activePollGeneration = ++pollGeneration
   try {
-    job.value = await trainingApi.getJob(job.value.job_id)
-    if (job.value.status === 'completed' && !result.value) {
-      result.value = await trainingApi.getResult(job.value.job_id)
+    const current = await trainingApi.getJob(jobId)
+    if (!isCurrentJobContext(generation, datasetId, jobId, activePollGeneration)) return
+    if (current.job_id !== jobId || current.dataset_id !== datasetId) return
+    job.value = current
+    if (current.status === 'completed' && !result.value) {
+      const completedResult = await trainingApi.getResult(jobId)
+      if (!isCurrentJobContext(generation, datasetId, jobId, activePollGeneration)) return
+      if (completedResult.job_id !== jobId || completedResult.dataset_id !== datasetId) return
+      result.value = completedResult
     }
   } catch (error) {
+    if (!isCurrentJobContext(generation, datasetId, jobId, activePollGeneration)) return
     errorMessage.value = error instanceof Error ? error.message : '任务刷新失败'
   }
 }
 
 async function cancelJob() {
-  if (!job.value || !isRunning.value) return
+  if (!job.value || !dataset.value || !isRunning.value) return
+  const generation = datasetGeneration
+  const datasetId = dataset.value.dataset_id
+  const jobId = job.value.job_id
   errorMessage.value = ''
   try {
-    pollGeneration += 1
-    job.value = await trainingApi.cancelJob(job.value.job_id)
+    const activePollGeneration = ++pollGeneration
+    const cancelled = await trainingApi.cancelJob(jobId)
+    if (!isCurrentJobContext(generation, datasetId, jobId, activePollGeneration)) return
+    if (cancelled.job_id !== jobId || cancelled.dataset_id !== datasetId) return
+    job.value = cancelled
     ElMessage.info('已发送取消请求')
-    if (isRunning.value) void pollJob(job.value.job_id)
+    if (isRunning.value) void pollJob(jobId, datasetId, generation)
   } catch (error) {
+    if (!isCurrentDatasetContext(generation, datasetId)) return
     errorMessage.value = error instanceof Error ? error.message : '取消任务失败'
   }
 }
 
 async function saveResult() {
-  if (!job.value) return
+  if (!job.value || !dataset.value) return
+  const generation = datasetGeneration
+  const datasetId = dataset.value.dataset_id
+  const jobId = job.value.job_id
   saving.value = true
   errorMessage.value = ''
   try {
-    const saved = await trainingApi.saveResult(job.value.job_id)
+    const saved = await trainingApi.saveResult(jobId)
+    if (!isCurrentDatasetContext(generation, datasetId) || job.value?.job_id !== jobId) return
     savedArtifactPath.value = saved.artifact_path
     ElMessage.success('模型保存成功')
   } catch (error) {
+    if (!isCurrentDatasetContext(generation, datasetId) || job.value?.job_id !== jobId) return
     errorMessage.value = error instanceof Error ? error.message : '模型保存失败'
   } finally {
-    saving.value = false
+    if (isCurrentDatasetContext(generation, datasetId) && job.value?.job_id === jobId) saving.value = false
   }
 }
 

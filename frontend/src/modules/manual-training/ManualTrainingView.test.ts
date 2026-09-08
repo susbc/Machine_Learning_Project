@@ -8,9 +8,11 @@ const trainingMocks = vi.hoisted(() => ({
   getCapabilities: vi.fn(),
   uploadDataset: vi.fn(),
   getFieldConfig: vi.fn(),
+  runEda: vi.fn(),
   createJob: vi.fn(),
   getJob: vi.fn(),
   getResult: vi.fn(),
+  saveResult: vi.fn(),
   cancelJob: vi.fn(async () => ({
     job_id: 'job_1',
     dataset_id: 'dataset_1',
@@ -25,11 +27,11 @@ vi.mock('@/api/training', () => ({
     uploadDataset: trainingMocks.uploadDataset,
     getFieldConfig: trainingMocks.getFieldConfig,
     getCapabilities: trainingMocks.getCapabilities,
-    runEda: vi.fn(),
+    runEda: trainingMocks.runEda,
     createJob: trainingMocks.createJob,
     getJob: trainingMocks.getJob,
     getResult: trainingMocks.getResult,
-    saveResult: vi.fn(),
+    saveResult: trainingMocks.saveResult,
     cancelJob: trainingMocks.cancelJob,
   },
 }))
@@ -164,17 +166,36 @@ async function chooseFile(wrapper: ReturnType<typeof mount>, filename = 'train.c
   await wrapper.get('[data-testid="manual-training-file-input"]').trigger('change')
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
 describe('ManualTrainingView', () => {
   beforeEach(() => {
     trainingMocks.getCapabilities.mockReset()
     trainingMocks.uploadDataset.mockReset()
     trainingMocks.getFieldConfig.mockReset()
+    trainingMocks.runEda.mockReset()
     trainingMocks.createJob.mockReset()
     trainingMocks.getJob.mockReset()
     trainingMocks.getResult.mockReset()
+    trainingMocks.saveResult.mockReset()
     trainingMocks.cancelJob.mockReset()
     trainingMocks.getCapabilities.mockResolvedValue(capabilities)
     trainingMocks.getFieldConfig.mockResolvedValue({ dataset_id: 'dataset_cls', fields: [] })
+    trainingMocks.runEda.mockResolvedValue({
+      dataset_id: 'dataset_cls',
+      summary: { missing_rate: 0, numeric_features: 1, categorical_features: 0, target_unique: 2 },
+      columns: [],
+      correlations: {},
+    })
+    trainingMocks.saveResult.mockResolvedValue({
+      status: 'saved', job_id: 'job_cls', artifact_path: 'saved/manual_old.pkl',
+    })
     trainingMocks.cancelJob.mockResolvedValue({
       job_id: 'job_1',
       dataset_id: 'dataset_1',
@@ -359,9 +380,16 @@ describe('ManualTrainingView', () => {
   it('sends cancellation for a running job', async () => {
     const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
     const vm = wrapper.vm as unknown as {
+      datasetFile: File
+      uploadedDatasetFile: File
+      dataset: Record<string, unknown>
       job: Record<string, unknown>
       cancelJob: () => Promise<void>
     }
+    const file = new File(['x,label\n1,0'], 'running.csv', { type: 'text/csv' })
+    vm.datasetFile = file
+    vm.uploadedDatasetFile = file
+    vm.dataset = { ...classificationDataset, dataset_id: 'dataset_1' }
     vm.job = {
       job_id: 'job_1',
       dataset_id: 'dataset_1',
@@ -374,6 +402,133 @@ describe('ManualTrainingView', () => {
 
     expect(trainingMocks.cancelJob).toHaveBeenCalledWith('job_1')
     expect(vm.job.status).toBe('cancelled')
+    wrapper.unmount()
+  })
+
+  it('invalidates every dataset-bound view state immediately when a new file is selected', async () => {
+    trainingMocks.uploadDataset.mockResolvedValue(classificationDataset)
+    trainingMocks.getFieldConfig.mockResolvedValue({
+      dataset_id: 'dataset_cls',
+      fields: [{ field_name: 'old_feature', field_type: 'num', dtype: 'float64', missing_rate: 0, unique_count: 80 }],
+    })
+    trainingMocks.runEda.mockResolvedValue({
+      dataset_id: 'dataset_cls',
+      summary: { missing_rate: 0, numeric_features: 1, categorical_features: 0, target_unique: 2 },
+      columns: [{ field_name: 'old_feature', field_type: 'num', dtype: 'float64', missing_rate: 0, unique_count: 80 }],
+      correlations: {},
+    })
+    trainingMocks.createJob.mockResolvedValue({
+      job_id: 'job_cls', dataset_id: 'dataset_cls', algorithm: 'logistic_regression', status: 'queued', progress: 0, problem_spec: classificationSpec,
+    })
+    trainingMocks.getJob.mockResolvedValue({
+      job_id: 'job_cls', dataset_id: 'dataset_cls', algorithm: 'logistic_regression', status: 'completed', progress: 100, problem_spec: classificationSpec,
+    })
+    trainingMocks.getResult.mockResolvedValue(classificationResult)
+    const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await chooseFile(wrapper, 'old.csv')
+    await actionButton(wrapper, '上传').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '运行 EDA').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '开始训练').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '刷新任务').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '保存模型').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('old_feature')
+    expect(wrapper.text()).toContain('0.91000')
+    expect(wrapper.text()).toContain('saved/manual_old.pkl')
+
+    await chooseFile(wrapper, 'replacement.csv')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('待上传')
+    expect(wrapper.text()).not.toContain('行数 80')
+    expect(wrapper.text()).not.toContain('old_feature')
+    expect(wrapper.text()).not.toContain('0.91000')
+    expect(wrapper.text()).not.toContain('saved/manual_old.pkl')
+    expect(actionButton(wrapper, '开始训练').attributes('disabled')).toBeDefined()
+    await actionButton(wrapper, '开始训练').trigger('click')
+    expect(trainingMocks.createJob).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
+  it('ignores a deferred field response after its uploaded file is replaced', async () => {
+    const fieldResponse = deferred<{ dataset_id: string; fields: [] }>()
+    trainingMocks.uploadDataset.mockResolvedValue(classificationDataset)
+    trainingMocks.getFieldConfig.mockReturnValue(fieldResponse.promise)
+    const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await chooseFile(wrapper, 'old.csv')
+    await actionButton(wrapper, '上传').trigger('click')
+    await flushPromises()
+
+    await chooseFile(wrapper, 'replacement.csv')
+    fieldResponse.resolve({ dataset_id: 'dataset_cls', fields: [] })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('待上传')
+    expect(wrapper.text()).not.toContain('行数 80')
+    expect(actionButton(wrapper, '开始训练').attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+
+  it('ignores a deferred job status after its dataset file is replaced', async () => {
+    const statusResponse = deferred<typeof classificationResult & { status: 'completed'; progress: number }>()
+    trainingMocks.uploadDataset.mockResolvedValue(classificationDataset)
+    trainingMocks.createJob.mockResolvedValue({
+      job_id: 'job_cls', dataset_id: 'dataset_cls', algorithm: 'logistic_regression', status: 'queued', progress: 0, problem_spec: classificationSpec,
+    })
+    trainingMocks.getJob.mockReturnValue(statusResponse.promise)
+    const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await chooseFile(wrapper, 'old.csv')
+    await actionButton(wrapper, '上传').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '开始训练').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '刷新任务').trigger('click')
+    await flushPromises()
+
+    await chooseFile(wrapper, 'replacement.csv')
+    statusResponse.resolve({ ...classificationResult, status: 'completed', progress: 100 })
+    await flushPromises()
+
+    expect(trainingMocks.getResult).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('待上传')
+    expect(wrapper.text()).not.toContain('0.91000')
+    wrapper.unmount()
+  })
+
+  it('ignores a deferred result after its job and dataset file are replaced', async () => {
+    const resultResponse = deferred<typeof classificationResult>()
+    trainingMocks.uploadDataset.mockResolvedValue(classificationDataset)
+    trainingMocks.createJob.mockResolvedValue({
+      job_id: 'job_cls', dataset_id: 'dataset_cls', algorithm: 'logistic_regression', status: 'queued', progress: 0, problem_spec: classificationSpec,
+    })
+    trainingMocks.getJob.mockResolvedValue({
+      job_id: 'job_cls', dataset_id: 'dataset_cls', algorithm: 'logistic_regression', status: 'completed', progress: 100, problem_spec: classificationSpec,
+    })
+    trainingMocks.getResult.mockReturnValue(resultResponse.promise)
+    const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await chooseFile(wrapper, 'old.csv')
+    await actionButton(wrapper, '上传').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '开始训练').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '刷新任务').trigger('click')
+    await flushPromises()
+
+    await chooseFile(wrapper, 'replacement.csv')
+    resultResponse.resolve(classificationResult)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('待上传')
+    expect(wrapper.text()).not.toContain('0.91000')
     wrapper.unmount()
   })
 })
