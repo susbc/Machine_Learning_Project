@@ -101,6 +101,16 @@ async function createWorkflow(wrapper: VueWrapper) {
   await flushPromises()
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
 describe('AgentWorkflowView', () => {
   beforeEach(() => {
     workflowMocks.getTaskStatus.mockReset()
@@ -438,6 +448,74 @@ describe('AgentWorkflowView', () => {
     expect(wrapper.text()).toContain('ROC-AUC')
     expect(wrapper.text()).toContain('0.8100')
     expect(wrapper.text()).not.toContain('最终：')
+    wrapper.unmount()
+  })
+
+  it('ignores a deferred prediction result after the JSON input changes', async () => {
+    const pending = deferred<{ status: string; prediction: number }>()
+    workflowMocks.predict.mockReturnValue(pending.promise)
+    const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await actionButton(wrapper, '执行预测').trigger('click')
+    await flushPromises()
+    await wrapper.get('.predict-json textarea').setValue('{"order_fee":999,"age":41,"city_code":"上海"}')
+    pending.resolve({ status: 'success', prediction: 111.25 })
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('111.25')
+    expect(actionButton(wrapper, '执行预测').classes()).not.toContain('is-loading')
+    wrapper.unmount()
+  })
+
+  it('keeps the current model prediction when a superseded model request rejects late', async () => {
+    const oldRequest = deferred<{ status: string; prediction: number }>()
+    workflowMocks.listModels.mockResolvedValue({
+      models: [{ task_id: 'model_old' }, { task_id: 'model_new' }],
+    })
+    workflowMocks.predict
+      .mockReturnValueOnce(oldRequest.promise)
+      .mockResolvedValueOnce({ status: 'success', model_version: 'model_new', prediction: 222.5 })
+    const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await actionButton(wrapper, '执行预测').trigger('click')
+    await flushPromises()
+    await selectOption(wrapper, '工作流预测模型', 'model_new')
+    await actionButton(wrapper, '执行预测').trigger('click')
+    await flushPromises()
+    oldRequest.reject(new Error('old model failed'))
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('222.5')
+    expect(wrapper.text()).not.toContain('old model failed')
+    wrapper.unmount()
+  })
+
+  it('ignores a deferred prediction when the workflow task changes', async () => {
+    const pending = deferred<{ status: string; prediction: number }>()
+    workflowMocks.retrieveData
+      .mockResolvedValueOnce({ status: 'success', task_id: 'task_old', data_shape: [80, 3] })
+      .mockResolvedValueOnce({ status: 'success', task_id: 'task_new', data_shape: [40, 3] })
+    workflowMocks.getTaskStatus
+      .mockResolvedValueOnce({ task_id: 'task_old', status: 'created' })
+      .mockResolvedValueOnce({ task_id: 'task_new', status: 'created' })
+    workflowMocks.predict.mockReturnValue(pending.promise)
+    const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await actionButton(wrapper, '生成 SQL 并提取数据').trigger('click')
+    await flushPromises()
+
+    await actionButton(wrapper, '执行预测').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '生成 SQL 并提取数据').trigger('click')
+    await flushPromises()
+    pending.resolve({ status: 'success', prediction: 333.75 })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('task_new')
+    expect(wrapper.text()).not.toContain('333.75')
+    expect(actionButton(wrapper, '执行预测').classes()).not.toContain('is-loading')
     wrapper.unmount()
   })
 })

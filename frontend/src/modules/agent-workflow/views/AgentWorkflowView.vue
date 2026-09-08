@@ -271,6 +271,7 @@ const modelListVisible = ref(false)
 let streamController: AbortController | null = null
 let contextGeneration = 0
 let streamGeneration = 0
+let predictionGeneration = 0
 
 const stepState = computed(() => ({
   retrieve: taskId.value ? '完成' : '待执行',
@@ -278,7 +279,9 @@ const stepState = computed(() => ({
 }))
 const canGenerateFeatures = computed(() => Boolean(taskId.value) && !generatingFeatures.value)
 const canTrain = computed(() => Boolean(taskId.value && featureResult.value) && !training.value)
-const canPredict = computed(() => Boolean(predictForm.model_version && predictFeatureJson.value.trim()))
+const canPredict = computed(() => Boolean(
+  predictForm.model_version && predictFeatureJson.value.trim() && !predicting.value,
+))
 const featureActions = computed<WorkflowFeatureAction[]>(() => featureResult.value?.strategy?.actions ?? [])
 const taskMetricName = computed(() => liveMetric.value?.name ?? taskStatus.value?.best_metric ?? (typeof taskStatus.value?.best_auc === 'number' ? 'roc_auc' : undefined))
 const taskMetricValue = computed(() => liveMetric.value?.value ?? taskStatus.value?.best_value ?? taskStatus.value?.best_auc)
@@ -305,6 +308,7 @@ async function runRetrieve() {
     }
     contextGeneration += 1
     invalidateTrainingStream()
+    invalidatePrediction()
     const generation = contextGeneration
     retrieveResult.value = result
     taskId.value = result.task_id
@@ -312,7 +316,6 @@ async function runRetrieve() {
     taskStatus.value = null
     liveMetric.value = null
     trainEvents.value = []
-    predictionResult.value = null
     ElMessage.success('数据提取完成')
     await refreshTask(result.task_id, generation)
   } catch (error) {
@@ -441,19 +444,46 @@ function selectModel(model: WorkflowModelRecord) {
 }
 
 async function runPrediction() {
+  if (!canPredict.value) return
+  const expectedModelId = predictForm.model_version
+  const jsonSnapshot = predictFeatureJson.value
+  const expectedTaskId = taskId.value
+  const expectedContextGeneration = contextGeneration
+  const activePredictionGeneration = ++predictionGeneration
   predicting.value = true
   errorMessage.value = ''
   infoMessage.value = ''
   predictionResult.value = null
   try {
-    predictionResult.value = await workflowApi.predict({
-      model_version: predictForm.model_version,
-      features: JSON.parse(predictFeatureJson.value) as Record<string, unknown>,
+    const response = await workflowApi.predict({
+      model_version: expectedModelId,
+      features: JSON.parse(jsonSnapshot) as Record<string, unknown>,
     })
+    if (!isCurrentPrediction(
+      activePredictionGeneration,
+      expectedModelId,
+      jsonSnapshot,
+      expectedTaskId,
+      expectedContextGeneration,
+    )) return
+    predictionResult.value = response
   } catch (error) {
+    if (!isCurrentPrediction(
+      activePredictionGeneration,
+      expectedModelId,
+      jsonSnapshot,
+      expectedTaskId,
+      expectedContextGeneration,
+    )) return
     errorMessage.value = error instanceof Error ? error.message : '预测失败，请检查 JSON 和模型版本'
   } finally {
-    predicting.value = false
+    if (isCurrentPrediction(
+      activePredictionGeneration,
+      expectedModelId,
+      jsonSnapshot,
+      expectedTaskId,
+      expectedContextGeneration,
+    )) predicting.value = false
   }
 }
 
@@ -525,6 +555,27 @@ function isCurrentStream(expectedTaskId: string, generation: number, expectedStr
   return isCurrentContext(expectedTaskId, generation) && streamGeneration === expectedStreamGeneration
 }
 
+function isCurrentPrediction(
+  expectedPredictionGeneration: number,
+  expectedModelId: string,
+  expectedJson: string,
+  expectedTaskId: string,
+  expectedContextGeneration: number,
+) {
+  return predictionGeneration === expectedPredictionGeneration
+    && predictForm.model_version === expectedModelId
+    && predictFeatureJson.value === expectedJson
+    && taskId.value === expectedTaskId
+    && contextGeneration === expectedContextGeneration
+}
+
+function invalidatePrediction() {
+  predictionGeneration += 1
+  predictionResult.value = null
+  predicting.value = false
+  errorMessage.value = ''
+}
+
 function closeTrainingStream(expectedController?: AbortController) {
   if (streamController && (!expectedController || streamController === expectedController)) {
     streamController.abort()
@@ -541,21 +592,18 @@ function invalidateTrainingStream() {
 function handleProblemTypeChange() {
   contextGeneration += 1
   invalidateTrainingStream()
+  invalidatePrediction()
   taskStatus.value = null
   liveMetric.value = null
   trainEvents.value = []
   predictForm.model_version = ''
-  predictionResult.value = null
-  errorMessage.value = ''
   infoMessage.value = ''
 }
 
 onMounted(loadModels)
 onBeforeUnmount(closeTrainingStream)
 
-watch(() => predictForm.model_version, () => {
-  predictionResult.value = null
-})
+watch([() => predictForm.model_version, predictFeatureJson], invalidatePrediction)
 </script>
 
 <style scoped>
