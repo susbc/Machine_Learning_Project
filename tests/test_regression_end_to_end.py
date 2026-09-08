@@ -90,18 +90,24 @@ def _prepare_workflow_input(root: Path, frame: pd.DataFrame) -> str:
     task_dir = root / "output" / task_id
     task_dir.mkdir(parents=True)
     frame.to_parquet(task_dir / "raw_data.parquet", index=False)
-    (task_dir / "eda_summary.json").write_text(
-        json.dumps(
-            {"target": "price", "user_query": "预测连续价格"},
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+    partition = workflow._build_workflow_partition(frame, "price", "auto")
+    train_frame = frame.iloc[partition["train_positions"]].copy()
+    eda_summary = workflow._build_workflow_eda_summary(
+        train_frame,
+        "price",
+        partition=partition,
+        source_rows=len(frame),
+        user_query="预测连续价格",
     )
     strategy = FeatureStrategy(
         actions=[FeatureAction(column="x", action="fillna_mean", reason="保留数值特征")]
     )
-    (task_dir / "feature_strategy.json").write_text(
-        strategy.model_dump_json(), encoding="utf-8"
+    workflow._persist_workflow_selection(
+        task_dir,
+        partition,
+        eda_summary,
+        strategy,
+        "保留数值特征",
     )
     return task_id
 
@@ -343,7 +349,17 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
     ]
     assert workflow_artifact.get("confusion_matrix") is None
     assert workflow_artifact.get("threshold_calibration") is None
-    (tmp_path / "output" / workflow_task_id / "workflow_state.json").unlink()
+    workflow_state_path = tmp_path / "output" / workflow_task_id / "workflow_state.json"
+    committed_workflow_state = json.loads(workflow_state_path.read_text(encoding="utf-8"))
+    workflow_state_path.unlink()
+    uncommitted_status = client.get(f"/api/workflow/task/{workflow_task_id}/status")
+    assert uncommitted_status.status_code == 200, uncommitted_status.text
+    assert uncommitted_status.json()["status"] != "completed"
+    assert f"workflow:model_{workflow_task_id}" not in {
+        item["model_id"] for item in client.get("/api/models").json()["models"]
+    }
+
+    workflow._write_workflow_state(workflow_task_id, committed_workflow_state)
     artifact_restored_status = client.get(f"/api/workflow/task/{workflow_task_id}/status")
     assert artifact_restored_status.status_code == 200, artifact_restored_status.text
     assert artifact_restored_status.json()["status"] == "completed"
