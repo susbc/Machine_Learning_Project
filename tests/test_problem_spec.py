@@ -161,8 +161,15 @@ def test_regression_capabilities_and_metric_direction():
     assert resolve_metric(spec, "auto") == "rmse"
     assert spec.metric_directions["rmse"] == "minimize"
     assert "linear_regression" in spec.algorithms
-    with pytest.raises(ProblemSpecError, match="logistic_regression"):
+    with pytest.raises(ProblemSpecError) as caught:
         validate_algorithm(spec, "logistic_regression")
+    assert caught.value.as_detail() == {
+        "code": "incompatible_algorithm",
+        "field": "algorithm",
+        "message": "算法 logistic_regression 不适用于 regression",
+        "received": "logistic_regression",
+        "allowed": ["lightgbm", "xgboost", "catboost", "random_forest", "linear_regression"],
+    }
     assert capabilities_payload()["problem_types"]["regression"]["default_metric"] == "rmse"
 
 

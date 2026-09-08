@@ -98,7 +98,7 @@ RESULT_BLOB_NAMESPACE = "training_job_results"
 class TrainingJobRequest(BaseModel):
     dataset_id: str
     algorithm: str
-    problem_type: str = "auto"
+    problem_type: Optional[str] = None
     params: Dict[str, Any] = Field(default_factory=dict)
     test_size: float = Field(0.3, ge=0.1, le=0.5)
     random_state: int = Field(42, ge=0, le=10000)
@@ -386,14 +386,26 @@ def _mark_cancelled(job: TrainingJob) -> bool:
     return True
 
 
+def _job_log_context(job: TrainingJob) -> tuple[str, str, str, str]:
+    """Return non-sensitive lifecycle log fields from the durable job snapshot."""
+    saved_spec = job.problem_spec if isinstance(job.problem_spec, dict) else {}
+    capabilities = saved_spec.get("capabilities") if isinstance(saved_spec.get("capabilities"), dict) else {}
+    return (
+        job.job_id,
+        str(saved_spec.get("resolved_type", "unknown")),
+        job.algorithm,
+        str(capabilities.get("default_metric", "unknown")),
+    )
+
+
 def _run_training_job(job_id: str, test_size: float, random_state: int) -> None:
     from model_code.model_factory import ModelFactory
     from sklearn.base import clone
     from sklearn.pipeline import Pipeline
 
     job = _get_job(job_id)
-    dataset = _get_dataset(job.dataset_id)
     try:
+        dataset = _get_dataset(job.dataset_id)
         with training_lock:
             job.status = "running"
             job.progress = 20
@@ -416,7 +428,11 @@ def _run_training_job(job_id: str, test_size: float, random_state: int) -> None:
         task_type = spec.resolved_type.value
         preprocessor = bundle.preprocessor
         model = ModelFactory.build(job.algorithm, task_type=task_type, params=with_runtime_params(job.algorithm, job.params))
-        calibration = None
+        calibration = None if spec.resolved_type == ProblemType.REGRESSION else {
+            "threshold": 0.5,
+            "source": "default",
+            "calibration_size": 0,
+        }
         if spec.resolved_type == ProblemType.BINARY:
             calibration = calibrate_binary_threshold(
                 Pipeline([("prep", clone(preprocessor)), ("model", clone(model))]),
@@ -482,8 +498,16 @@ def _run_training_job(job_id: str, test_size: float, random_state: int) -> None:
             job.progress = 100
             job.updated_at = _now()
         _persist_job(job)
+        logger.info(
+            "Manual training job completed: job_id=%s problem_type=%s algorithm=%s metric=%s",
+            *_job_log_context(job),
+        )
     except Exception as exc:
-        logger.exception("Manual training job failed: %s", exc)
+        logger.error(
+            "Manual training job failed: job_id=%s problem_type=%s algorithm=%s metric=%s error_type=%s",
+            *_job_log_context(job),
+            type(exc).__name__,
+        )
         with training_lock:
             job.status = "failed"
             job.error = str(exc)
@@ -546,7 +570,13 @@ async def run_training_eda(payload: EdaRequest):
 @router.post("/jobs", status_code=status.HTTP_201_CREATED)
 async def create_training_job(payload: TrainingJobRequest):
     dataset = _get_dataset(payload.dataset_id)
-    spec = _resolve_problem_spec_or_422(dataset.df[dataset.target_col], dataset.target_col, payload.problem_type)
+    if payload.problem_type is None:
+        try:
+            spec = ProblemSpec.from_dict(dataset.problem_spec)
+        except (KeyError, TypeError, ProblemSpecError):
+            spec = _resolve_problem_spec_or_422(dataset.df[dataset.target_col], dataset.target_col, "auto")
+    else:
+        spec = _resolve_problem_spec_or_422(dataset.df[dataset.target_col], dataset.target_col, payload.problem_type)
     try:
         validate_algorithm(spec, payload.algorithm)
         validate_train_test_split(spec, dataset.df[dataset.target_col], payload.test_size)
