@@ -635,9 +635,13 @@ async def retrieve_data(req: DataRetrievalRequest):
             "data_shape": list(df.shape)
         }
         
-    except Exception as e:
-        logger.error(f"步骤 1 失败：{e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("步骤 1 数据提取失败")
+        raise HTTPException(
+            status_code=500, detail="数据提取失败，请检查查询配置后重试"
+        ) from exc
 
 
 # ==================== 步骤 2: 特征策略生成 ====================
@@ -686,9 +690,13 @@ async def generate_features(req: FeatureGenerationRequest):
             "actions_count": len(strategy_obj.actions)
         }
         
-    except Exception as e:
-        logger.error(f"步骤 2 失败：{e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("步骤 2 特征策略生成失败 task_id=%s", req.task_id)
+        raise HTTPException(
+            status_code=500, detail="特征策略生成失败，请检查任务配置后重试"
+        ) from exc
 
 
 # ==================== 步骤 3: 训练 + SSE 推送 ====================
@@ -1200,9 +1208,11 @@ async def predict_online(req: PredictRequest):
 
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"预测失败：{e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.exception("工作流预测失败 model_version=%s", req.model_version)
+        raise HTTPException(
+            status_code=500, detail="模型预测失败，请检查输入后重试"
+        ) from exc
 
 
 # ==================== 辅助接口 ====================

@@ -96,6 +96,56 @@ def test_workflow_predict_uses_shared_inference_and_returns_original_label(tmp_p
     assert payload["probability"] is None or 0.0 <= payload["probability"] <= 1.0
 
 
+def test_workflow_public_endpoints_do_not_expose_internal_exception_paths(tmp_path, monkeypatch):
+    unsafe_error = RuntimeError("unsafe /private/server/secret.parquet")
+    monkeypatch.setattr(
+        workflow.orchestrator,
+        "run_data_retrieval_agent",
+        lambda *args, **kwargs: (_ for _ in ()).throw(unsafe_error),
+    )
+    retrieve = TestClient(app).post(
+        "/api/workflow/step1_retrieve_data",
+        json={"user_query": "查询订单", "target_col": "is_fraud"},
+    )
+
+    task_id = "task_ab12cd34"
+    task_dir = tmp_path / "output" / task_id
+    task_dir.mkdir(parents=True)
+    (task_dir / "eda_summary.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(
+        workflow.orchestrator,
+        "run_feature_agent",
+        lambda *args, **kwargs: (_ for _ in ()).throw(unsafe_error),
+    )
+    features = TestClient(app).post(
+        "/api/workflow/step2_generate_features",
+        json={"task_id": task_id, "eda_report_text": ""},
+    )
+
+    saved_dir = tmp_path / "saved"
+    saved_dir.mkdir()
+    (saved_dir / f"model_{task_id}.pkl").write_bytes(b"broken")
+    monkeypatch.setattr(workflow, "SAVED_DIR", saved_dir)
+    monkeypatch.setattr(
+        workflow.joblib,
+        "load",
+        lambda path: (_ for _ in ()).throw(unsafe_error),
+    )
+    prediction = TestClient(app).post(
+        "/api/workflow/predict",
+        json={"model_version": task_id, "features": {"age": 55}},
+    )
+
+    assert retrieve.status_code == 500
+    assert retrieve.json()["detail"] == "数据提取失败，请检查查询配置后重试"
+    assert features.status_code == 500
+    assert features.json()["detail"] == "特征策略生成失败，请检查任务配置后重试"
+    assert prediction.status_code == 500
+    assert prediction.json()["detail"] == "模型预测失败，请检查输入后重试"
+    assert all("/private/" not in response.text for response in (retrieve, features, prediction))
+
+
 def _prepare_workflow_task(tmp_path) -> str:
     task_id = "task_ab12cd34"
     task_dir = tmp_path / "output" / task_id
