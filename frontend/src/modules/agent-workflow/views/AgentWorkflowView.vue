@@ -38,8 +38,36 @@
         <strong>{{ stepState.features }}</strong>
       </div>
       <div class="status-item">
-        <span>Best AUC</span>
-        <strong>{{ taskStatus?.best_auc?.toFixed(4) ?? '-' }}</strong>
+        <span>{{ metricLabel(taskMetricName) }}</span>
+        <strong>{{ formatMetric(taskMetricValue) }}</strong>
+      </div>
+    </section>
+
+    <section v-if="taskStatus?.problem_spec" class="panel problem-spec-panel" aria-live="polite">
+      <div class="panel-title">
+        <h3>任务类型解析</h3>
+        <el-tag :type="taskStatus.problem_spec.resolved_type === 'regression' ? 'warning' : 'primary'" effect="light">
+          最终：{{ problemTypeLabel(taskStatus.problem_spec.resolved_type) }}
+        </el-tag>
+      </div>
+      <div class="problem-spec-summary">
+        <strong v-if="taskStatus.suggested_type">建议：{{ problemTypeLabel(taskStatus.suggested_type) }}</strong>
+        <span>最终：{{ problemTypeLabel(taskStatus.problem_spec.resolved_type) }}</span>
+        <span>来源：{{ problemSourceLabel(taskStatus.problem_spec.source) }}</span>
+        <span>依据：{{ taskStatus.problem_spec.reason }}</span>
+        <span>{{ taskStatus.problem_spec.explanation }}</span>
+        <span>
+          目标列 {{ taskStatus.problem_spec.target.column }}（{{ taskStatus.problem_spec.target.dtype }}），
+          有效行 {{ taskStatus.problem_spec.target.valid_rows }}，唯一值 {{ taskStatus.problem_spec.target.unique_count }}
+        </span>
+      </div>
+      <div v-if="taskStatus.agent_corrections?.length" class="correction-list">
+        <h4>Agent 配置修正</h4>
+        <div v-for="(correction, index) in taskStatus.agent_corrections" :key="`${correction.field}-${index}`" class="correction-item">
+          <strong>{{ correction.field }}</strong>
+          <span>{{ formatCorrectionValue(correction.suggested) }} → {{ formatCorrectionValue(correction.resolved) }}</span>
+          <small>{{ correction.reason }}</small>
+        </div>
       </div>
     </section>
 
@@ -100,6 +128,15 @@
           <span>{{ trainEvents.length }} 条事件</span>
         </div>
         <div class="train-controls">
+          <label class="train-field">
+            <span>问题类型</span>
+            <el-select v-model="problemType" aria-label="工作流问题类型">
+              <el-option label="自动识别" value="auto" />
+              <el-option label="二分类" value="binary_classification" />
+              <el-option label="多分类" value="multiclass_classification" />
+              <el-option label="回归" value="regression" />
+            </el-select>
+          </label>
           <el-input-number v-model="trainConfig.nTrials" :min="10" :max="100" controls-position="right" />
           <el-input-number v-model="trainConfig.cvFolds" :min="3" :max="10" controls-position="right" />
           <el-button type="warning" :loading="training" :disabled="!canTrain" @click="startTraining">开始训练</el-button>
@@ -108,8 +145,8 @@
         <el-table :data="trainEvents" height="240" class="event-table">
           <el-table-column prop="status" label="状态" width="120" />
           <el-table-column prop="trial" label="Trial" width="90" />
-          <el-table-column label="Best" width="120">
-            <template #default="{ row }">{{ formatMetric(row.best_value) }}</template>
+          <el-table-column label="最佳指标" width="160">
+            <template #default="{ row }">{{ metricLabel(row.best_metric ?? row.metric) }} {{ formatMetric(row.best_value) }}</template>
           </el-table-column>
           <el-table-column prop="msg" label="消息" />
         </el-table>
@@ -125,11 +162,25 @@
         </el-select>
         <el-input v-model="predictFeatureJson" class="predict-json" type="textarea" :rows="7" />
         <el-button type="primary" :loading="predicting" :disabled="!canPredict" @click="runPrediction">执行预测</el-button>
-        <div v-if="predictionResult" class="prediction-result">
+        <div v-if="predictionResult" class="prediction-result" aria-live="polite">
           <span>预测值</span>
           <strong>{{ predictionResult.prediction }}</strong>
-          <span>概率</span>
-          <strong>{{ predictionResult.probability == null ? '-' : predictionResult.probability.toFixed(4) }}</strong>
+          <template v-if="!isRegressionWorkflow && predictionResult.encoded_prediction != null">
+            <span>类别编码</span>
+            <strong>{{ predictionResult.encoded_prediction }}</strong>
+          </template>
+          <template v-if="!isRegressionWorkflow && predictionResult.probability != null">
+            <span>预测概率</span>
+            <strong>{{ formatMetric(predictionResult.probability) }}</strong>
+          </template>
+          <div v-if="hasPredictionDiagnostics" class="prediction-diagnostics" role="status">
+            <span v-if="predictionResult.diagnostics?.unknown_input_keys.length">
+              未知输入字段：{{ predictionResult.diagnostics.unknown_input_keys.join('、') }}
+            </span>
+            <span v-if="predictionResult.diagnostics?.missing_columns_imputed.length">
+              已补齐缺失字段：{{ predictionResult.diagnostics.missing_columns_imputed.join('、') }}
+            </span>
+          </div>
         </div>
       </section>
     </div>
@@ -148,12 +199,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { List, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 
 import {
   workflowApi,
+  type AgentCorrectionValue,
   type WorkflowFeatureAction,
   type WorkflowFeatureResponse,
   type WorkflowModelRecord,
@@ -162,6 +214,7 @@ import {
   type WorkflowTaskStatus,
   type WorkflowTrainEvent,
 } from '@/api/workflow'
+import type { ProblemSpec, ProblemType } from '@/api/problem'
 
 const retrieveForm = reactive({
   user_query: '查询所有司机订单数据，并包含司机年龄和城市信息',
@@ -175,6 +228,7 @@ const predictForm = reactive({
   model_version: '',
 })
 const featureMemo = ref('')
+const problemType = ref<ProblemType>('auto')
 const predictFeatureJson = ref('{\n  "order_fee": 128.5,\n  "age": 35,\n  "city_code": "北京"\n}')
 const taskId = ref('')
 const retrieveResult = ref<WorkflowRetrieveResponse | null>(null)
@@ -202,6 +256,13 @@ const canGenerateFeatures = computed(() => Boolean(taskId.value) && !generatingF
 const canTrain = computed(() => Boolean(taskId.value && featureResult.value) && !training.value)
 const canPredict = computed(() => Boolean(predictForm.model_version && predictFeatureJson.value.trim()))
 const featureActions = computed<WorkflowFeatureAction[]>(() => featureResult.value?.strategy?.actions ?? [])
+const taskMetricName = computed(() => taskStatus.value?.best_metric ?? (typeof taskStatus.value?.best_auc === 'number' ? 'roc_auc' : undefined))
+const taskMetricValue = computed(() => taskStatus.value?.best_value ?? taskStatus.value?.best_auc)
+const isRegressionWorkflow = computed(() => taskStatus.value?.problem_spec?.resolved_type === 'regression')
+const hasPredictionDiagnostics = computed(() => Boolean(
+  predictionResult.value?.diagnostics?.unknown_input_keys.length
+  || predictionResult.value?.diagnostics?.missing_columns_imputed.length,
+))
 const trainingProgress = computed(() => {
   if (trainEvents.value.some((event) => event.status === 'DONE')) return 100
   const latestTrial = trainEvents.value.reduce((max, event) => Math.max(max, Number(event.trial ?? 0)), 0)
@@ -222,6 +283,7 @@ async function runRetrieve() {
     retrieveResult.value = result
     taskId.value = result.task_id
     featureResult.value = null
+    taskStatus.value = null
     trainEvents.value = []
     predictionResult.value = null
     ElMessage.success('数据提取完成')
@@ -261,8 +323,9 @@ function startTraining() {
   infoMessage.value = ''
   const controller = new AbortController()
   streamController = controller
-  void workflowApi.streamTraining(taskId.value, trainConfig.nTrials, trainConfig.cvFolds, async (payload: WorkflowTrainEvent) => {
+  void workflowApi.streamTraining(taskId.value, trainConfig.nTrials, trainConfig.cvFolds, problemType.value, async (payload: WorkflowTrainEvent) => {
     trainEvents.value.unshift(payload)
+    applyTrainingMetadata(payload)
     if (payload.status === 'DONE') {
       training.value = false
       closeTrainingStream()
@@ -330,6 +393,7 @@ async function runPrediction() {
   predicting.value = true
   errorMessage.value = ''
   infoMessage.value = ''
+  predictionResult.value = null
   try {
     predictionResult.value = await workflowApi.predict({
       model_version: predictForm.model_version,
@@ -346,6 +410,57 @@ function formatMetric(value: number | null | undefined) {
   return typeof value === 'number' ? value.toFixed(4) : '-'
 }
 
+function applyTrainingMetadata(payload: WorkflowTrainEvent) {
+  if (!payload.problem_spec && !payload.best_metric && payload.best_value == null) return
+  const current = taskStatus.value ?? { task_id: taskId.value, status: 'running' }
+  taskStatus.value = {
+    ...current,
+    ...(payload.problem_spec ? { problem_spec: payload.problem_spec } : {}),
+    ...(payload.suggested_type !== undefined ? { suggested_type: payload.suggested_type } : {}),
+    ...(payload.agent_corrections ? { agent_corrections: payload.agent_corrections } : {}),
+    ...(payload.best_metric ? { best_metric: payload.best_metric } : {}),
+    ...(payload.best_value != null ? { best_value: payload.best_value } : {}),
+  }
+}
+
+function metricLabel(metric: string | undefined) {
+  const labels: Record<string, string> = {
+    roc_auc: 'ROC-AUC',
+    val_auc: 'ROC-AUC',
+    accuracy: 'Accuracy',
+    f1: 'F1',
+    rmse: 'RMSE',
+    mae: 'MAE',
+    r2: 'R²',
+  }
+  return metric ? (labels[metric] ?? metric.toUpperCase()) : '最佳指标'
+}
+
+function problemTypeLabel(value: string) {
+  const labels: Record<string, string> = {
+    auto: '自动识别',
+    binary_classification: '二分类',
+    multiclass_classification: '多分类',
+    regression: '回归',
+  }
+  return labels[value] ?? value
+}
+
+function problemSourceLabel(source: ProblemSpec['source']) {
+  const labels: Record<ProblemSpec['source'], string> = {
+    auto_inferred: '自动推断',
+    user_override: '用户指定',
+    legacy_compatibility: '旧模型兼容',
+  }
+  return labels[source]
+}
+
+function formatCorrectionValue(value: AgentCorrectionValue) {
+  if (value === null) return '无'
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return JSON.stringify(value)
+}
+
 function closeTrainingStream() {
   if (streamController) {
     streamController.abort()
@@ -355,6 +470,10 @@ function closeTrainingStream() {
 
 onMounted(loadModels)
 onBeforeUnmount(closeTrainingStream)
+
+watch(() => predictForm.model_version, () => {
+  predictionResult.value = null
+})
 </script>
 
 <style scoped>
@@ -451,6 +570,53 @@ onBeforeUnmount(closeTrainingStream)
 .train-controls {
   flex-wrap: wrap;
   margin-bottom: 14px;
+}
+
+.train-field {
+  display: grid;
+  min-width: 160px;
+  gap: 4px;
+}
+
+.train-field > span {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.problem-spec-summary,
+.correction-list,
+.correction-item,
+.prediction-diagnostics {
+  display: grid;
+  gap: 7px;
+}
+
+.problem-spec-summary span,
+.correction-item span,
+.correction-item small,
+.prediction-diagnostics span {
+  color: #475569;
+}
+
+.correction-list {
+  margin-top: 16px;
+}
+
+.correction-list h4 {
+  margin: 0;
+  color: #0f172a;
+}
+
+.correction-item {
+  border-left: 3px solid #f59e0b;
+  background: #fffbeb;
+  padding: 10px 12px;
+}
+
+.prediction-diagnostics {
+  margin-top: 8px;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 10px;
 }
 
 .prediction-result {

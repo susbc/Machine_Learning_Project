@@ -6,7 +6,15 @@
         <h2>预测实验室</h2>
         <p>选择已保存模型进行单条 JSON 预测，后续可扩展批量预测、阈值分析和结果导出。</p>
       </div>
-      <el-button plain :loading="loadingModels" @click="loadModels">刷新模型</el-button>
+      <el-button
+        data-testid="prediction-refresh-models"
+        aria-label="刷新预测模型"
+        plain
+        :loading="loadingModels"
+        @click="loadModels"
+      >
+        刷新模型
+      </el-button>
     </div>
 
     <el-alert v-if="errorMessage" type="error" :title="errorMessage" show-icon :closable="false" />
@@ -19,7 +27,7 @@
         </div>
         <label class="field-row">
           <span>模型版本</span>
-          <el-select v-model="selectedModelId" filterable placeholder="选择模型">
+          <el-select v-model="selectedModelId" aria-label="预测模型" filterable placeholder="选择模型">
             <el-option v-for="model in models" :key="model.model_id" :label="model.model_id" :value="model.model_id" />
           </el-select>
         </label>
@@ -27,14 +35,21 @@
           <el-tab-pane label="单条预测" name="single">
             <label class="field-row">
               <span>特征 JSON</span>
-              <el-input v-model="featureJson" type="textarea" :rows="8" />
+              <el-input v-model="featureJson" aria-label="特征 JSON" type="textarea" :rows="8" />
             </label>
             <el-button type="primary" :loading="predicting" :disabled="!canPredict" @click="runPrediction">执行预测</el-button>
           </el-tab-pane>
           <el-tab-pane label="批量预测" name="batch">
             <label class="field-row">
               <span>CSV 特征表</span>
-              <input class="file-input" type="file" accept=".csv,text/csv" @change="onCsvSelected" />
+              <input
+                data-testid="prediction-csv-input"
+                aria-label="CSV 特征表"
+                class="file-input"
+                type="file"
+                accept=".csv,text/csv"
+                @change="onCsvSelected"
+              />
             </label>
             <div class="batch-preview">
               <span>已解析 {{ batchRows.length }} 行</span>
@@ -51,11 +66,25 @@
           <h3>预测结果</h3>
           <span>{{ predictionResult?.source ?? '等待预测' }}</span>
         </div>
-        <div v-if="predictionResult" class="result-card">
+        <div v-if="predictionResult" class="result-card" aria-live="polite">
           <span>预测值</span>
           <strong>{{ predictionResult.prediction }}</strong>
-          <span>概率</span>
-          <strong>{{ predictionResult.probability == null ? '-' : predictionResult.probability.toFixed(4) }}</strong>
+          <template v-if="!isRegressionModel && predictionResult.encoded_prediction != null">
+            <span>类别编码</span>
+            <strong>{{ predictionResult.encoded_prediction }}</strong>
+          </template>
+          <template v-if="!isRegressionModel && predictionResult.probability != null">
+            <span>预测概率</span>
+            <strong>{{ formatMetric(predictionResult.probability) }}</strong>
+          </template>
+          <div v-if="hasDiagnostics(predictionResult.diagnostics)" class="diagnostics" role="status">
+            <span v-if="predictionResult.diagnostics.unknown_input_keys.length">
+              未知输入字段：{{ predictionResult.diagnostics.unknown_input_keys.join('、') }}
+            </span>
+            <span v-if="predictionResult.diagnostics.missing_columns_imputed.length">
+              已补齐缺失字段：{{ predictionResult.diagnostics.missing_columns_imputed.join('、') }}
+            </span>
+          </div>
         </div>
         <el-empty v-else description="暂无预测结果" />
       </section>
@@ -66,7 +95,7 @@
         <h3>批量结果</h3>
         <span>{{ batchResult.summary.count }} 行</span>
       </div>
-      <div class="summary-grid">
+      <div v-if="!isRegressionModel" class="summary-grid">
         <div>
           <span>正例占比</span>
           <strong>{{ formatMetric(batchResult.summary.positive_rate) }}</strong>
@@ -79,8 +108,18 @@
       <el-table :data="batchResult.rows" height="360">
         <el-table-column prop="index" label="#" width="80" />
         <el-table-column prop="prediction" label="预测值" width="120" />
-        <el-table-column label="概率" width="140">
-          <template #default="{ row }">{{ row.probability == null ? '-' : row.probability.toFixed(4) }}</template>
+        <el-table-column v-if="!isRegressionModel" prop="encoded_prediction" label="类别编码" width="110" />
+        <el-table-column v-if="!isRegressionModel" label="预测概率" width="140">
+          <template #default="{ row }">{{ formatMetric(row.probability) }}</template>
+        </el-table-column>
+        <el-table-column label="输入诊断" min-width="180">
+          <template #default="{ row }">
+            <div v-if="hasDiagnostics(row.diagnostics)" class="row-diagnostics">
+              <span v-if="row.diagnostics.unknown_input_keys.length">未知：{{ row.diagnostics.unknown_input_keys.join('、') }}</span>
+              <span v-if="row.diagnostics.missing_columns_imputed.length">缺失：{{ row.diagnostics.missing_columns_imputed.join('、') }}</span>
+            </div>
+            <span v-else>-</span>
+          </template>
         </el-table-column>
         <el-table-column label="输入特征">
           <template #default="{ row }">{{ JSON.stringify(row.features) }}</template>
@@ -91,9 +130,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 
-import { modelsApi, type ModelBatchPredictionResponse, type ModelPredictionResponse, type ModelRegistryRecord } from '@/api/models'
+import {
+  modelsApi,
+  type ModelBatchPredictionResponse,
+  type ModelPredictionResponse,
+  type ModelRegistryRecord,
+  type PredictionDiagnostics,
+} from '@/api/models'
 
 const models = ref<ModelRegistryRecord[]>([])
 const selectedModelId = ref('')
@@ -106,19 +151,29 @@ const loadingModels = ref(false)
 const predicting = ref(false)
 const batchPredicting = ref(false)
 const errorMessage = ref('')
+let predictionRequestGeneration = 0
+let batchRequestGeneration = 0
 
 const canPredict = computed(() => Boolean(selectedModelId.value && featureJson.value.trim()))
 const canBatchPredict = computed(() => Boolean(selectedModelId.value && batchRows.value.length > 0))
+const selectedModel = computed(() => models.value.find((model) => model.model_id === selectedModelId.value) ?? null)
+const isRegressionModel = computed(() => selectedModel.value?.problem_type === 'regression')
 
 async function loadModels() {
   loadingModels.value = true
   errorMessage.value = ''
   try {
-    models.value = (await modelsApi.listModels()).models.filter((model) => model.source !== 'legacy')
-    if (!selectedModelId.value && models.value[0]) {
-      selectedModelId.value = models.value[0].model_id
-    }
+    const records = (await modelsApi.listModels()).models
+      .filter((model) => !model.legacy && !model.metadata_error)
+    models.value = records
+    selectedModelId.value = records.some((model) => model.model_id === selectedModelId.value)
+      ? selectedModelId.value
+      : (records[0]?.model_id ?? '')
+    clearResults()
   } catch (error) {
+    models.value = []
+    selectedModelId.value = ''
+    clearResults()
     errorMessage.value = error instanceof Error ? error.message : '模型列表加载失败'
   } finally {
     loadingModels.value = false
@@ -126,16 +181,27 @@ async function loadModels() {
 }
 
 async function runPrediction() {
+  const requestGeneration = ++predictionRequestGeneration
+  const requestedModelId = selectedModelId.value
+  const requestedFeatureJson = featureJson.value
   predicting.value = true
   errorMessage.value = ''
+  predictionResult.value = null
   try {
-    predictionResult.value = await modelsApi.predict(selectedModelId.value, {
-      features: JSON.parse(featureJson.value) as Record<string, unknown>,
+    const result = await modelsApi.predict(requestedModelId, {
+      features: JSON.parse(requestedFeatureJson) as Record<string, unknown>,
     })
+    if (
+      requestGeneration !== predictionRequestGeneration
+      || requestedModelId !== selectedModelId.value
+      || requestedFeatureJson !== featureJson.value
+    ) return
+    predictionResult.value = result
   } catch (error) {
+    if (requestGeneration !== predictionRequestGeneration) return
     errorMessage.value = error instanceof Error ? error.message : '预测失败，请检查模型和 JSON'
   } finally {
-    predicting.value = false
+    if (requestGeneration === predictionRequestGeneration) predicting.value = false
   }
 }
 
@@ -172,6 +238,7 @@ function coerceCsvValue(value: string): unknown {
 }
 
 function parseCsvText(text: string) {
+  invalidateBatchResult()
   const lines = text
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -194,25 +261,68 @@ function parseCsvText(text: string) {
 async function onCsvSelected(event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
-  if (!file) return
+  if (!file) {
+    batchRows.value = []
+    invalidateBatchResult()
+    return
+  }
   parseCsvText(await file.text())
 }
 
 async function runBatchPrediction() {
+  const requestGeneration = ++batchRequestGeneration
+  const requestedModelId = selectedModelId.value
+  const requestedRows = batchRows.value
   batchPredicting.value = true
   errorMessage.value = ''
+  batchResult.value = null
   try {
-    batchResult.value = await modelsApi.batchPredict(selectedModelId.value, { rows: batchRows.value })
+    const result = await modelsApi.batchPredict(requestedModelId, { rows: requestedRows })
+    if (
+      requestGeneration !== batchRequestGeneration
+      || requestedModelId !== selectedModelId.value
+      || requestedRows !== batchRows.value
+    ) return
+    batchResult.value = result
   } catch (error) {
+    if (requestGeneration !== batchRequestGeneration) return
     errorMessage.value = error instanceof Error ? error.message : '批量预测失败，请检查模型和 CSV'
   } finally {
-    batchPredicting.value = false
+    if (requestGeneration === batchRequestGeneration) batchPredicting.value = false
   }
 }
 
-function formatMetric(value: number | null) {
+function formatMetric(value: number | null | undefined) {
   return typeof value === 'number' ? value.toFixed(4) : '-'
 }
+
+function hasDiagnostics(diagnostics: PredictionDiagnostics | null | undefined) {
+  return Boolean(diagnostics?.unknown_input_keys.length || diagnostics?.missing_columns_imputed.length)
+}
+
+function clearResults() {
+  predictionRequestGeneration += 1
+  batchRequestGeneration += 1
+  predictionResult.value = null
+  batchResult.value = null
+  predicting.value = false
+  batchPredicting.value = false
+}
+
+function invalidateSingleResult() {
+  predictionRequestGeneration += 1
+  predictionResult.value = null
+  predicting.value = false
+}
+
+function invalidateBatchResult() {
+  batchRequestGeneration += 1
+  batchResult.value = null
+  batchPredicting.value = false
+}
+
+watch(selectedModelId, clearResults)
+watch(featureJson, invalidateSingleResult)
 
 onMounted(loadModels)
 </script>
@@ -306,6 +416,24 @@ onMounted(loadModels)
 .result-card strong {
   color: #0f172a;
   font-size: 28px;
+}
+
+.diagnostics,
+.row-diagnostics {
+  display: grid;
+  gap: 6px;
+}
+
+.diagnostics {
+  margin-top: 8px;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 12px;
+}
+
+.diagnostics span,
+.row-diagnostics span {
+  color: #475569;
+  font-size: 12px;
 }
 
 .summary-grid {
