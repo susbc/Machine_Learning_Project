@@ -20,7 +20,7 @@ import backend.api.models as model_registry
 import backend.api.training as manual_training
 import backend.api.workflow as workflow
 from backend.main import app
-from backend.runtime_state import RuntimeStateStore, background_tasks
+from backend.runtime_state import BoundedTaskExecutor, RuntimeStateStore
 from core.llm.agent_schemas import FeatureAction, FeatureStrategy
 
 
@@ -50,6 +50,7 @@ def _wait_for_job(
     client: TestClient,
     status_path: str,
     *,
+    executor: BoundedTaskExecutor,
     task_key: str,
     timeout: float = 15.0,
 ) -> dict:
@@ -64,9 +65,11 @@ def _wait_for_job(
                 raise AssertionError(
                     f"Regression training ended as {last['status']}: {last.get('error')}"
                 )
-            while background_tasks.is_active(task_key) and time.monotonic() < deadline:
+            while executor.is_active(task_key) and time.monotonic() < deadline:
                 time.sleep(0.01)
-            assert not background_tasks.is_active(task_key), f"Background task did not exit: {task_key}"
+            assert not executor.is_active(task_key), (
+                f"Background task did not exit: {task_key}"
+            )
             return last
         time.sleep(0.05)
     raise AssertionError(f"Regression training timed out: {last}")
@@ -122,21 +125,26 @@ def _workflow_events(client: TestClient, task_id: str) -> list[dict]:
         ]
 
 
-def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
-    tmp_path, monkeypatch
-):
-    """Catches any break in regression train, recovery, registry, or inference."""
+@pytest.fixture
+def isolated_services(tmp_path, monkeypatch):
     runtime_store = RuntimeStateStore(tmp_path / "runtime_state")
+    monkeypatch.setenv("ML_BACKGROUND_WORKERS", "1")
+    monkeypatch.setenv("ML_MAX_PENDING_JOBS", "4")
+    manual_executor = BoundedTaskExecutor()
+    automl_executor = BoundedTaskExecutor()
+
     monkeypatch.setattr(manual_training, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(
         manual_training, "ARTIFACT_DIR", tmp_path / "saved" / "manual_training"
     )
     monkeypatch.setattr(manual_training, "runtime_state", runtime_store)
+    monkeypatch.setattr(manual_training, "background_tasks", manual_executor)
     monkeypatch.setattr(manual_training, "training_datasets", {})
     monkeypatch.setattr(manual_training, "training_jobs", {})
     monkeypatch.setattr(automl_api, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(automl_api, "ARTIFACT_DIR", tmp_path / "saved" / "automl")
     monkeypatch.setattr(automl_api, "runtime_state", runtime_store)
+    monkeypatch.setattr(automl_api, "background_tasks", automl_executor)
     monkeypatch.setattr(automl_api, "automl_jobs", {})
     monkeypatch.setattr(workflow, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
@@ -155,8 +163,20 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
         },
     )
 
+    try:
+        with TestClient(app) as client:
+            yield client, manual_executor, automl_executor
+    finally:
+        manual_executor._executor.shutdown(wait=True, cancel_futures=True)
+        automl_executor._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
+    tmp_path, isolated_services
+):
+    """Catches any break in regression train, recovery, registry, or inference."""
+    client, manual_executor, automl_executor = isolated_services
     frame = _linear_frame()
-    client = TestClient(app)
 
     upload = client.post(
         "/api/training/datasets",
@@ -168,7 +188,27 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
     assert uploaded["problem_spec"]["requested_type"] == "auto"
     assert uploaded["problem_spec"]["resolved_type"] == "regression"
     assert uploaded["problem_spec"]["source"] == "auto_inferred"
-    assert uploaded["problem_spec"]["capabilities"]["metrics"] == ["rmse", "mae", "r2"]
+    assert uploaded["problem_spec"]["reason"] == "numeric_continuous_target"
+    assert (
+        uploaded["problem_spec"]["explanation"]
+        == "数值目标具有连续取值，识别为回归任务"
+    )
+    assert uploaded["problem_spec"]["capabilities"] == {
+        "algorithms": [
+            "lightgbm",
+            "xgboost",
+            "catboost",
+            "random_forest",
+            "linear_regression",
+        ],
+        "metrics": ["rmse", "mae", "r2"],
+        "default_metric": "rmse",
+        "metric_directions": {
+            "rmse": "minimize",
+            "mae": "minimize",
+            "r2": "maximize",
+        },
+    }
 
     created = client.post(
         "/api/training/jobs",
@@ -186,6 +226,7 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
     _wait_for_job(
         client,
         f"/api/training/jobs/{manual_job_id}",
+        executor=manual_executor,
         task_key=f"training-{manual_job_id}",
     )
 
@@ -233,6 +274,7 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
     _wait_for_job(
         client,
         f"/api/automl/jobs/{automl_job_id}",
+        executor=automl_executor,
         task_key=f"automl-{automl_job_id}",
     )
 
@@ -254,6 +296,14 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
     events = _workflow_events(client, workflow_task_id)
     assert events
     assert all(event["status"] != "ERROR" for event in events)
+    running_events = [event for event in events if event["status"] == "RUNNING"]
+    assert running_events
+    assert any(
+        event["metric"] == "rmse"
+        and math.isfinite(event["value"])
+        and math.isfinite(event["best_value"])
+        for event in running_events
+    )
     workflow_done = events[-1]
     assert workflow_done["status"] == "DONE"
     assert workflow_done["problem_spec"]["requested_type"] == "auto"
@@ -263,21 +313,47 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
     assert workflow_done["selected_algorithm"] == "linear_regression"
     assert math.isfinite(workflow_done["best_value"])
     assert workflow_done["best_value"] == pytest.approx(0.0, abs=1e-10)
+    _assert_exact_linear_metrics(workflow_done["metrics"])
+    assert workflow_done["metrics_evaluation"] == {
+        "scope": "training_data",
+        "rows": 120,
+    }
+    assert workflow_done.get("confusion_matrix") is None
+    assert workflow_done.get("threshold_calibration") is None
 
     workflow_status = client.get(f"/api/workflow/task/{workflow_task_id}/status")
     assert workflow_status.status_code == 200, workflow_status.text
     assert workflow_status.json()["status"] == "completed"
     assert workflow_status.json()["problem_spec"]["resolved_type"] == "regression"
+    assert workflow_status.json()["metrics"] == workflow_done["metrics"]
+    assert workflow_status.json()["metrics_evaluation"] == workflow_done[
+        "metrics_evaluation"
+    ]
     workflow_artifact_path = tmp_path / "saved" / f"model_{workflow_task_id}.pkl"
     workflow_artifact = joblib.load(workflow_artifact_path)
     assert workflow_artifact["artifact_schema_version"] == 3
     assert workflow_artifact["problem_type"] == "regression"
     assert workflow_artifact["label_encoder"] is None
+    assert workflow_artifact["metrics"] == workflow_done["metrics"]
+    assert workflow_artifact["metrics_evaluation"] == workflow_done[
+        "metrics_evaluation"
+    ]
+    assert workflow_artifact.get("confusion_matrix") is None
+    assert workflow_artifact.get("threshold_calibration") is None
     (tmp_path / "output" / workflow_task_id / "workflow_state.json").unlink()
     artifact_restored_status = client.get(f"/api/workflow/task/{workflow_task_id}/status")
     assert artifact_restored_status.status_code == 200, artifact_restored_status.text
     assert artifact_restored_status.json()["status"] == "completed"
-    assert artifact_restored_status.json()["problem_spec"]["resolved_type"] == "regression"
+    assert (
+        artifact_restored_status.json()["problem_spec"]["resolved_type"]
+        == "regression"
+    )
+    assert artifact_restored_status.json()["metrics"] == workflow_done["metrics"]
+    assert artifact_restored_status.json()["metrics_evaluation"] == workflow_done[
+        "metrics_evaluation"
+    ]
+    assert artifact_restored_status.json().get("confusion_matrix") is None
+    assert artifact_restored_status.json().get("threshold_calibration") is None
 
     model_ids = {
         item["model_id"]: item for item in client.get("/api/models").json()["models"]
@@ -293,13 +369,19 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
         assert registered.json()["problem_type"] == "regression"
         assert registered.json()["problem_spec"]["resolved_type"] == "regression"
         assert registered.json()["legacy"] is False
+        if model_id == workflow_model_id:
+            assert registered.json()["metrics"] == workflow_done["metrics"]
+            assert registered.json()["metrics_evaluation"] == workflow_done[
+                "metrics_evaluation"
+            ]
 
         single = client.post(
             f"/api/models/{encoded_model_id}/predict",
-            json={"features": {"x": 8.0, "segment": "positive"}},
+            json={"features": {"x": 1.5, "segment": "positive"}},
         )
         assert single.status_code == 200, single.text
-        assert single.json()["prediction"] == pytest.approx(43.0, abs=0.5)
+        assert isinstance(single.json()["prediction"], float)
+        assert single.json()["prediction"] == pytest.approx(21.875, abs=0.5)
         assert single.json()["encoded_prediction"] is None
         assert single.json()["probability"] is None
 
@@ -307,8 +389,8 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
             f"/api/models/{encoded_model_id}/batch-predict",
             json={
                 "rows": [
-                    {"x": -4.0, "segment": "negative"},
-                    {"x": 8.0, "segment": "positive"},
+                    {"x": -3.5, "segment": "negative"},
+                    {"x": 1.5, "segment": "positive"},
                 ]
             },
         )
@@ -318,9 +400,9 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
             "positive_rate": None,
             "average_probability": None,
         }
-        assert [row["prediction"] for row in batch.json()["rows"]] == pytest.approx(
-            [4.0, 43.0], abs=0.5
-        )
+        batch_predictions = [row["prediction"] for row in batch.json()["rows"]]
+        assert all(isinstance(prediction, float) for prediction in batch_predictions)
+        assert batch_predictions == pytest.approx([5.625, 21.875], abs=0.5)
         assert all(row["encoded_prediction"] is None for row in batch.json()["rows"])
         assert all(row["probability"] is None for row in batch.json()["rows"])
 
@@ -328,10 +410,11 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
         "/api/workflow/predict",
         json={
             "model_version": workflow_task_id,
-            "features": {"x": 8.0, "segment": "positive"},
+            "features": {"x": 1.5, "segment": "positive"},
         },
     )
     assert workflow_prediction.status_code == 200, workflow_prediction.text
-    assert workflow_prediction.json()["prediction"] == pytest.approx(43.0, abs=0.5)
+    assert isinstance(workflow_prediction.json()["prediction"], float)
+    assert workflow_prediction.json()["prediction"] == pytest.approx(21.875, abs=0.5)
     assert workflow_prediction.json()["encoded_prediction"] is None
     assert workflow_prediction.json()["probability"] is None

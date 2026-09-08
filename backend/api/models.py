@@ -50,6 +50,7 @@ def _try_load_registry_metadata(path: Path) -> Dict[str, Any]:
     """
     metadata: Dict[str, Any] = {
         "metrics": {},
+        "metrics_evaluation": None,
         "optimization_metric": None,
         "best_metric": None,
         "problem_type": None,
@@ -75,6 +76,14 @@ def _try_load_registry_metadata(path: Path) -> Dict[str, Any]:
         best_value = artifact.get("best_value")
         if isinstance(best_value, (int, float)):
             metadata["metrics"] = {"best_value": float(best_value)}
+
+    metrics_evaluation = artifact.get("metrics_evaluation")
+    if isinstance(metrics_evaluation, dict):
+        metadata["metrics_evaluation"] = {
+            key: value
+            for key, value in metrics_evaluation.items()
+            if isinstance(value, (int, float, str, bool)) or value is None
+        }
 
     try:
         problem_type = resolve_artifact_problem_type(artifact)
