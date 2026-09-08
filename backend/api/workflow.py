@@ -124,13 +124,103 @@ def _write_run_state(
         _write_workflow_state(task_id, {"run_id": run_id, **payload})
 
 
-def _persist_run_artifact(task_id: str, run_id: str, artifact: Dict[str, Any], path: Path) -> None:
-    temporary = path.with_name(f".{path.name}.{run_id}.tmp")
+def _commit_completed_run(
+    task_id: str,
+    run_id: str,
+    artifact: Dict[str, Any],
+    artifact_path: Path,
+    completed_state: Dict[str, Any],
+) -> None:
+    """Publish artifact/state and release the run as one cancellation-guarded transition."""
+    temporary = artifact_path.with_name(f".{artifact_path.name}.{run_id}.tmp")
+    backup = artifact_path.with_name(f".{artifact_path.name}.{run_id}.backup")
+    published = False
+    previous_backed_up = False
     try:
         joblib.dump(artifact, temporary)
         with workflow_run_lock:
-            _require_current_run(task_id, run_id)
-            os.replace(temporary, path)
+            control = _require_current_run(task_id, run_id)
+            if artifact_path.exists():
+                os.replace(artifact_path, backup)
+                previous_backed_up = True
+            try:
+                os.replace(temporary, artifact_path)
+                published = True
+                if control.cancel_event.is_set():
+                    raise OptimizationCancelled("工作流运行已取消")
+                _write_workflow_state(task_id, {"run_id": run_id, **completed_state})
+            except Exception:
+                if published and artifact_path.exists():
+                    artifact_path.unlink()
+                if previous_backed_up and backup.exists():
+                    os.replace(backup, artifact_path)
+                raise
+            active_workflow_runs.pop(task_id, None)
+            if backup.exists():
+                try:
+                    backup.unlink()
+                except OSError:
+                    logger.warning(
+                        "清理工作流 artifact 备份失败 task_id=%s run_id=%s",
+                        task_id,
+                        run_id,
+                    )
+    finally:
+        temporary.unlink(missing_ok=True)
+        if backup.exists() and artifact_path.exists():
+            try:
+                backup.unlink()
+            except OSError:
+                logger.warning(
+                    "清理工作流 artifact 备份失败 task_id=%s run_id=%s",
+                    task_id,
+                    run_id,
+                )
+
+
+def _artifact_belongs_to_run(path: Path, run_id: str) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        artifact = joblib.load(path)
+    except Exception:
+        return False
+    return isinstance(artifact, dict) and artifact.get("run_id") == run_id
+
+
+def _finalize_unsuccessful_run(
+    task_id: str, run_id: str, payload: Dict[str, Any]
+) -> None:
+    """Persist a failed/cancelled terminal state and remove only this run's artifact."""
+    with workflow_run_lock:
+        _require_current_run(task_id, run_id, allow_cancelled=True)
+        artifact_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
+        if _artifact_belongs_to_run(artifact_path, run_id):
+            artifact_path.unlink()
+        _write_workflow_state(task_id, {"run_id": run_id, **payload})
+        active_workflow_runs.pop(task_id, None)
+
+
+def _persist_completed_run_baseline(
+    task_id: str, run_id: str, baseline_data: Dict[str, Any], monitor: Any
+) -> bool:
+    """Publish a non-critical baseline only while this completed run remains latest."""
+    baseline_path = get_saved_path(f"baseline_{validate_task_id(task_id)}.json")
+    temporary = baseline_path.with_name(f".{baseline_path.name}.{run_id}.tmp")
+    try:
+        monitor.save_baseline(baseline_data, temporary)
+        with workflow_run_lock:
+            active = active_workflow_runs.get(task_id)
+            state = _read_workflow_state(task_id)
+            if (
+                (active is not None and active.run_id != run_id)
+                or not state
+                or state.get("run_id") != run_id
+                or state.get("status") != "completed"
+            ):
+                return False
+            os.replace(temporary, baseline_path)
+            return True
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1129,9 +1219,6 @@ async def train_stream(
                 "agent_corrections": agent_corrections,
                 "feature_columns": list(feature_executor.state["feature_columns"]),
             }
-            _persist_run_artifact(task_id, run_id, artifact, artifact_path)
-
-            logger.info("模型已保存 task_id=%s run_id=%s", task_id, run_id)
             completed_state = {
                 "status": "completed",
                 **state_metadata,
@@ -1142,7 +1229,25 @@ async def train_stream(
                 "selected_algorithm": selected_algorithm,
                 "cv_folds": cv_folds,
             }
-            _write_run_state(task_id, run_id, completed_state)
+            done_payload = {
+                "status": "DONE",
+                "metric": best_metric,
+                "value": best_value,
+                "problem_spec": problem_spec,
+                "suggested_type": suggested_type,
+                "agent_corrections": agent_corrections,
+                "best_metric": best_metric,
+                "best_value": best_value,
+                "metrics": metrics,
+                "metrics_evaluation": metrics_evaluation,
+                "selected_algorithm": selected_algorithm,
+                "run_id": run_id,
+                "cv_folds": cv_folds,
+            }
+            _commit_completed_run(
+                task_id, run_id, artifact, artifact_path, completed_state
+            )
+            logger.info("模型已保存 task_id=%s run_id=%s", task_id, run_id)
             logger.info(
                 "workflow_training_completed task_id=%s resolved_type=%s "
                 "selected_algorithm=%s metric=%s",
@@ -1151,23 +1256,7 @@ async def train_stream(
                 selected_algorithm,
                 best_metric,
             )
-            completion_payload.update(
-                {
-                    "status": "DONE",
-                    "metric": best_metric,
-                    "value": best_value,
-                    "problem_spec": problem_spec,
-                    "suggested_type": suggested_type,
-                    "agent_corrections": agent_corrections,
-                    "best_metric": best_metric,
-                    "best_value": best_value,
-                    "metrics": metrics,
-                    "metrics_evaluation": metrics_evaluation,
-                    "selected_algorithm": selected_algorithm,
-                    "run_id": run_id,
-                    "cv_folds": cv_folds,
-                }
-            )
+            completion_payload.update(done_payload)
 
             # 基线只使用生产模型实际拟合的 train 行；holdout 不进入拟合状态。
             try:
@@ -1179,16 +1268,12 @@ async def train_stream(
                     transformed_train, features=list(transformed_train.columns)
                 )
 
-                baseline_path = get_saved_path(f"baseline_{validate_task_id(task_id)}.json")
-                temporary_baseline = baseline_path.with_name(f".{baseline_path.name}.{run_id}.tmp")
-                try:
-                    monitor.save_baseline(baseline_data, temporary_baseline)
-                    with workflow_run_lock:
-                        _require_current_run(task_id, run_id)
-                        os.replace(temporary_baseline, baseline_path)
-                finally:
-                    temporary_baseline.unlink(missing_ok=True)
-                logger.info("基线数据已保存 task_id=%s run_id=%s", task_id, run_id)
+                if _persist_completed_run_baseline(
+                    task_id, run_id, baseline_data, monitor
+                ):
+                    logger.info("基线数据已保存 task_id=%s run_id=%s", task_id, run_id)
+                else:
+                    logger.info("跳过失效运行基线 task_id=%s run_id=%s", task_id, run_id)
             except Exception as e:
                 logger.warning("保存基线数据失败 task_id=%s error_type=%s", task_id, type(e).__name__)
 
@@ -1197,11 +1282,10 @@ async def train_stream(
         except OptimizationCancelled:
             canonical_error = "训练已取消"
             try:
-                _write_run_state(
+                _finalize_unsuccessful_run(
                     task_id,
                     run_id,
                     {"status": "cancelled", **state_metadata, "error": canonical_error},
-                    allow_cancelled=True,
                 )
                 asyncio.run_coroutine_threadsafe(
                     queue.put({"status": "CANCELLED", "error": canonical_error, "run_id": run_id}), loop
@@ -1211,11 +1295,10 @@ async def train_stream(
         except Exception as e:
             canonical_error = _safe_workflow_error(e)
             try:
-                _write_run_state(
+                _finalize_unsuccessful_run(
                     task_id,
                     run_id,
                     {"status": "failed", **state_metadata, "error": canonical_error},
-                    allow_cancelled=True,
                 )
                 asyncio.run_coroutine_threadsafe(
                     queue.put({"status": "ERROR", "error": canonical_error, "run_id": run_id}), loop
@@ -1270,10 +1353,19 @@ async def cancel_workflow_run(task_id: str, run_id: str):
     validate_task_id(task_id)
     with workflow_run_lock:
         control = active_workflow_runs.get(task_id)
-        if control is None or control.run_id != run_id:
-            raise HTTPException(status_code=404, detail="未找到活动训练运行")
-        control.cancel_event.set()
-    return {"task_id": task_id, "run_id": run_id, "status": "cancelling"}
+        if control is not None and control.run_id == run_id:
+            control.cancel_event.set()
+            status = "cancelling"
+        else:
+            persisted = _read_workflow_state(task_id)
+            if (
+                not persisted
+                or persisted.get("run_id") != run_id
+                or persisted.get("status") not in {"completed", "cancelled", "failed"}
+            ):
+                raise HTTPException(status_code=404, detail="未找到活动训练运行")
+            status = persisted["status"]
+    return {"task_id": task_id, "run_id": run_id, "status": status}
 
 
 # ==================== 步骤 4: 线上预测 ====================

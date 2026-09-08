@@ -909,3 +909,125 @@ def test_workflow_cancel_endpoint_propagates_to_optimizer_and_persists_cancelled
     assert persisted["status"] == "cancelled"
     assert persisted["error"] == "训练已取消"
     assert not thread.is_alive()
+
+
+def _linear_regression_agent_config(_data_features: dict, _scenario: str) -> dict:
+    return {
+        "task_type": "regression",
+        "optimization_metric": "rmse",
+        "candidate_models": ["linear_regression"],
+        "n_trials": 10,
+        "search_spaces": {},
+        "rationale": "terminal publication sentinel",
+    }
+
+
+def test_workflow_cancel_after_artifact_replace_rolls_back_run_owned_publication(
+    tmp_path, monkeypatch
+):
+    """Catches cancellation publishing a selectable artifact without a completed state."""
+    task_id = _prepare_workflow_task(tmp_path)
+    saved_dir = tmp_path / "saved"
+    artifact_path = saved_dir / f"model_{task_id}.pkl"
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", saved_dir)
+    monkeypatch.setattr(workflow, "recommend_automl_config", _linear_regression_agent_config)
+    artifact_replaced = threading.Event()
+    release_publication = threading.Event()
+    original_replace = workflow.os.replace
+
+    def replace_with_cancel_barrier(source, destination):
+        original_replace(source, destination)
+        if destination == artifact_path:
+            # This is the exact publication boundary: the run's cancellation signal wins
+            # before completed state is allowed to commit.
+            workflow.active_workflow_runs[task_id].cancel_event.set()
+            artifact_replaced.set()
+            assert release_publication.wait(timeout=5)
+
+    monkeypatch.setattr(workflow.os, "replace", replace_with_cancel_barrier)
+    events: list[dict] = []
+
+    def consume_stream():
+        events.extend(_read_workflow_sse(task_id, "regression", 10, 3))
+
+    thread = threading.Thread(target=consume_stream)
+    thread.start()
+    try:
+        assert artifact_replaced.wait(timeout=5)
+        assert artifact_path.is_file()
+    finally:
+        release_publication.set()
+    thread.join(timeout=5)
+
+    state = json.loads(
+        (tmp_path / "output" / task_id / "workflow_state.json").read_text(encoding="utf-8")
+    )
+    terminal_statuses = [
+        event["status"] for event in events if event["status"] in {"DONE", "CANCELLED", "ERROR"}
+    ]
+    assert terminal_statuses == ["CANCELLED"]
+    assert state["status"] == "cancelled"
+    assert not artifact_path.exists()
+    assert task_id not in workflow.active_workflow_runs
+    assert not thread.is_alive()
+
+
+def test_workflow_cancel_after_completed_state_returns_completed_during_baseline(
+    tmp_path, monkeypatch
+):
+    """Catches baseline work keeping a completed run cancellable and active."""
+    from model_code.mlops_monitor import DataDriftMonitor
+
+    task_id = _prepare_workflow_task(tmp_path)
+    saved_dir = tmp_path / "saved"
+    artifact_path = saved_dir / f"model_{task_id}.pkl"
+    state_path = tmp_path / "output" / task_id / "workflow_state.json"
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", saved_dir)
+    monkeypatch.setattr(workflow, "recommend_automl_config", _linear_regression_agent_config)
+    baseline_entered = threading.Event()
+    release_baseline = threading.Event()
+    original_extract_baseline = DataDriftMonitor.extract_baseline
+
+    def extract_with_completed_barrier(self, data, features):
+        baseline_entered.set()
+        assert release_baseline.wait(timeout=5)
+        return original_extract_baseline(self, data, features)
+
+    monkeypatch.setattr(DataDriftMonitor, "extract_baseline", extract_with_completed_barrier)
+    events: list[dict] = []
+
+    def consume_stream():
+        events.extend(_read_workflow_sse(task_id, "regression", 10, 3))
+
+    thread = threading.Thread(target=consume_stream)
+    thread.start()
+    try:
+        assert baseline_entered.wait(timeout=5)
+        completed_state = json.loads(state_path.read_text(encoding="utf-8"))
+        active_during_baseline = task_id in workflow.active_workflow_runs
+        cancel = TestClient(app).post(
+            f"/api/workflow/task/{task_id}/run/{completed_state['run_id']}/cancel"
+        )
+    finally:
+        release_baseline.set()
+    thread.join(timeout=5)
+
+    final_state = json.loads(state_path.read_text(encoding="utf-8"))
+    terminal_statuses = [
+        event["status"] for event in events if event["status"] in {"DONE", "CANCELLED", "ERROR"}
+    ]
+    assert completed_state["status"] == "completed"
+    assert not active_during_baseline
+    assert cancel.status_code == 200
+    assert cancel.json() == {
+        "task_id": task_id,
+        "run_id": completed_state["run_id"],
+        "status": "completed",
+    }
+    assert terminal_statuses == ["DONE"]
+    assert final_state["status"] == "completed"
+    assert artifact_path.is_file()
+    assert joblib.load(artifact_path)["run_id"] == completed_state["run_id"]
+    assert not thread.is_alive()
