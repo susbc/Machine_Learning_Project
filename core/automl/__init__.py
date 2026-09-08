@@ -11,10 +11,30 @@ AutoML 模块 - Phase 3 核心组件
 
 from .automl_agent import AutoMLAgent, extract_data_features
 from .automl_optimizer import AutoMLOptimizer, plot_optimization_results
+from .problem_spec import (
+    ProblemSpec,
+    ProblemSpecError,
+    ProblemType,
+    capabilities_payload,
+    resolve_metric,
+    resolve_problem_spec,
+    validate_algorithm,
+    validate_cv,
+    validate_train_test_split,
+)
 
 __all__ = [
     "AutoMLAgent",
     "AutoMLOptimizer",
+    "ProblemSpec",
+    "ProblemSpecError",
+    "ProblemType",
+    "capabilities_payload",
     "extract_data_features",
     "plot_optimization_results",
+    "resolve_metric",
+    "resolve_problem_spec",
+    "validate_algorithm",
+    "validate_cv",
+    "validate_train_test_split",
 ]
