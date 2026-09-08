@@ -265,6 +265,7 @@ def validate_algorithm(spec: ProblemSpec, algorithm: str) -> None:
             "algorithm",
             f"算法 {algorithm} 不适用于 {spec.resolved_type.value}",
             spec.algorithms,
+            received=algorithm,
         )
 
 

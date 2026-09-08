@@ -1,4 +1,5 @@
 import io
+import logging
 import time
 import uuid
 from datetime import datetime
@@ -44,14 +45,28 @@ def _upload_regression_dataset(client: TestClient, rows: int = 60) -> str:
     return response.json()["dataset_id"]
 
 
+def _upload_low_cardinality_numeric_dataset(client: TestClient, *, problem_type: str = "auto") -> str:
+    frame = pd.DataFrame({"x": range(60), "score": np.tile([0, 1, 2], 20)})
+    response = client.post(
+        "/api/training/datasets",
+        files={"file": ("scores.csv", io.BytesIO(frame.to_csv(index=False).encode()), "text/csv")},
+        data={"target_col": "score", "problem_type": problem_type},
+    )
+    assert response.status_code == 201
+    return response.json()["dataset_id"]
+
+
 def test_training_capabilities_expose_regression():
     """The manual-training client can discover the canonical regression contract."""
     response = TestClient(app).get("/api/training/capabilities")
 
     assert response.status_code == 200
-    regression = response.json()["problem_types"]["regression"]
-    assert regression["default_metric"] == "rmse"
-    assert "linear_regression" in regression["algorithms"]
+    assert response.json()["problem_types"]["regression"] == {
+        "algorithms": ["lightgbm", "xgboost", "catboost", "random_forest", "linear_regression"],
+        "metrics": ["rmse", "mae", "r2"],
+        "default_metric": "rmse",
+        "metric_directions": {"rmse": "minimize", "mae": "minimize", "r2": "maximize"},
+    }
 
 
 def test_training_upload_auto_detects_regression():
@@ -126,6 +141,22 @@ def test_restoring_legacy_job_without_dataset_uses_classification_compatibility(
     assert restored.result["problem_spec"]["resolved_type"] == "binary_classification"
 
 
+def test_job_without_problem_type_reuses_explicit_dataset_override():
+    """Omitting a job override retains the task type selected while uploading the dataset."""
+    client = TestClient(app)
+    dataset_id = _upload_low_cardinality_numeric_dataset(client, problem_type="regression")
+
+    created = client.post(
+        "/api/training/jobs",
+        json={"dataset_id": dataset_id, "algorithm": "linear_regression", "params": {}, "test_size": 0.25},
+    )
+
+    assert created.status_code == 201
+    assert created.json()["problem_spec"]["requested_type"] == "regression"
+    assert created.json()["problem_spec"]["resolved_type"] == "regression"
+    assert _wait_for_job(client, created.json()["job_id"])["status"] == "completed"
+
+
 def test_training_rejects_incompatible_algorithm_before_enqueue():
     """A classification-only algorithm never creates a job for a regression target."""
     client = TestClient(app)
@@ -142,7 +173,39 @@ def test_training_rejects_incompatible_algorithm_before_enqueue():
     )
 
     assert response.status_code == 422
-    assert response.json()["detail"]["field"] == "algorithm"
+    assert response.json()["detail"] == {
+        "code": "incompatible_algorithm",
+        "field": "algorithm",
+        "message": "算法 logistic_regression 不适用于 regression",
+        "received": "logistic_regression",
+        "allowed": ["lightgbm", "xgboost", "catboost", "random_forest", "linear_regression"],
+    }
+
+
+def test_manual_multiclass_training_keeps_default_threshold_calibration():
+    """Classification clients retain the default threshold payload for multiclass jobs."""
+    client = TestClient(app)
+    dataset_id = _upload_low_cardinality_numeric_dataset(client)
+    created = client.post(
+        "/api/training/jobs",
+        json={
+            "dataset_id": dataset_id,
+            "algorithm": "logistic_regression",
+            "params": {"solver": "lbfgs"},
+            "test_size": 0.25,
+        },
+    )
+
+    assert created.status_code == 201
+    job = _wait_for_job(client, created.json()["job_id"])
+    assert job["status"] == "completed"
+    result = client.get(f"/api/training/jobs/{job['job_id']}/result").json()
+    expected_calibration = {"threshold": 0.5, "source": "default", "calibration_size": 0}
+    assert result["threshold_calibration"] == expected_calibration
+    saved = client.post(f"/api/training/jobs/{job['job_id']}/save")
+    artifact = joblib.load(Path(__file__).parents[1] / saved.json()["artifact_path"])
+    assert artifact["decision_threshold"] == 0.5
+    assert artifact["threshold_calibration"] == expected_calibration
 
 
 def test_manual_linear_regression_completes_with_regression_metrics():
@@ -323,6 +386,87 @@ def test_preset_cancel_event_marks_job_cancelled():
 
     assert job.status == "cancelled"
     assert job.result is None
+
+
+def _persisted_job_for_missing_dataset() -> TrainingJob:
+    job_id = uuid.uuid4().hex
+    now = datetime.now().isoformat(timespec="seconds")
+    job = TrainingJob(
+        job_id=job_id,
+        dataset_id="expireddataset",
+        algorithm="logistic_regression",
+        params={},
+        status="queued",
+        progress=0,
+        created_at=now,
+        updated_at=now,
+        problem_spec=training_api._legacy_classification_problem_spec(),
+    )
+    training_jobs[job_id] = job
+    training_api._persist_job(job)
+    return job
+
+
+def test_worker_persists_missing_dataset_failure():
+    """A dataset disappearance becomes a durable failed job rather than an escaping worker error."""
+    job = _persisted_job_for_missing_dataset()
+    try:
+        _run_training_job(job.job_id, 0.25, 42)
+        training_jobs.pop(job.job_id)
+        restored = training_api._get_job(job.job_id)
+    finally:
+        training_jobs.pop(job.job_id, None)
+        training_api.runtime_state.delete(training_api.JOB_NAMESPACE, job.job_id, (training_api.RESULT_BLOB_NAMESPACE,))
+
+    assert restored.status == "failed"
+    assert restored.error == "404: 未找到训练数据集"
+
+
+def test_training_lifecycle_logs_safe_job_context(caplog):
+    """Completion and failure logs identify the job context without emitting dataset contents."""
+    client = TestClient(app)
+    dataset_id = _upload_regression_dataset(client)
+    dataset = training_api._get_dataset(dataset_id)
+    job_id = uuid.uuid4().hex
+    now = datetime.now().isoformat(timespec="seconds")
+    completed_job = TrainingJob(
+        job_id=job_id,
+        dataset_id=dataset_id,
+        algorithm="linear_regression",
+        params={},
+        status="queued",
+        progress=0,
+        created_at=now,
+        updated_at=now,
+        problem_spec=dataset.problem_spec,
+    )
+    training_jobs[job_id] = completed_job
+    failed_job = _persisted_job_for_missing_dataset()
+    caplog.set_level(logging.INFO, logger="backend.api.training")
+    try:
+        _run_training_job(completed_job.job_id, 0.25, 42)
+        _run_training_job(failed_job.job_id, 0.25, 42)
+    finally:
+        training_jobs.pop(completed_job.job_id, None)
+        training_jobs.pop(failed_job.job_id, None)
+        training_api.runtime_state.delete(training_api.JOB_NAMESPACE, completed_job.job_id, (training_api.RESULT_BLOB_NAMESPACE,))
+        training_api.runtime_state.delete(training_api.JOB_NAMESPACE, failed_job.job_id, (training_api.RESULT_BLOB_NAMESPACE,))
+
+    records = [record.getMessage() for record in caplog.records]
+    assert any(
+        f"job_id={completed_job.job_id}" in message
+        and "problem_type=regression" in message
+        and "algorithm=linear_regression" in message
+        and "metric=rmse" in message
+        for message in records
+    )
+    assert any(
+        f"job_id={failed_job.job_id}" in message
+        and "problem_type=binary_classification" in message
+        and "algorithm=logistic_regression" in message
+        and "metric=roc_auc" in message
+        for message in records
+    )
 
 
 def test_cancel_endpoint_unknown_job_404_and_terminal_noop():
