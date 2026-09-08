@@ -364,6 +364,21 @@ def test_workflow_discards_search_space_from_mismatched_agent_task():
             {"n_estimators": {"type": "int", "low": "many", "high": 20}},
             "search_spaces.random_forest.n_estimators",
         ),
+        (
+            "random_forest",
+            {"n_estimators": {"type": "int", "low": -10, "high": 20}},
+            "search_spaces.random_forest.n_estimators",
+        ),
+        (
+            "random_forest",
+            {
+                "max_features": {
+                    "type": "categorical",
+                    "choices": ["sqrt", "unsupported"],
+                }
+            },
+            "search_spaces.random_forest.max_features",
+        ),
     ],
 )
 def test_workflow_drops_algorithm_invalid_search_rules(candidate, space, correction_field):
@@ -381,6 +396,28 @@ def test_workflow_drops_algorithm_invalid_search_rules(candidate, space, correct
 
     assert config["search_spaces"][candidate] == {}
     assert any(item["field"] == correction_field for item in corrections)
+
+
+def test_workflow_preserves_valid_custom_search_space_within_canonical_domain():
+    """Catches domain validation replacing valid bounded custom tuning rules."""
+    spec = resolve_problem_spec(pd.Series(np.linspace(1.0, 20.0, 40)), "amount", "auto")
+    valid_space = {
+        "n_estimators": {"type": "int", "low": 150, "high": 300},
+        "max_depth": {"type": "int", "low": 4, "high": 10},
+        "max_features": {"type": "categorical", "choices": ["sqrt", None]},
+    }
+    suggested = {
+        "task_type": "regression",
+        "optimization_metric": "rmse",
+        "candidate_models": ["random_forest"],
+        "search_spaces": {"random_forest": valid_space},
+        "rationale": "valid custom search",
+    }
+
+    config, _, corrections = workflow._coordinate_automl_config(suggested, spec, 10)
+
+    assert config["search_spaces"]["random_forest"] == valid_space
+    assert not any(item["field"].startswith("search_spaces.random_forest") for item in corrections)
 
 
 def test_workflow_explicit_regression_override_precedes_agent_suggestion(tmp_path, monkeypatch):

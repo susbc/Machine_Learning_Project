@@ -245,7 +245,7 @@ def _coordinate_automl_config(
 def _validate_search_space(
     model_name: str, resolved_type: str, search_space: Any
 ) -> tuple[Dict[str, Any], list[Dict[str, Any]]]:
-    """Drop estimator-unknown or malformed Optuna rules before optimization."""
+    """Drop rules outside the estimator's canonical safe tuning domain."""
     from model_code.model_factory import ModelFactory
 
     corrections: list[Dict[str, Any]] = []
@@ -259,21 +259,24 @@ def _validate_search_space(
             }
         ]
 
-    allowed_params = set(ModelFactory.get_param_grid(model_name))
+    parameter_domains = dict(ModelFactory.get_param_grid(model_name))
     if model_name == "catboost":
-        allowed_params.add("n_estimators")
+        parameter_domains["n_estimators"] = parameter_domains["iterations"]
         if resolved_type != ProblemType.REGRESSION.value:
-            allowed_params.add("auto_class_weights")
+            parameter_domains["auto_class_weights"] = ["Balanced", "SqrtBalanced"]
     if (
         model_name in {"lightgbm", "xgboost"}
         and resolved_type != ProblemType.REGRESSION.value
     ):
-        allowed_params.add("scale_pos_weight")
+        # This parameter is task-specific and therefore is not in the shared
+        # factory grid.  The bounds admit the documented Agent suggestions
+        # while excluding non-positive or unbounded estimator inputs.
+        parameter_domains["scale_pos_weight"] = [1e-6, 1e6]
 
     safe_space: Dict[str, Any] = {}
     for param_name, rule in search_space.items():
         field = f"search_spaces.{model_name}.{param_name}"
-        reason = _search_rule_error(param_name, rule, allowed_params)
+        reason = _search_rule_error(param_name, rule, parameter_domains)
         if reason is None:
             safe_space[param_name] = rule
         else:
@@ -289,9 +292,9 @@ def _validate_search_space(
 
 
 def _search_rule_error(
-    param_name: str, rule: Any, allowed_params: set[str]
+    param_name: str, rule: Any, parameter_domains: Dict[str, Any]
 ) -> Optional[str]:
-    if param_name not in allowed_params:
+    if param_name not in parameter_domains:
         return "参数不受该任务对应的 estimator 支持，已移除"
     if not isinstance(rule, dict):
         return "搜索规则必须是对象，已移除"
@@ -302,7 +305,7 @@ def _search_rule_error(
         choices = rule.get("choices")
         if not isinstance(choices, list) or not choices:
             return "categorical 规则必须提供非空 choices，已移除"
-        return None
+        return _categorical_domain_error(choices, parameter_domains[param_name])
 
     low = rule.get("low")
     high = rule.get("high")
@@ -326,6 +329,49 @@ def _search_rule_error(
         return "数值搜索规则必须提供有效且有序的 low/high，已移除"
     if rule_type == "loguniform" and low <= 0:
         return "loguniform 的 low 必须大于 0，已移除"
+    domain_error = _numeric_domain_error(low, high, parameter_domains[param_name])
+    if domain_error is not None:
+        return domain_error
+    return None
+
+
+def _canonical_domain_values(domain: Any) -> list[Any]:
+    """Normalize ModelFactory grids without weakening numpy scalar checks."""
+    if isinstance(domain, np.ndarray):
+        return domain.tolist()
+    if isinstance(domain, (list, tuple)):
+        return list(domain)
+    return [domain]
+
+
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float, np.integer, np.floating))
+        and not isinstance(value, (bool, np.bool_))
+        and bool(np.isfinite(value))
+    )
+
+
+def _categorical_domain_error(choices: list[Any], domain: Any) -> Optional[str]:
+    supported = _canonical_domain_values(domain)
+    if supported and all(_is_finite_number(value) for value in supported):
+        lower, upper = min(supported), max(supported)
+        if all(
+            _is_finite_number(choice) and lower <= choice <= upper
+            for choice in choices
+        ):
+            return None
+    elif all(any(choice == value for value in supported) for choice in choices):
+        return None
+    return "categorical choices 超出该 estimator 的安全支持域，已移除"
+
+
+def _numeric_domain_error(low: Any, high: Any, domain: Any) -> Optional[str]:
+    supported = _canonical_domain_values(domain)
+    if not supported or not all(_is_finite_number(value) for value in supported):
+        return "数值规则不适用于该 estimator 参数，已移除"
+    if low < min(supported) or high > max(supported):
+        return "low/high 超出该 estimator 的安全支持域，已移除"
     return None
 
 
