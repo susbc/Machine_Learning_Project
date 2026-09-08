@@ -76,7 +76,11 @@ def generate_test_data(
     actual_features = n_features
     if include_categorical:
         actual_features = n_features - n_categorical
-    
+
+    # 使用独立的随机数发生器：此前分类特征/缺失值/异常值注入消耗的是
+    # 全局 np.random 状态，导致"相同 seed 两次生成结果不一致"的确定性缺陷
+    rng = np.random.RandomState(random_state)
+
     # 生成基础数据
     X, y = make_classification(
         n_samples=n_samples,
@@ -98,7 +102,7 @@ def generate_test_data(
         cat_categories = ['A', 'B', 'C', 'D']
         for i in range(n_categorical):
             cat_col = f'cat_feature_{i+1}'
-            df[cat_col] = np.random.choice(
+            df[cat_col] = rng.choice(
                 cat_categories,
                 size=n_samples,
                 p=[0.4, 0.3, 0.2, 0.1]
@@ -120,8 +124,8 @@ def generate_test_data(
             numeric_cols.remove('id')
         
         n_missing = int(len(df) * missing_rate)
-        missing_rows = np.random.choice(len(df), n_missing, replace=False)
-        missing_cols = np.random.choice(numeric_cols, n_missing)
+        missing_rows = rng.choice(len(df), n_missing, replace=False)
+        missing_cols = rng.choice(numeric_cols, n_missing)
         
         for row, col in zip(missing_rows, missing_cols):
             df.loc[row, col] = np.nan
@@ -137,15 +141,15 @@ def generate_test_data(
             numeric_cols.remove('id')
         
         n_outliers = int(len(df) * outlier_rate)
-        outlier_rows = np.random.choice(len(df), n_outliers, replace=False)
-        outlier_cols = np.random.choice(numeric_cols, n_outliers)
+        outlier_rows = rng.choice(len(df), n_outliers, replace=False)
+        outlier_cols = rng.choice(numeric_cols, n_outliers)
         
         for row, col in zip(outlier_rows, outlier_cols):
             # 添加 3-5 倍标准差的异常值
             std = df[col].std()
             mean = df[col].mean()
-            direction = np.random.choice([-1, 1])
-            df.loc[row, col] = mean + direction * np.random.uniform(3, 5) * std
+            direction = rng.choice([-1, 1])
+            df.loc[row, col] = mean + direction * rng.uniform(3, 5) * std
         
         logger.info(f"  添加了 {n_outliers} 个异常值")
     

@@ -269,7 +269,8 @@ def _render_db_query_editor(db, tables, pd) -> None:
 
     st.subheader("🔍 SQL 查询编辑器")
 
-    default_query = f"SELECT * FROM {tables[0] if tables else 'table_name'} LIMIT 100"
+    # 表名来自数据库元数据，仅用于预填充可编辑查询框。
+    default_query = f"SELECT * FROM {tables[0] if tables else 'table_name'} LIMIT 100"  # nosec B608
     sql_query = st.text_area(
         "SQL 查询",
         value=default_query,

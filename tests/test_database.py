@@ -128,7 +128,7 @@ class TestQueryBuilder:
             .build())
         
         assert "WHERE age > :param_0" in sql
-        assert "status = :param_1" in sql
+        assert "AND status = :param_1" in sql
         assert params['param_0'] == 18
         assert params['param_1'] == 'active'
     
@@ -196,6 +196,17 @@ class TestQueryBuilder:
             .build())
         
         assert "GROUP BY user_id" in sql
+
+    def test_or_where_uses_explicit_boolean_operator(self):
+        qb = QueryBuilder('users')
+        sql, _ = qb.where('status', '=', 'active').or_where('role', '=', 'admin').build()
+
+        assert "WHERE status = :param_0 OR role = :param_1" in sql
+
+    def test_count_distinct_expression(self):
+        sql, _ = QueryBuilder('users').select('COUNT(DISTINCT email) AS unique_count').build()
+
+        assert sql == "SELECT COUNT(DISTINCT email) AS unique_count FROM users"
     
     def test_reset(self):
         """测试重置"""
@@ -206,6 +217,39 @@ class TestQueryBuilder:
         sql, params = qb.build()
         assert sql == "SELECT * FROM users"
         assert params == {}
+
+    @pytest.mark.parametrize(
+        ("factory", "message"),
+        [
+            (lambda: QueryBuilder("users; DROP TABLE users"), "表名"),
+            (lambda: QueryBuilder("users").select("name, password"), "SELECT"),
+            (lambda: QueryBuilder("users").where("id", "= 1 OR", 1), "操作符"),
+            (lambda: QueryBuilder("users").where("id; DROP", "=", 1), "列名"),
+            (
+                lambda: QueryBuilder("orders").join("users", "orders.user_id = users.id OR 1=1"),
+                "JOIN",
+            ),
+        ],
+    )
+    def test_rejects_unsafe_sql_fragments(self, factory, message):
+        """不可参数化的 SQL 片段必须经过严格白名单。"""
+        with pytest.raises(ValueError, match=message):
+            factory()
+
+    @pytest.mark.parametrize("method", ["limit", "offset"])
+    def test_rejects_invalid_pagination(self, method):
+        """分页值只能是非负整数。"""
+        with pytest.raises(ValueError, match="非负整数"):
+            getattr(QueryBuilder("users"), method)(-1)
+
+    def test_rejects_empty_in_values(self):
+        with pytest.raises(ValueError, match="空列表"):
+            QueryBuilder("users").where("id", "IN", [])
+
+    def test_rejects_duplicate_parameter_names(self):
+        qb = QueryBuilder("users").where("id", "=", 1, param_name="identifier")
+        with pytest.raises(ValueError, match="参数名已存在"):
+            qb.where("owner_id", "=", 2, param_name="identifier")
 
 
 class TestAutoTrainer:

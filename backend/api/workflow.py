@@ -44,6 +44,8 @@ from model_code.model_factory import ModelFactory
 from core.automl.automl_optimizer import AutoMLOptimizer
 from core.llm.agent_schemas import FeatureStrategy
 
+from ._dataset import predict_with_artifact
+
 logger = logging.getLogger(__name__)
 
 # ==================== 路由配置 ====================
@@ -54,8 +56,10 @@ router = APIRouter(prefix="/api/workflow", tags=["Agentic AutoML Workflow"])
 executor_pool = ThreadPoolExecutor(max_workers=4)
 
 TASK_ID_PATTERN = re.compile(r"^task_[a-f0-9]{8}$")
-OUTPUT_DIR = Path("output")
-SAVED_DIR = Path("saved")
+# 基于项目根目录（而非 CWD），从任意目录启动服务都能定位同一份数据
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+OUTPUT_DIR = PROJECT_ROOT / "output"
+SAVED_DIR = PROJECT_ROOT / "saved"
 
 
 def validate_task_id(task_id: str) -> str:
@@ -330,7 +334,7 @@ async def train_stream(
             with open(strategy_path, "r", encoding='utf-8') as f:
                 strategy_json = f.read()
 
-            strategy_obj = FeatureStrategy.parse_raw(strategy_json)
+            strategy_obj = FeatureStrategy.model_validate_json(strategy_json)
             logger.info(f"策略加载完成：{len(strategy_obj.actions)} 个动作")
 
             # 加载 eda_summary 获取目标变量列名
@@ -342,7 +346,9 @@ async def train_stream(
                     target_col = eda_summary.get("target", "is_fraud")
 
             # 2. 执行特征工程 (fit_transform)
-            feature_executor = FeatureEngineeringExecutor(target_col=target_col)
+            # 特征工程先于 AutoML CV 执行，因此禁用监督式 Target Encoding；高基数
+            # 类别会由执行器自动采用频率编码，避免验证折标签泄漏。
+            feature_executor = FeatureEngineeringExecutor(target_col=target_col, allow_target_encoding=False)
             df_clean = feature_executor.fit_transform(df_raw, strategy_obj)
             logger.info(f"特征工程完成：{df_clean.shape}")
 
@@ -350,13 +356,19 @@ async def train_stream(
             if target_col not in df_clean.columns:
                 raise ValueError(f"目标变量 '{target_col}' 不在清洗后的数据中")
 
-            # 准备训练数据
-            X = df_clean.drop(columns=[target_col])
-            y = df_clean[target_col]
+            # 准备训练数据（标签统一编码，字符串目标不再崩溃；编码器随 artifact 保存）
+            from sklearn.preprocessing import LabelEncoder
 
-            # 3. AutoML 配置
+            X = df_clean.drop(columns=[target_col])
+            label_encoder = LabelEncoder()
+            y = pd.Series(label_encoder.fit_transform(df_clean[target_col]), name=target_col)
+            n_classes = int(y.nunique())
+            if n_classes < 2:
+                raise ValueError("目标变量至少需要 2 个类别")
+
+            # 3. AutoML 配置（task_type 按实际类别数推断）
             optuna_config = {
-                "task_type": "binary_classification",
+                "task_type": "binary_classification" if n_classes == 2 else "multiclass_classification",
                 "optimization_metric": "roc_auc",
                 "candidate_models": ModelFactory.get_supported_algorithms(),
                 "n_trials": n_trials,
@@ -380,11 +392,15 @@ async def train_stream(
             def sse_callback(study: optuna.Study, trial: optuna.Trial):
                 """Optuna Trial 结束时的回调，推送 SSE"""
                 if trial.state.is_finished():
+                    try:
+                        current_best = float(study.best_value)
+                    except ValueError:
+                        current_best = None
                     payload = {
                         "status": "RUNNING",
                         "trial": trial.number,
                         "value": float(trial.value) if trial.value is not None else None,
-                        "best_value": float(study.best_value) if study.best_value is not None else None,
+                        "best_value": current_best,
                         "params": trial.params
                     }
                     try:
@@ -393,7 +409,8 @@ async def train_stream(
                         logger.error(f"推送 SSE 数据失败：{e}")
 
             # 5. 启动 Optuna 寻优 (真实训练)
-            optimizer = AutoMLOptimizer(X, y, optuna_config, cv_splits=max(3, cv_folds), n_jobs=-1)
+            # 外层 Trial 顺序执行，模型内部可自行并行，避免 CV × 模型线程嵌套过载。
+            optimizer = AutoMLOptimizer(X, y, optuna_config, cv_splits=max(3, cv_folds), n_jobs=1)
 
             # 运行优化并获取最佳模型
             best_value = 0.5
@@ -401,22 +418,12 @@ async def train_stream(
             study = None
 
             try:
-                study, best_model = optimizer.optimize(n_trials=n_trials, show_progress=False)
+                # sse_callback 实时推送每个 Trial（不再结束后回放）
+                study, best_model = optimizer.optimize(
+                    n_trials=n_trials, show_progress=False, callbacks=[sse_callback]
+                )
                 if study and study.best_value is not None:
                     best_value = float(study.best_value)
-
-                # 为每个 Trial 生成 SSE 推送 (从历史记录中回放)
-                if study:
-                    for trial in study.trials:
-                        if trial.state.is_finished():
-                            payload = {
-                                "status": "RUNNING",
-                                "trial": trial.number,
-                                "value": float(trial.value) if trial.value is not None else None,
-                                "best_value": float(study.best_value) if study.best_value is not None else None,
-                                "params": trial.params
-                            }
-                            asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
             except Exception as e:
                 logger.error(f"Optuna 优化失败：{e}")
                 raise
@@ -428,6 +435,7 @@ async def train_stream(
             joblib.dump({
                 "feature_executor": feature_executor,
                 "model": best_model,
+                "label_encoder": label_encoder,
                 "config": optuna_config,
                 "best_value": best_value,
                 "feature_columns": list(X.columns)
@@ -521,55 +529,39 @@ async def predict_online(req: PredictRequest):
                 status_code=404,
                 detail=f"模型未找到：{model_version}，请先训练模型"
             )
-        
+
         artifact = joblib.load(artifact_path)
-        feature_executor = artifact["feature_executor"]
         model = artifact.get("model")  # mock 模式下为 None
-        feature_columns = artifact.get("feature_columns", [])
-        
+
         logger.info(f"加载模型：{model_version}")
-        
-        # 2. 将前端 JSON 转为 DataFrame
-        df_infer = pd.DataFrame([req.features])
-        logger.info(f"输入数据：{df_infer.shape}")
-        
-        # 3. 严格使用训练时的状态进行特征清洗 (transform, NOT fit_transform)
-        if feature_executor.is_fitted():
-            df_clean = feature_executor.transform(df_infer)
-            logger.info(f"特征清洗完成：{df_clean.shape}")
-        else:
-            df_clean = df_infer
 
-        # 确保特征列顺序一致
-        if feature_columns:
-            # 补齐缺失列 (填充 0)
-            for col in feature_columns:
-                if col not in df_clean.columns:
-                    df_clean[col] = 0
-            # 按训练时的顺序重排列
-            df_clean = df_clean[feature_columns]
-
-        # 4. 预测
+        # 2. mock 模式保留模拟预测
         if model is None:
             logger.warning("模型未加载，使用模拟预测结果")
-            pred = [0.85]
-            prob = 0.85
-        else:
-            # 真实模型预测
-            pred = model.predict(df_clean)
-            if hasattr(model, 'predict_proba'):
-                prob = float(model.predict_proba(df_clean)[0][1])
-            else:
-                prob = float(pred[0]) if hasattr(pred, '__len__') else float(pred)
-        
+            return {
+                "status": "success",
+                "model_version": model_version,
+                "prediction": 0.85,
+                "probability": 0.85,
+                "input_features": req.features
+            }
+
+        # 3. 共享推理：executor 仅 transform（绝不重新 fit）、无二次 get_dummies、
+        #    标签反变换为原始标签、概率为预测类别的概率
+        result = predict_with_artifact(artifact, [req.features])[0]
+
         return {
             "status": "success",
             "model_version": model_version,
-            "prediction": float(pred[0]),
-            "probability": float(prob),
+            "prediction": result["prediction"],
+            "probability": result["probability"],
+            "encoded_prediction": result["encoded_prediction"],
+            "diagnostics": result["diagnostics"],
             "input_features": req.features
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"预测失败：{e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -33,7 +33,7 @@ class FeatureEngineeringExecutor:
     - 可持久化：与模型一起打包保存
     """
     
-    def __init__(self, target_col: Optional[str] = None):
+    def __init__(self, target_col: Optional[str] = None, allow_target_encoding: bool = True):
         """
         初始化执行器
         
@@ -41,6 +41,7 @@ class FeatureEngineeringExecutor:
             target_col: 目标变量列名
         """
         self.target_col = target_col
+        self.allow_target_encoding = allow_target_encoding
         self.strategy: Optional[FeatureStrategy] = None
         
         # 【核心设计】：状态字典，用于保存训练集上的统计量或拟合好的编码器
@@ -49,6 +50,8 @@ class FeatureEngineeringExecutor:
             'fill_values': {},      # 保存填充的均值/中位数/众数
             'encoders': {},         # 保存 fit 好的 TargetEncoder 或 OneHotEncoder
             'scalers': {},          # 保存 fit 好的 StandardScaler 等
+            'transform_params': {}, # Box-Cox 等变换参数
+            'bin_edges': {},        # 保存训练期分箱边界
             'feature_columns': [],  # 保存处理后的特征列顺序
             'fitted': False         # 是否已 fit
         }
@@ -86,7 +89,7 @@ class FeatureEngineeringExecutor:
             df_out = self._execute_action(df_out, action_item, y, fit=True)
         
         # 保存处理后的特征列顺序 (用于推理时验证)
-        self.state['feature_columns'] = list(df_out.columns)
+        self.state['feature_columns'] = [col for col in df_out.columns if col != self.target_col]
         self.state['fitted'] = True
         
         logger.info(f"fit_transform 完成，最终形状：{df_out.shape}")
@@ -119,9 +122,14 @@ class FeatureEngineeringExecutor:
         for action_item in self.strategy.actions:
             df_out = self._execute_action(df_out, action_item, y=None, fit=False)
         
-        # 验证特征列顺序
-        if list(df_out.columns) != self.state['feature_columns']:
-            logger.warning("特征列顺序与训练时不一致，可能导致模型预测异常")
+        # 推理只返回训练时的特征列，并固定列顺序；目标列和未知输入列不进入模型。
+        df_out = df_out.drop(columns=[self.target_col], errors='ignore')
+        expected = self.state['feature_columns']
+        missing = [col for col in expected if col not in df_out.columns]
+        unexpected = [col for col in df_out.columns if col not in expected]
+        if missing or unexpected:
+            logger.warning("特征列已自动对齐：缺失=%s，忽略=%s", missing, unexpected)
+        df_out = df_out.reindex(columns=expected, fill_value=0)
         
         logger.info(f"transform 完成，最终形状：{df_out.shape}")
         return df_out
@@ -148,9 +156,9 @@ class FeatureEngineeringExecutor:
         col = action_item.column
         action = action_item.action
         
-        # 防御性编程：保护目标列不被删除
-        if action == "drop" and col == self.target_col:
-            logger.info(f"⚠️ 跳过对目标列 [{col}] 的 drop 操作，训练需要保留目标变量")
+        # 目标列只作为监督信号，禁止进入任何特征变换。
+        if col == self.target_col:
+            logger.info(f"⚠️ 跳过对目标列 [{col}] 的特征处理操作：{action}")
             return df
 
         # 防御性编程：无视 LLM 产生的列名幻觉
@@ -168,7 +176,7 @@ class FeatureEngineeringExecutor:
                 return self._fillna(df, col, action, fit)
             
             elif action.endswith("_transform"):
-                return self._transform_numeric(df, col, action)
+                return self._transform_numeric(df, col, action, fit)
             
             elif action.endswith("_encode"):
                 return self._encode(df, col, action, y, fit)
@@ -180,7 +188,7 @@ class FeatureEngineeringExecutor:
                 return self._scale(df, col, action, fit)
             
             elif action == "binning":
-                return self._binning(df, col, action_item.params)
+                return self._binning(df, col, action_item.params, fit)
             
             elif action == "interaction":
                 return self._interaction(df, col, action_item.params)
@@ -236,7 +244,8 @@ class FeatureEngineeringExecutor:
         self,
         df: pd.DataFrame,
         col: str,
-        action: str
+        action: str,
+        fit: bool,
     ) -> pd.DataFrame:
         """数值变换"""
         df = df.copy()
@@ -250,8 +259,19 @@ class FeatureEngineeringExecutor:
         
         elif action == "boxcox_transform":
             from scipy import stats
-            # Box-Cox 需要正值
-            df[col], _ = stats.boxcox(df[col].clip(lower=1e-6))
+            numeric = pd.to_numeric(df[col], errors='coerce')
+            if fit:
+                minimum = float(numeric.min()) if numeric.notna().any() else 0.0
+                shift = max(0.0, 1e-6 - minimum)
+                transformed, lmbda = stats.boxcox((numeric + shift).clip(lower=1e-6))
+                self.state['transform_params'][col] = {'type': 'boxcox', 'lambda': float(lmbda), 'shift': shift}
+                df[col] = transformed
+            else:
+                saved = self.state.get('transform_params', {}).get(col)
+                if not saved:
+                    raise RuntimeError(f"未找到 Box-Cox 训练参数：{col}")
+                positive = (numeric + saved['shift']).clip(lower=1e-6)
+                df[col] = stats.boxcox(positive, lmbda=saved['lambda'])
         
         return df
     
@@ -268,15 +288,26 @@ class FeatureEngineeringExecutor:
         
         if action == "target_encode":
             if fit:
-                # 训练阶段：fit 并保存编码器
-                encoder = ce.TargetEncoder(cols=[col])
-                df[col] = encoder.fit_transform(df[col], y)
-                self.state['encoders'][col] = encoder
-                logger.debug(f"保存 TargetEncoder：{col}")
+                if self.allow_target_encoding:
+                    if y is None:
+                        raise ValueError("Target Encoding 需要目标变量")
+                    encoder = ce.TargetEncoder(cols=[col])
+                    df[col] = encoder.fit_transform(df[col], y)
+                    self.state['encoders'][col] = encoder
+                    logger.debug(f"保存 TargetEncoder：{col}")
+                else:
+                    # AutoML 的特征工程发生在 CV 之前，监督式编码会让验证折标签泄漏。
+                    # 使用无监督频率编码保留高基数压缩能力。
+                    freq = df[col].value_counts(normalize=True, dropna=False).to_dict()
+                    self.state['encoders'][col] = {'type': 'frequency', 'mapping': freq}
+                    df[col] = df[col].map(freq).fillna(0.0)
+                    logger.warning("为避免交叉验证标签泄漏，列 [%s] 的 Target Encoding 已降级为频率编码", col)
             else:
                 # 推理阶段：使用保存的编码器
                 encoder = self.state['encoders'].get(col)
-                if encoder:
+                if isinstance(encoder, dict) and encoder.get('type') == 'frequency':
+                    df[col] = df[col].map(encoder['mapping']).fillna(0.0)
+                elif encoder:
                     df[col] = encoder.transform(df[col])
                 else:
                     logger.warning(f"未找到保存的编码器：{col}")
@@ -314,7 +345,7 @@ class FeatureEngineeringExecutor:
             else:
                 saved = self.state['encoders'].get(col)
                 if saved and saved.get('type') == 'frequency':
-                    df[col] = df[col].map(saved['mapping'])
+                    df[col] = df[col].map(saved['mapping']).fillna(0.0)
         
         return df
     
@@ -389,17 +420,28 @@ class FeatureEngineeringExecutor:
         self,
         df: pd.DataFrame,
         col: str,
-        params: Optional[Dict]
+        params: Optional[Dict],
+        fit: bool,
     ) -> pd.DataFrame:
         """分箱处理"""
         df = df.copy()
         bins = params.get('bins', 5) if params else 5
         
-        try:
-            df[col] = pd.qcut(df[col], q=bins, labels=False, duplicates='drop')
-        except Exception as e:
-            logger.warning(f"分箱失败：{e}，使用等宽分箱")
-            df[col] = pd.cut(df[col], bins=bins, labels=False)
+        numeric = pd.to_numeric(df[col], errors='coerce')
+        if fit:
+            try:
+                _, edges = pd.qcut(numeric, q=bins, retbins=True, duplicates='drop')
+            except Exception as e:
+                logger.warning(f"分箱失败：{e}，使用等宽分箱")
+                _, edges = pd.cut(numeric, bins=bins, retbins=True, duplicates='drop')
+            edges = np.asarray(edges, dtype=float)
+            edges[0], edges[-1] = -np.inf, np.inf
+            self.state['bin_edges'][col] = edges
+        else:
+            edges = self.state.get('bin_edges', {}).get(col)
+            if edges is None:
+                raise RuntimeError(f"未找到训练期分箱边界：{col}")
+        df[col] = pd.cut(numeric, bins=edges, labels=False, include_lowest=True).fillna(-1)
         
         return df
     
@@ -431,6 +473,7 @@ class FeatureEngineeringExecutor:
         """
         joblib.dump({
             'target_col': self.target_col,
+            'allow_target_encoding': self.allow_target_encoding,
             'strategy': self.strategy,
             'state': self.state
         }, path)
@@ -447,6 +490,9 @@ class FeatureEngineeringExecutor:
         self.target_col = data['target_col']
         self.strategy = data['strategy']
         self.state = data['state']
+        self.allow_target_encoding = data.get('allow_target_encoding', True)
+        self.state.setdefault('transform_params', {})
+        self.state.setdefault('bin_edges', {})
         logger.info(f"执行器已加载：{path}")
     
     def get_state(self) -> Dict[str, Any]:

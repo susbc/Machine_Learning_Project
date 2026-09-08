@@ -1,0 +1,492 @@
+<template>
+  <section class="workflow-workspace">
+    <div class="section-heading workflow-heading">
+      <div>
+        <p class="eyebrow">Phase 6</p>
+        <h2>Agent 工作流</h2>
+        <p>按步骤执行自然语言取数、特征策略生成、AutoML 训练和在线预测，后续步骤会受前置状态约束。</p>
+      </div>
+      <div class="heading-actions">
+        <el-button
+          data-testid="workflow-refresh-status-button"
+          :icon="Refresh"
+          :loading="refreshingStatus"
+          @click="refreshTask"
+        >
+          刷新状态
+        </el-button>
+        <el-button data-testid="workflow-model-list-button" :icon="List" :loading="loadingModels" @click="openModelList">
+          模型列表
+        </el-button>
+      </div>
+    </div>
+
+    <el-alert v-if="infoMessage" type="info" :title="infoMessage" show-icon :closable="true" @close="infoMessage = ''" />
+    <el-alert v-if="errorMessage" type="error" :title="errorMessage" show-icon :closable="false" />
+
+    <section class="workflow-status-strip">
+      <div class="status-item">
+        <span>Task ID</span>
+        <strong>{{ taskId || '-' }}</strong>
+      </div>
+      <div class="status-item">
+        <span>Step 1</span>
+        <strong>{{ stepState.retrieve }}</strong>
+      </div>
+      <div class="status-item">
+        <span>Step 2</span>
+        <strong>{{ stepState.features }}</strong>
+      </div>
+      <div class="status-item">
+        <span>Best AUC</span>
+        <strong>{{ taskStatus?.best_auc?.toFixed(4) ?? '-' }}</strong>
+      </div>
+    </section>
+
+    <section v-if="modelListVisible" class="panel model-list-panel" data-testid="workflow-model-list-panel">
+      <div class="panel-title">
+        <h3>模型列表</h3>
+        <span>{{ modelRecords.length }} 个模型</span>
+      </div>
+      <el-table :data="modelRecords" max-height="260">
+        <el-table-column prop="task_id" label="模型版本" width="180" />
+        <el-table-column prop="model_path" label="模型文件" />
+        <el-table-column label="操作" width="110">
+          <template #default="{ row }">
+            <el-button link type="primary" @click="selectModel(row)">选择</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </section>
+
+    <div class="workflow-grid">
+      <section class="panel">
+        <div class="panel-title">
+          <h3>1. 自然语言取数</h3>
+          <span>{{ retrieveResult?.data_shape?.join(' × ') ?? '待执行' }}</span>
+        </div>
+        <el-form label-position="top" @submit.prevent>
+          <el-form-item label="业务查询">
+            <el-input v-model="retrieveForm.user_query" type="textarea" :rows="4" />
+          </el-form-item>
+          <el-form-item label="目标列">
+            <el-input v-model="retrieveForm.target_col" />
+          </el-form-item>
+          <el-button type="primary" :loading="retrieving" @click="runRetrieve">生成 SQL 并提取数据</el-button>
+        </el-form>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <h3>2. 特征策略生成</h3>
+          <span>{{ featureResult?.actions_count ?? 0 }} 个动作</span>
+        </div>
+        <el-input v-model="featureMemo" type="textarea" :rows="5" placeholder="可选：补充业务先验或字段处理偏好" />
+        <el-button class="step-button" type="primary" :loading="generatingFeatures" :disabled="!canGenerateFeatures" @click="runFeatureGeneration">
+          生成特征策略
+        </el-button>
+        <el-table :data="featureActions" height="220" class="feature-table">
+          <el-table-column prop="action" label="动作" width="140" />
+          <el-table-column prop="column" label="字段" width="140" />
+          <el-table-column prop="reason" label="理由" />
+        </el-table>
+      </section>
+    </div>
+
+    <div class="workflow-grid">
+      <section class="panel">
+        <div class="panel-title">
+          <h3>3. AutoML 训练</h3>
+          <span>{{ trainEvents.length }} 条事件</span>
+        </div>
+        <div class="train-controls">
+          <el-input-number v-model="trainConfig.nTrials" :min="10" :max="100" controls-position="right" />
+          <el-input-number v-model="trainConfig.cvFolds" :min="3" :max="10" controls-position="right" />
+          <el-button type="warning" :loading="training" :disabled="!canTrain" @click="startTraining">开始训练</el-button>
+        </div>
+        <el-progress :percentage="trainingProgress" :status="trainingProgress === 100 ? 'success' : undefined" />
+        <el-table :data="trainEvents" height="240" class="event-table">
+          <el-table-column prop="status" label="状态" width="120" />
+          <el-table-column prop="trial" label="Trial" width="90" />
+          <el-table-column label="Best" width="120">
+            <template #default="{ row }">{{ formatMetric(row.best_value) }}</template>
+          </el-table-column>
+          <el-table-column prop="msg" label="消息" />
+        </el-table>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <h3>4. 在线预测</h3>
+          <span>{{ modelRecords.length }} 个模型</span>
+        </div>
+        <el-select v-model="predictForm.model_version" placeholder="选择模型版本">
+          <el-option v-for="model in modelRecords" :key="model.task_id" :label="model.task_id" :value="model.task_id" />
+        </el-select>
+        <el-input v-model="predictFeatureJson" class="predict-json" type="textarea" :rows="7" />
+        <el-button type="primary" :loading="predicting" :disabled="!canPredict" @click="runPrediction">执行预测</el-button>
+        <div v-if="predictionResult" class="prediction-result">
+          <span>预测值</span>
+          <strong>{{ predictionResult.prediction }}</strong>
+          <span>概率</span>
+          <strong>{{ predictionResult.probability.toFixed(4) }}</strong>
+        </div>
+      </section>
+    </div>
+
+    <section class="panel">
+      <div class="panel-title">
+        <h3>任务结果</h3>
+        <span>{{ taskStatus?.status ?? 'no task' }}</span>
+      </div>
+      <div class="result-grid">
+        <pre>{{ prettyRetrieve }}</pre>
+        <pre>{{ prettyTaskStatus }}</pre>
+      </div>
+    </section>
+  </section>
+</template>
+
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { List, Refresh } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus/es/components/message/index.mjs'
+
+import {
+  workflowApi,
+  type WorkflowFeatureAction,
+  type WorkflowFeatureResponse,
+  type WorkflowModelRecord,
+  type WorkflowPredictResponse,
+  type WorkflowRetrieveResponse,
+  type WorkflowTaskStatus,
+  type WorkflowTrainEvent,
+} from '@/api/workflow'
+
+const retrieveForm = reactive({
+  user_query: '查询所有司机订单数据，并包含司机年龄和城市信息',
+  target_col: 'is_fraud',
+})
+const trainConfig = reactive({
+  nTrials: 10,
+  cvFolds: 3,
+})
+const predictForm = reactive({
+  model_version: '',
+})
+const featureMemo = ref('')
+const predictFeatureJson = ref('{\n  "order_fee": 128.5,\n  "age": 35,\n  "city_code": "北京"\n}')
+const taskId = ref('')
+const retrieveResult = ref<WorkflowRetrieveResponse | null>(null)
+const featureResult = ref<WorkflowFeatureResponse | null>(null)
+const taskStatus = ref<WorkflowTaskStatus | null>(null)
+const predictionResult = ref<WorkflowPredictResponse | null>(null)
+const modelRecords = ref<WorkflowModelRecord[]>([])
+const trainEvents = ref<WorkflowTrainEvent[]>([])
+const retrieving = ref(false)
+const generatingFeatures = ref(false)
+const training = ref(false)
+const predicting = ref(false)
+const refreshingStatus = ref(false)
+const loadingModels = ref(false)
+const errorMessage = ref('')
+const infoMessage = ref('')
+const modelListVisible = ref(false)
+let streamController: AbortController | null = null
+
+const stepState = computed(() => ({
+  retrieve: taskId.value ? '完成' : '待执行',
+  features: featureResult.value ? '完成' : '待执行',
+}))
+const canGenerateFeatures = computed(() => Boolean(taskId.value) && !generatingFeatures.value)
+const canTrain = computed(() => Boolean(taskId.value && featureResult.value) && !training.value)
+const canPredict = computed(() => Boolean(predictForm.model_version && predictFeatureJson.value.trim()))
+const featureActions = computed<WorkflowFeatureAction[]>(() => featureResult.value?.strategy?.actions ?? [])
+const trainingProgress = computed(() => {
+  if (trainEvents.value.some((event) => event.status === 'DONE')) return 100
+  const latestTrial = trainEvents.value.reduce((max, event) => Math.max(max, Number(event.trial ?? 0)), 0)
+  return Math.min(95, Math.round((latestTrial / Math.max(trainConfig.nTrials, 1)) * 100))
+})
+const prettyRetrieve = computed(() => JSON.stringify(retrieveResult.value ?? {}, null, 2))
+const prettyTaskStatus = computed(() => JSON.stringify(taskStatus.value ?? {}, null, 2))
+
+async function runRetrieve() {
+  retrieving.value = true
+  errorMessage.value = ''
+  infoMessage.value = ''
+  try {
+    const result = await workflowApi.retrieveData({ ...retrieveForm })
+    if (result.status !== 'success' || !result.task_id) {
+      throw new Error(result.msg ?? 'Step 1 未成功返回 task_id')
+    }
+    retrieveResult.value = result
+    taskId.value = result.task_id
+    featureResult.value = null
+    trainEvents.value = []
+    predictionResult.value = null
+    ElMessage.success('数据提取完成')
+    await refreshTask()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '自然语言取数失败'
+  } finally {
+    retrieving.value = false
+  }
+}
+
+async function runFeatureGeneration() {
+  if (!taskId.value) return
+  generatingFeatures.value = true
+  errorMessage.value = ''
+  infoMessage.value = ''
+  try {
+    featureResult.value = await workflowApi.generateFeatures({
+      task_id: taskId.value,
+      eda_report_text: featureMemo.value,
+    })
+    ElMessage.success('特征策略已生成')
+    await refreshTask()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '特征策略生成失败'
+  } finally {
+    generatingFeatures.value = false
+  }
+}
+
+function startTraining() {
+  if (!taskId.value) return
+  closeTrainingStream()
+  trainEvents.value = []
+  training.value = true
+  errorMessage.value = ''
+  infoMessage.value = ''
+  const controller = new AbortController()
+  streamController = controller
+  void workflowApi.streamTraining(taskId.value, trainConfig.nTrials, trainConfig.cvFolds, async (payload: WorkflowTrainEvent) => {
+    trainEvents.value.unshift(payload)
+    if (payload.status === 'DONE') {
+      training.value = false
+      closeTrainingStream()
+      await refreshTask()
+      await loadModels()
+      if (taskId.value) predictForm.model_version = taskId.value
+    }
+    if (payload.status === 'ERROR') {
+      training.value = false
+      errorMessage.value = payload.msg ?? '训练失败'
+      closeTrainingStream()
+    }
+  }, controller.signal).catch((error: unknown) => {
+    if (controller.signal.aborted) return
+    training.value = false
+    errorMessage.value = error instanceof Error ? error.message : '训练流连接中断'
+    if (streamController === controller) streamController = null
+  })
+}
+
+async function refreshTask() {
+  errorMessage.value = ''
+  if (!taskId.value) {
+    taskStatus.value = null
+    infoMessage.value = '暂无任务可刷新，请先完成自然语言取数'
+    return
+  }
+  refreshingStatus.value = true
+  try {
+    taskStatus.value = await workflowApi.getTaskStatus(taskId.value)
+    infoMessage.value = '任务状态已刷新'
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '任务状态刷新失败'
+  } finally {
+    refreshingStatus.value = false
+  }
+}
+
+async function openModelList() {
+  modelListVisible.value = true
+  await loadModels()
+}
+
+async function loadModels() {
+  loadingModels.value = true
+  errorMessage.value = ''
+  try {
+    modelRecords.value = (await workflowApi.listModels()).models
+    if (!predictForm.model_version && modelRecords.value[0]) {
+      predictForm.model_version = modelRecords.value[0].task_id
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '模型列表加载失败'
+  } finally {
+    loadingModels.value = false
+  }
+}
+
+function selectModel(model: WorkflowModelRecord) {
+  predictForm.model_version = model.task_id
+  infoMessage.value = `已选择模型 ${model.task_id}`
+}
+
+async function runPrediction() {
+  predicting.value = true
+  errorMessage.value = ''
+  infoMessage.value = ''
+  try {
+    predictionResult.value = await workflowApi.predict({
+      model_version: predictForm.model_version,
+      features: JSON.parse(predictFeatureJson.value) as Record<string, unknown>,
+    })
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '预测失败，请检查 JSON 和模型版本'
+  } finally {
+    predicting.value = false
+  }
+}
+
+function formatMetric(value: number | null | undefined) {
+  return typeof value === 'number' ? value.toFixed(4) : '-'
+}
+
+function closeTrainingStream() {
+  if (streamController) {
+    streamController.abort()
+    streamController = null
+  }
+}
+
+onMounted(loadModels)
+onBeforeUnmount(closeTrainingStream)
+</script>
+
+<style scoped>
+.workflow-workspace {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.workflow-heading,
+.panel-title,
+.heading-actions,
+.train-controls,
+.prediction-result {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.workflow-heading,
+.panel-title {
+  justify-content: space-between;
+}
+
+.heading-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.workflow-status-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.status-item,
+.panel {
+  border: 1px solid #dbe3ef;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 14px 40px rgba(15, 23, 42, 0.06);
+}
+
+.status-item {
+  min-width: 0;
+  padding: 16px;
+}
+
+.status-item span,
+.panel-title span {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.status-item strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 5px;
+  color: #0f172a;
+  font-size: 19px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-grid,
+.result-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.panel {
+  min-width: 0;
+  padding: 18px;
+}
+
+.panel-title {
+  margin-bottom: 14px;
+}
+
+.panel-title h3 {
+  margin: 0;
+  color: #111827;
+  font-size: 16px;
+}
+
+.step-button,
+.feature-table,
+.event-table,
+.predict-json {
+  margin-top: 12px;
+}
+
+.train-controls {
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.prediction-result {
+  justify-content: space-between;
+  border: 1px solid #dbe3ef;
+  border-radius: 8px;
+  margin-top: 14px;
+  padding: 12px;
+}
+
+.prediction-result span {
+  color: #64748b;
+}
+
+pre {
+  overflow: auto;
+  max-height: 300px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  margin: 0;
+  padding: 12px;
+  color: #334155;
+}
+
+@media (max-width: 1080px) {
+  .workflow-grid,
+  .workflow-status-strip,
+  .result-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .workflow-heading,
+  .panel-title {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+</style>

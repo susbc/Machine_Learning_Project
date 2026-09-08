@@ -307,7 +307,8 @@ class NL2SQLEngine:
         match = re.search(r"表名：(\w+)", prompt)
         if match:
             table = match.group(1)
-            return f"SELECT * FROM {table} LIMIT 10;"
+            # table 来自上方 \w+ 的严格匹配，仅用于无 LLM 时的演示回退。
+            return f"SELECT * FROM {table} LIMIT 10;"  # nosec B608
         return ""
     
     def _extract_sql(self, text: str) -> str:

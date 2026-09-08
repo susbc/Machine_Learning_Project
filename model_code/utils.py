@@ -10,7 +10,7 @@
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import OrdinalEncoder, StandardScaler, MinMaxScaler, RobustScaler
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.base import BaseEstimator, TransformerMixin
 from typing import Dict, List, Optional, Tuple, Union
 import warnings
@@ -264,7 +264,7 @@ def handle_dataframe_missing_values(data: pd.DataFrame, df_field: pd.DataFrame) 
         for f in fill_by_mode:
             mode_val = data[f].mode()
             if len(mode_val) > 0:
-                data[f].fillna(mode_val.iloc[0], inplace=True)
+                data[f] = data[f].fillna(mode_val.iloc[0])
         print(f"使用众数填充字段：{fill_by_mode}")
     
     if fill_by_value:
@@ -444,7 +444,16 @@ class ConfigDrivenPreprocessor(BaseEstimator, TransformerMixin):
         if self.enable_encoding:
             for field, encoder in self.encoders_.items():
                 if field in X.columns:
-                    X[field] = encoder.transform(X[[field]]).flatten()
+                    encoded = encoder.transform(X[[field]])
+                    if isinstance(encoder, OneHotEncoder):
+                        encoded_df = pd.DataFrame(
+                            encoded,
+                            columns=encoder.get_feature_names_out([field]),
+                            index=X.index,
+                        )
+                        X = pd.concat([X.drop(columns=[field]), encoded_df], axis=1)
+                    else:
+                        X[field] = encoded.flatten()
 
         return X
     
@@ -520,7 +529,15 @@ class ConfigDrivenPreprocessor(BaseEstimator, TransformerMixin):
             if field not in X.columns:
                 continue
             
-            if ecode_type != 'one-hot':  # one-hot 不需要 fit
+            if ecode_type == 'one-hot':
+                self.encoders_[field] = OneHotEncoder(
+                    handle_unknown='ignore',
+                    min_frequency=2,
+                    max_categories=100,
+                    sparse_output=False,
+                )
+                self.encoders_[field].fit(X[[field]])
+            else:
                 self.encoders_[field] = OrdinalEncoder(
                     handle_unknown='use_encoded_value',
                     unknown_value=-1,

@@ -87,7 +87,8 @@ if step == "Step 1: 数据提取":
                         json={
                             "user_query": user_query,
                             "target_col": target_col
-                        }
+                        },
+                        timeout=30,
                     )
                     
                     if response.status_code == 200:
@@ -149,7 +150,8 @@ elif step == "Step 2: 特征策略":
                         json={
                             "task_id": st.session_state.task_id,
                             "eda_report_text": eda_report
-                        }
+                        },
+                        timeout=30,
                     )
                     
                     if response.status_code == 200:
@@ -320,7 +322,8 @@ elif step == "Step 4: 线上预测":
                         json={
                             "model_version": selected_model,
                             "features": features
-                        }
+                        },
+                        timeout=30,
                     )
                     
                     if response.status_code == 200:
@@ -367,7 +370,7 @@ elif step == "任务状态查询":
             st.warning("请输入 Task ID")
         else:
             try:
-                response = requests.get(f"{API_BASE}/task/{task_id_query}/status")
+                response = requests.get(f"{API_BASE}/task/{task_id_query}/status", timeout=10)
                 
                 if response.status_code == 200:
                     result = response.json()

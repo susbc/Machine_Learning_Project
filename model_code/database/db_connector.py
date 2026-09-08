@@ -5,6 +5,7 @@
 """
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 from sqlalchemy.exc import SQLAlchemyError
 from typing import Optional, Dict, Any, List
 import pandas as pd
@@ -14,6 +15,24 @@ import re
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 驱动层禁止的连接参数（与 backend/api/database.py 的 FORBIDDEN_EXTRA_PARAM_KEYS 对齐）。
+# 存量连接配置（config/saved_connections.json）可能绕过 API 层新增的校验，
+# 因此连接串构造层必须再拦截一次：
+#   local_infile      —— pymysql 启用 LOAD DATA LOCAL，恶意服务器可读取本机任意文件
+#   read_default_file —— pymysql 读取任意路径的 MySQL 选项文件
+#   client_flag       —— 可重新打开 CLIENT_LOCAL_FILES 能力位
+#   init_command      —— 连接建立后自动执行任意 SQL
+#   dsn/odbc_connect  —— pyodbc 任意 DSN / 完整连接串
+FORBIDDEN_DRIVER_PARAM_KEYS = {
+    "local_infile",
+    "read_default_file",
+    "read_default_group",
+    "client_flag",
+    "init_command",
+    "dsn",
+    "odbc_connect",
+}
 
 
 class DatabaseConnector:
@@ -71,30 +90,52 @@ class DatabaseConnector:
                     raise ValueError(f"{self.db_type} 需要指定 {field} 字段")
     
     def _build_connection_string(self) -> str:
-        """构建数据库连接字符串"""
+        """构建数据库连接字符串。
+
+        使用 SQLAlchemy 的 URL.create 组装（而非手工字符串拼接），
+        并对 extra_params 做驱动层黑名单校验，防止：
+        1) 危险驱动参数（如 local_infile）把连接变成任意文件读取原语；
+        2) 参数值中的 '&'/'?'/'#' 注入额外连接参数；
+        3) 用户名/密码/库名中的特殊字符破坏或注入 URL 段。
+        """
+        database = str(self.config['database'])
+
         if self.db_type == 'sqlite':
-            return f"{self.DB_DRIVERS['sqlite']}:///{self.config['database']}"
-        
+            return URL.create('sqlite', database=database).render_as_string(hide_password=False)
+
         driver = self.DB_DRIVERS[self.db_type]
-        user = self.config.get('user', '')
-        password = self.config.get('password', '')
+        user = self.config.get('user', '') or None
+        password = self.config.get('password', '') or None
         host = self.config.get('host', 'localhost')
-        port = self.config.get('port', self._get_default_port())
-        database = self.config['database']
-        
-        # 构建连接字符串
-        if password:
-            conn_str = f"{driver}://{user}:{password}@{host}:{port}/{database}"
-        else:
-            conn_str = f"{driver}://{user}@{host}:{port}/{database}"
-        
-        # 添加额外参数
-        extra_params = self.config.get('extra_params', {})
-        if extra_params:
-            params = "&".join(f"{k}={v}" for k, v in extra_params.items())
-            conn_str += f"?{params}"
-        
-        return conn_str
+        port = int(self.config.get('port', self._get_default_port()))
+
+        query: Dict[str, str] = {}
+        extra_params = self.config.get('extra_params') or {}
+        for key, value in extra_params.items():
+            str_key = str(key)
+            if str_key.strip().lower() in FORBIDDEN_DRIVER_PARAM_KEYS:
+                raise ValueError(f"数据库连接配置包含被禁止的危险参数：{str_key}")
+            if isinstance(value, bool):
+                query[str_key] = "1" if value else "0"
+            elif isinstance(value, (int, float)):
+                query[str_key] = str(value)
+            elif isinstance(value, str):
+                if re.search(r"[&?#;]", value):
+                    raise ValueError(f"数据库连接参数 {str_key} 的值包含非法字符")
+                query[str_key] = value
+            else:
+                raise ValueError(f"数据库连接参数 {str_key} 的值类型不受支持")
+
+        url = URL.create(
+            driver,
+            username=user,
+            password=password,
+            host=host,
+            port=port,
+            database=database,
+            query=query,
+        )
+        return url.render_as_string(hide_password=False)
     
     def _get_default_port(self) -> int:
         """获取数据库默认端口"""

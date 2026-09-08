@@ -105,6 +105,31 @@ class Neo4jClient:
         except Exception as e:
             logger.error(f"列出业务域失败：{e}")
             return []
+
+    def _link_table_to_database(self, table_name: str, db_name: str) -> bool:
+        """
+        建立表到业务域的 CONTAINS 关系
+
+        Args:
+            table_name: 表名
+            db_name: 业务域名
+
+        Returns:
+            bool: 是否成功
+        """
+        cypher = """
+        MATCH (db:Database {name: $db_name})
+        MATCH (t:Table {name: $table_name})
+        MERGE (db)-[:CONTAINS]->(t)
+        """
+        try:
+            with self.driver.session() as session:
+                session.run(cypher, db_name=db_name, table_name=table_name)
+            logger.debug(f"建立业务域关联：{db_name} CONTAINS {table_name}")
+            return True
+        except Exception as e:
+            logger.error(f"建立业务域关联失败：{e}")
+            return False
     
     # ==================== 表节点操作 ====================
     
@@ -330,8 +355,8 @@ class Neo4jClient:
             bool: 是否成功
         """
         cypher = """
-        MATCH (ft:Table {table_name: $from_table})-[:HAS_COLUMN]->(fc:Column {table: $from_table, name: $from_col})
-        MATCH (tt:Table {table_name: $to_table})-[:HAS_COLUMN]->(tc:Column {table: $to_table, name: $to_col})
+        MATCH (ft:Table {name: $from_table})-[:HAS_COLUMN]->(fc:Column {table: $from_table, name: $from_col})
+        MATCH (tt:Table {name: $to_table})-[:HAS_COLUMN]->(tc:Column {table: $to_table, name: $to_col})
         MERGE (fc)-[r:FOREIGN_KEY_TO]->(tc)
         SET r.join_type = $join_type,
             r.created_at = datetime()
