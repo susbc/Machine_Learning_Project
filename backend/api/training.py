@@ -464,6 +464,9 @@ def _run_training_job(job_id: str, test_size: float, random_state: int) -> None:
             confusion_matrix = metrics["confusion_matrix"]
             threshold_calibration = calibration
         feature_importance = feature_importance_rows(model, list(preprocessor.get_feature_names_out()))
+        display_metric = "r2" if spec.resolved_type == ProblemType.REGRESSION else (
+            "roc_auc" if "roc_auc" in metrics else "accuracy"
+        )
         result = {
             "job_id": job.job_id,
             "dataset_id": job.dataset_id,
@@ -482,6 +485,7 @@ def _run_training_job(job_id: str, test_size: float, random_state: int) -> None:
                 "problem_type": spec.resolved_type.value,
                 "problem_spec": spec.to_dict(),
                 "metric_directions": spec.metric_directions,
+                "best_metric": display_metric,
                 "model": model,
                 "preprocessor": preprocessor,
                 "label_encoder": bundle.label_encoder,
