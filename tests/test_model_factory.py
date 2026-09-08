@@ -64,3 +64,32 @@ def test_catboost_rejects_filesystem_related_params(bad_params):
     防止 fit() 被诱导在任意目录创建文件（受限文件写入原语）。"""
     with pytest.raises(ValueError, match="文件系统"):
         ModelFactory.build("catboost", task_type="binary", params=bad_params)
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "params"),
+    [
+        ("lightgbm", {"n_estimators": 5, "n_jobs": 1}),
+        ("xgboost", {"n_estimators": 5, "max_depth": 2, "n_jobs": 1}),
+        ("catboost", {"iterations": 5, "depth": 2, "thread_count": 1}),
+        ("random_forest", {"n_estimators": 5, "max_depth": 2, "n_jobs": 1}),
+        ("linear_regression", {}),
+    ],
+)
+def test_factory_builds_regressors(algorithm, params):
+    X = np.arange(60, dtype=float).reshape(30, 2)
+    y = X[:, 0] * 2.5 - X[:, 1]
+
+    model = ModelFactory.build(algorithm, task_type="regression", params=params)
+    model.fit(X, y)
+    prediction = model.predict(X[:2])
+
+    assert prediction.shape == (2,)
+    assert np.issubdtype(prediction.dtype, np.floating)
+
+
+def test_factory_rejects_task_incompatible_linear_models():
+    with pytest.raises(ValueError, match="logistic_regression"):
+        ModelFactory.build("logistic_regression", task_type="regression")
+    with pytest.raises(ValueError, match="linear_regression"):
+        ModelFactory.build("linear_regression", task_type="binary")

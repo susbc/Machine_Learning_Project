@@ -23,6 +23,13 @@ import numpy as np
 import pandas as pd
 from fastapi import HTTPException, UploadFile
 
+from core.automl.problem_spec import (
+    ProblemSpec,
+    ProblemType,
+    resolve_problem_spec,
+    validate_train_test_split,
+)
+
 logger = logging.getLogger(__name__)
 
 LABEL_NAME_CANDIDATES = ("label", "target", "y", "class", "is_fraud", "是否违约", "标签", "目标")
@@ -142,6 +149,7 @@ class TrainBundle:
     y_train: pd.Series
     y_test: pd.Series
     label_encoder: Any
+    problem_spec: ProblemSpec
     preprocessor: Any  # 未 fit 的 ColumnTransformer，仅在 X_train 上构建
     feature_columns: List[str]  # 原始输入列名（推理时的对齐基准）
 
@@ -203,14 +211,18 @@ def prepare_train_pipeline(
     *,
     test_size: Optional[float] = None,
     random_state: int = 42,
+    problem_spec: Optional[ProblemSpec] = None,
 ) -> TrainBundle:
-    """清洗 → 剔键列 → 标签编码 → 先划分原始特征 → 仅从训练集构建预处理器。
+    """清洗 → 剔键列 → 按任务处理目标 → 划分特征 → 构建预处理器。
 
     与旧 get_dummies 方案的关键差异：类别集合、缺失值统计量、缩放参数
     都只在训练集上学习，测试集/推理期只做 transform，杜绝划分前泄漏。
     """
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import LabelEncoder
+
+    if problem_spec is None:
+        problem_spec = resolve_problem_spec(df[target_col], target_col, "auto")
 
     clean_df = df.copy()
     clean_df = clean_df.loc[clean_df[target_col].notna()].reset_index(drop=True)
@@ -224,25 +236,29 @@ def prepare_train_pipeline(
     if len(numeric_cols):
         feature_df.loc[:, numeric_cols] = feature_df.loc[:, numeric_cols].replace([np.inf, -np.inf], np.nan)
 
-    label_encoder = LabelEncoder()
-    y = pd.Series(label_encoder.fit_transform(clean_df[target_col]), name=target_col)
-    if y.nunique() < 2:
-        raise ValueError("目标变量至少需要 2 个类别")
-    class_counts = y.value_counts()
-    if int(class_counts.min()) < 2:
-        rare_labels = label_encoder.inverse_transform(class_counts[class_counts < 2].index.to_numpy())
-        raise ValueError(f"每个类别至少需要 2 条记录；样本不足的类别：{', '.join(map(str, rare_labels))}")
-
     if test_size is None:
         test_size = 0.25 if len(feature_df) >= 20 else 0.3
-    n_classes = int(y.nunique())
-    n_test = math.ceil(len(feature_df) * test_size)
-    if n_test < n_classes or len(feature_df) - n_test < n_classes:
-        raise ValueError(
-            f"当前测试集比例无法让训练集和测试集覆盖全部 {n_classes} 个类别，请增加样本或调整测试集比例"
-        )
+
+    if problem_spec.resolved_type == ProblemType.REGRESSION:
+        y = pd.to_numeric(clean_df[target_col], errors="raise").astype(float)
+        if not np.isfinite(y.to_numpy(dtype=float)).all():
+            raise ValueError("回归任务的目标列必须是有限数值")
+        label_encoder = None
+        stratify = None
+    else:
+        label_encoder = LabelEncoder()
+        y = pd.Series(label_encoder.fit_transform(clean_df[target_col]), name=target_col)
+        if y.nunique() < 2:
+            raise ValueError("目标变量至少需要 2 个类别")
+        class_counts = y.value_counts()
+        if int(class_counts.min()) < 2:
+            rare_labels = label_encoder.inverse_transform(class_counts[class_counts < 2].index.to_numpy())
+            raise ValueError(f"每个类别至少需要 2 条记录；样本不足的类别：{', '.join(map(str, rare_labels))}")
+        stratify = y
+
+    validate_train_test_split(problem_spec, y, test_size)
     X_train, X_test, y_train, y_test = train_test_split(
-        feature_df, y, test_size=test_size, random_state=random_state, stratify=y
+        feature_df, y, test_size=test_size, random_state=random_state, stratify=stratify
     )
     preprocessor = build_preprocessor(X_train)
     return TrainBundle(
@@ -251,6 +267,7 @@ def prepare_train_pipeline(
         y_train=y_train,
         y_test=y_test,
         label_encoder=label_encoder,
+        problem_spec=problem_spec,
         preprocessor=preprocessor,
         feature_columns=[str(col) for col in feature_df.columns],
     )
@@ -352,6 +369,24 @@ def compute_classification_metrics(model, X_test, y_test, *, decision_threshold:
     return metrics
 
 
+def compute_regression_metrics(model, X_test, y_test) -> Dict[str, float]:
+    """计算回归指标。"""
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+    y_pred = model.predict(X_test)
+    try:
+        from sklearn.metrics import root_mean_squared_error
+    except ImportError:  # pragma: no cover - 仅覆盖旧版 sklearn
+        rmse = math.sqrt(mean_squared_error(y_test, y_pred))
+    else:
+        rmse = root_mean_squared_error(y_test, y_pred)
+    return {
+        "rmse": float(rmse),
+        "mae": float(mean_absolute_error(y_test, y_pred)),
+        "r2": float(r2_score(y_test, y_pred)),
+    }
+
+
 def save_job_artifact(artifact_dir: Path, prefix: str, job_id: str, artifact: Any, project_root: Path) -> str:
     """将任务产物保存到 artifact_dir 内（含目录约束校验），返回项目相对路径。"""
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -370,7 +405,8 @@ def feature_importance_rows(model: Any, feature_names: List[str], top_n: int = 3
     if hasattr(model, "feature_importances_"):
         values = np.asarray(model.feature_importances_, dtype=float)
     elif hasattr(model, "coef_"):
-        values = np.mean(np.abs(np.asarray(model.coef_, dtype=float)), axis=0)
+        coefficients = np.asarray(model.coef_, dtype=float)
+        values = np.abs(coefficients) if coefficients.ndim == 1 else np.mean(np.abs(coefficients), axis=0)
     else:
         return []
     names = [str(name) for name in feature_names]
@@ -401,6 +437,20 @@ def predict_with_artifact(artifact: Dict[str, Any], features_list: List[Dict[str
     label_encoder = artifact.get("label_encoder")
     preprocessor = artifact.get("preprocessor")
     executor = artifact.get("feature_executor")
+    try:
+        is_schema_v3 = int(artifact.get("artifact_schema_version", 0)) >= 3
+    except (TypeError, ValueError):
+        is_schema_v3 = False
+    persisted_problem_type = artifact.get("problem_type")
+    if persisted_problem_type is None:
+        saved_spec = artifact.get("problem_spec")
+        if isinstance(saved_spec, ProblemSpec):
+            persisted_problem_type = saved_spec.resolved_type
+        elif isinstance(saved_spec, dict):
+            persisted_problem_type = saved_spec.get("resolved_type")
+    if isinstance(persisted_problem_type, ProblemType):
+        persisted_problem_type = persisted_problem_type.value
+    is_regression = is_schema_v3 and persisted_problem_type == ProblemType.REGRESSION.value
 
     frame = pd.DataFrame(features_list)
     unknown_keys: List[str] = []
@@ -423,8 +473,24 @@ def predict_with_artifact(artifact: Dict[str, Any], features_list: List[Dict[str
             frame = frame.reindex(columns=feature_columns, fill_value=0)
         matrix = frame
 
+    raw_predictions = np.asarray(model.predict(matrix)).ravel()
+    if is_regression:
+        diagnostics = {
+            "unknown_input_keys": unknown_keys,
+            "missing_columns_imputed": [str(col) for col in missing],
+        }
+        return [
+            {
+                "prediction": float(raw_prediction),
+                "encoded_prediction": None,
+                "probability": None,
+                "diagnostics": diagnostics,
+            }
+            for raw_prediction in raw_predictions
+        ]
+
     proba = model.predict_proba(matrix) if hasattr(model, "predict_proba") else None
-    encoded = np.asarray(model.predict(matrix)).ravel()
+    encoded = raw_predictions
     decision_threshold = artifact.get("decision_threshold")
     classes = list(getattr(model, "classes_", []))
     if proba is not None and proba.shape[1] == 2 and decision_threshold is not None and 1 in classes:

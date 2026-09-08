@@ -14,11 +14,13 @@ from backend.api._dataset import (
     build_preprocessor,
     calibrate_binary_threshold,
     compute_classification_metrics,
+    compute_regression_metrics,
     dataframe_quality_report,
     feature_importance_rows,
     prepare_train_pipeline,
     predict_with_artifact,
 )
+from core.automl.problem_spec import resolve_problem_spec
 
 
 def _sample_df(n: int = 80) -> pd.DataFrame:
@@ -147,6 +149,27 @@ def test_build_preprocessor_rejects_empty_features():
         prepare_train_pipeline(df, "label", [])
 
 
+def test_prepare_regression_pipeline_keeps_continuous_target():
+    df = pd.DataFrame({"x": range(20), "price": np.linspace(10.25, 40.75, 20)})
+    spec = resolve_problem_spec(df["price"], "price", "auto")
+
+    bundle = prepare_train_pipeline(df, "price", [], test_size=0.25, problem_spec=spec)
+
+    assert bundle.label_encoder is None
+    assert bundle.problem_spec.resolved_type.value == "regression"
+    assert bundle.y_train.dtype.kind == "f"
+    assert set(bundle.y_train) <= set(df["price"])
+
+
+def test_prepare_regression_pipeline_rejects_non_finite_target_with_saved_spec():
+    valid = pd.Series(np.linspace(1.0, 8.0, 8), name="price")
+    spec = resolve_problem_spec(valid, "price", "regression")
+    df = pd.DataFrame({"x": range(8), "price": [1.0, 2.0, 3.0, 4.0, np.inf, 6.0, 7.0, 8.0]})
+
+    with pytest.raises(ValueError, match="有限数值"):
+        prepare_train_pipeline(df, "price", [], problem_spec=spec)
+
+
 # ---------- compute_classification_metrics ----------
 
 
@@ -185,6 +208,20 @@ def test_binary_threshold_is_calibrated_without_test_data():
     assert calibration["calibration_size"] == 16
 
 
+def test_compute_regression_metrics_returns_only_regression_metrics():
+    from sklearn.linear_model import LinearRegression
+
+    model = LinearRegression().fit([[0], [1], [2], [3]], [1.0, 3.0, 5.0, 7.0])
+
+    metrics = compute_regression_metrics(model, [[4], [5]], [9.0, 11.0])
+
+    assert metrics == {
+        "rmse": pytest.approx(0.0),
+        "mae": pytest.approx(0.0),
+        "r2": pytest.approx(1.0),
+    }
+
+
 # ---------- feature_importance_rows ----------
 
 
@@ -209,6 +246,21 @@ def test_feature_importance_rows_mismatch_zips_shortest():
 
 def test_feature_importance_rows_no_attributes_returns_empty():
     assert feature_importance_rows(object(), ["a", "b"]) == []
+
+
+def test_feature_importance_rows_supports_linear_regression_coefficients():
+    from sklearn.linear_model import LinearRegression
+
+    X = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [2.0, 1.0]])
+    y = 2.0 * X[:, 0] - 3.0 * X[:, 1] + 4.0
+    model = LinearRegression().fit(X, y)
+
+    rows = feature_importance_rows(model, ["first", "second"])
+
+    assert rows == [
+        {"feature": "second", "importance": pytest.approx(3.0)},
+        {"feature": "first", "importance": pytest.approx(2.0)},
+    ]
 
 
 # ---------- predict_with_artifact ----------
@@ -255,6 +307,51 @@ def test_predict_v2_string_labels_roundtrip():
         artifact["preprocessor"].transform(pd.DataFrame([{"age": 45, "city": "北京"}]))
     )[0]
     assert row["probability"] == pytest.approx(float(proba[int(row["encoded_prediction"])]))
+
+
+def test_schema_v3_regression_prediction_has_no_class_fields():
+    from sklearn.linear_model import LinearRegression
+
+    model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+
+    result = predict_with_artifact(
+        {
+            "artifact_schema_version": 3,
+            "problem_type": "regression",
+            "model": model,
+            "feature_columns": ["x"],
+        },
+        [{"x": 3}],
+    )[0]
+
+    assert result["prediction"] == pytest.approx(7.5)
+    assert result["encoded_prediction"] is None
+    assert result["probability"] is None
+
+
+def test_schema_v3_regression_prediction_uses_nested_persisted_problem_spec():
+    from sklearn.linear_model import LinearRegression
+
+    target = pd.Series([1.5, 3.5, 5.5], name="price")
+    spec = resolve_problem_spec(target, "price", "regression")
+    model = LinearRegression().fit([[0], [1], [2]], target)
+
+    result = predict_with_artifact(
+        {
+            "artifact_schema_version": 3,
+            "problem_spec": spec.to_dict(),
+            "model": model,
+            "feature_columns": ["x"],
+        },
+        [{"x": 3}],
+    )[0]
+
+    assert result == {
+        "prediction": pytest.approx(7.5),
+        "encoded_prediction": None,
+        "probability": None,
+        "diagnostics": {"unknown_input_keys": [], "missing_columns_imputed": []},
+    }
 
 
 def test_predict_v2_diagnostics_for_unknown_missing_and_typo_keys():
