@@ -55,7 +55,7 @@
           <span>预测值</span>
           <strong>{{ predictionResult.prediction }}</strong>
           <span>概率</span>
-          <strong>{{ predictionResult.probability.toFixed(4) }}</strong>
+          <strong>{{ predictionResult.probability == null ? '-' : predictionResult.probability.toFixed(4) }}</strong>
         </div>
         <el-empty v-else description="暂无预测结果" />
       </section>
@@ -80,7 +80,7 @@
         <el-table-column prop="index" label="#" width="80" />
         <el-table-column prop="prediction" label="预测值" width="120" />
         <el-table-column label="概率" width="140">
-          <template #default="{ row }">{{ row.probability.toFixed(4) }}</template>
+          <template #default="{ row }">{{ row.probability == null ? '-' : row.probability.toFixed(4) }}</template>
         </el-table-column>
         <el-table-column label="输入特征">
           <template #default="{ row }">{{ JSON.stringify(row.features) }}</template>

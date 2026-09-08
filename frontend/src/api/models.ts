@@ -1,4 +1,5 @@
 import { createRequestJson } from './client'
+import type { ProblemSpec, ResolvedProblemType } from './problem'
 
 export interface ModelRegistryRecord {
   model_id: string
@@ -6,6 +7,10 @@ export interface ModelRegistryRecord {
   name: string
   artifact_path: string
   metrics: Record<string, unknown>
+  problem_type: ResolvedProblemType | null
+  problem_spec: ProblemSpec | null
+  legacy: boolean
+  metadata_error: unknown | null
   updated_at: number
 }
 
@@ -18,7 +23,8 @@ export interface ModelPredictionResponse {
   source: string
   input_features: Record<string, unknown>
   prediction: number
-  probability: number
+  encoded_prediction: number | null
+  probability: number | null
 }
 
 export interface ModelBatchPredictionInput {
@@ -29,7 +35,8 @@ export interface ModelBatchPredictionRow {
   index: number
   features: Record<string, unknown>
   prediction: number
-  probability: number
+  encoded_prediction: number | null
+  probability: number | null
 }
 
 export interface ModelBatchPredictionResponse {

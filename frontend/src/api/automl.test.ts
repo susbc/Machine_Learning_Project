@@ -27,6 +27,21 @@ describe('automl api', () => {
     expect(form.get('business_context')).toBe('credit risk')
   })
 
+  it('serializes problem type and automatic metric', () => {
+    const file = new File(['price\n10'], 'prices.csv')
+    const form = buildAutoMLJobForm({
+      file,
+      targetCol: 'price',
+      problemType: 'regression',
+      nTrials: 3,
+      cvFolds: 3,
+      optimizationMetric: 'auto',
+    })
+
+    expect(form.get('problem_type')).toBe('regression')
+    expect(form.get('optimization_metric')).toBe('auto')
+  })
+
   it('creates jobs, reads status, reads result, cancels and saves through the stable API paths', async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)

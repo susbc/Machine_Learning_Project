@@ -1,7 +1,14 @@
 import { createRequestJson } from './client'
+import type { ProblemCapabilitiesResponse, ProblemSpec, ProblemType } from './problem'
 
 export type TrainingStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled'
-export type TrainingAlgorithm = 'lightgbm' | 'xgboost' | 'catboost' | 'random_forest' | 'logistic_regression'
+export type TrainingAlgorithm =
+  | 'lightgbm'
+  | 'xgboost'
+  | 'catboost'
+  | 'random_forest'
+  | 'logistic_regression'
+  | 'linear_regression'
 
 export interface TrainingDataset {
   dataset_id: string
@@ -9,6 +16,7 @@ export interface TrainingDataset {
   rows: number
   columns: number
   target_col: string
+  problem_spec: ProblemSpec
   created_at: string
   quality?: DataQualitySummary
   preview: Record<string, unknown>[]
@@ -49,6 +57,7 @@ export interface TrainingJob {
   progress: number
   error?: string | null
   artifact_path?: string | null
+  problem_spec: ProblemSpec
 }
 
 export interface TrainingResult {
@@ -57,21 +66,23 @@ export interface TrainingResult {
   algorithm: TrainingAlgorithm
   params: Record<string, unknown>
   metrics: Record<string, number>
-  confusion_matrix: number[][]
+  confusion_matrix: number[][] | null
   feature_importance: Array<{ feature: string; importance: number }>
   train_size: number
   test_size: number
   feature_columns: string[]
+  problem_spec: ProblemSpec
   threshold_calibration?: {
     threshold: number
     source: 'training_calibration_split' | 'default'
     calibration_size: number
-  }
+  } | null
 }
 
 export interface UploadTrainingDatasetInput {
   file: File
   targetCol?: string
+  problemType?: ProblemType
 }
 
 export interface CreateTrainingJobInput {
@@ -80,6 +91,7 @@ export interface CreateTrainingJobInput {
   params: Record<string, unknown>
   test_size?: number
   random_state?: number
+  problemType?: ProblemType
 }
 
 interface TrainingApiOptions {
@@ -92,6 +104,9 @@ export function buildTrainingDatasetForm(input: UploadTrainingDatasetInput): For
   form.append('file', input.file)
   if (input.targetCol?.trim()) {
     form.append('target_col', input.targetCol.trim())
+  }
+  if (input.problemType) {
+    form.append('problem_type', input.problemType)
   }
   return form
 }
@@ -109,18 +124,24 @@ export function createTrainingApi(options: TrainingApiOptions) {
       requestJson<{ dataset_id: string; fields: TrainingField[] }>(`/api/training/datasets/${datasetId}/field-config`, {
         method: 'GET',
       }),
+    getCapabilities: () => requestJson<ProblemCapabilitiesResponse>('/api/training/capabilities', { method: 'GET' }),
     runEda: (datasetId: string) =>
       requestJson<TrainingEda>('/api/training/eda', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dataset_id: datasetId }),
       }),
-    createJob: (input: CreateTrainingJobInput) =>
-      requestJson<TrainingJob>('/api/training/jobs', {
+    createJob: (input: CreateTrainingJobInput) => {
+      const { problemType, ...payload } = input
+      return requestJson<TrainingJob>('/api/training/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(input),
-      }),
+        body: JSON.stringify({
+          ...payload,
+          ...(problemType ? { problem_type: problemType } : {}),
+        }),
+      })
+    },
     getJob: (jobId: string) => requestJson<TrainingJob>(`/api/training/jobs/${jobId}`, { method: 'GET' }),
     getResult: (jobId: string) => requestJson<TrainingResult>(`/api/training/jobs/${jobId}/result`, { method: 'GET' }),
     cancelJob: (jobId: string) =>

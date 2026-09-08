@@ -1,4 +1,5 @@
 import { authorizedFetch, createRequestJson, normalizeApiBaseUrl, streamSseJson } from './client'
+import type { ProblemSpec, ProblemType } from './problem'
 
 export interface WorkflowRetrieveInput {
   user_query: string
@@ -39,7 +40,12 @@ export interface WorkflowTrainEvent {
   status: 'RUNNING' | 'DONE' | 'ERROR' | 'HEARTBEAT' | string
   trial?: number
   value?: number | null
+  metric?: string
   best_value?: number | null
+  best_metric?: string
+  problem_spec?: ProblemSpec
+  suggested_type?: string
+  agent_corrections?: string[]
   params?: Record<string, unknown>
   msg?: string
 }
@@ -52,6 +58,11 @@ export interface WorkflowTaskStatus {
   step2?: string
   step3?: string
   best_auc?: number
+  best_metric?: string
+  best_value?: number
+  problem_spec?: ProblemSpec
+  suggested_type?: string
+  agent_corrections?: string[]
   feature_columns?: string[]
 }
 
@@ -74,7 +85,8 @@ export interface WorkflowPredictResponse {
   status: string
   model_version?: string
   prediction: number
-  probability: number
+  encoded_prediction: number | null
+  probability: number | null
   input_features?: Record<string, unknown>
 }
 
@@ -98,8 +110,44 @@ export function createWorkflowApi(options: WorkflowApiOptions) {
   const fetcher = options.fetcher ?? authorizedFetch
   const requestJson = createRequestJson({ ...options, label: 'Workflow' })
 
-  function trainStreamUrl(taskId: string, nTrials = 30, cvFolds = 5): string {
-    return `${baseUrl}/api/workflow/step3_train_stream?task_id=${encodeURIComponent(taskId)}&n_trials=${nTrials}&cv_folds=${cvFolds}`
+  function trainStreamUrl(taskId: string, nTrials = 30, cvFolds = 5, problemType: ProblemType = 'auto'): string {
+    return `${baseUrl}/api/workflow/step3_train_stream?task_id=${encodeURIComponent(taskId)}&n_trials=${nTrials}&cv_folds=${cvFolds}&problem_type=${encodeURIComponent(problemType)}`
+  }
+
+  function streamTraining(
+    taskId: string,
+    nTrials: number,
+    cvFolds: number,
+    onEvent: (event: WorkflowTrainEvent) => void | Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<void>
+  function streamTraining(
+    taskId: string,
+    nTrials: number,
+    cvFolds: number,
+    problemType: ProblemType,
+    onEvent: (event: WorkflowTrainEvent) => void | Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<void>
+  function streamTraining(
+    taskId: string,
+    nTrials: number,
+    cvFolds: number,
+    problemTypeOrOnEvent: ProblemType | ((event: WorkflowTrainEvent) => void | Promise<void>),
+    onEventOrSignal?: ((event: WorkflowTrainEvent) => void | Promise<void>) | AbortSignal,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const problemType = typeof problemTypeOrOnEvent === 'string' ? problemTypeOrOnEvent : 'auto'
+    const onEvent =
+      typeof problemTypeOrOnEvent === 'function'
+        ? problemTypeOrOnEvent
+        : (onEventOrSignal as (event: WorkflowTrainEvent) => void | Promise<void>)
+    const streamSignal = typeof problemTypeOrOnEvent === 'function' ? (onEventOrSignal as AbortSignal | undefined) : signal
+    return streamSseJson<WorkflowTrainEvent>(trainStreamUrl(taskId, nTrials, cvFolds, problemType), {
+      fetcher,
+      signal: streamSignal,
+      onEvent,
+    })
   }
 
   return {
@@ -116,13 +164,7 @@ export function createWorkflowApi(options: WorkflowApiOptions) {
         body: JSON.stringify({ eda_report_text: '', ...input }),
     }),
     trainStreamUrl,
-    streamTraining: (
-      taskId: string,
-      nTrials: number,
-      cvFolds: number,
-      onEvent: (event: WorkflowTrainEvent) => void | Promise<void>,
-      signal?: AbortSignal,
-    ) => streamSseJson<WorkflowTrainEvent>(trainStreamUrl(taskId, nTrials, cvFolds), { fetcher, signal, onEvent }),
+    streamTraining,
     getTaskStatus: (taskId: string) =>
       requestJson<WorkflowTaskStatus>(`/api/workflow/task/${encodeURIComponent(taskId)}/status`, { method: 'GET' }),
     getImportance: (taskId: string) =>

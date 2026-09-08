@@ -1,8 +1,19 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, expectTypeOf, it, vi } from 'vitest'
 
-import { createWorkflowApi, parseSseEvent } from './workflow'
+import { createWorkflowApi, parseSseEvent, type WorkflowPredictResponse } from './workflow'
 
 describe('workflow api', () => {
+  it('types regression-only workflow prediction fields as nullable', () => {
+    expectTypeOf<WorkflowPredictResponse['encoded_prediction']>().toEqualTypeOf<number | null>()
+    expectTypeOf<WorkflowPredictResponse['probability']>().toEqualTypeOf<number | null>()
+  })
+
+  it('adds problem type to workflow training stream URL', () => {
+    const api = createWorkflowApi({ baseUrl: '' })
+
+    expect(api.trainStreamUrl('task_1234abcd', 3, 3, 'regression')).toContain('problem_type=regression')
+  })
+
   it('uses stable Agent workflow endpoints and parses SSE payloads', async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
@@ -44,7 +55,7 @@ describe('workflow api', () => {
     expect((await api.listModels()).models[0].task_id).toBe('task_1234abcd')
     expect((await api.predict({ model_version: 'task_1234abcd', features: { age: 35 } })).probability).toBe(0.85)
     const streamEvents: string[] = []
-    await api.streamTraining('task_1234abcd', 10, 3, (event) => {
+    await api.streamTraining('task_1234abcd', 10, 3, 'regression', (event) => {
       streamEvents.push(event.status)
     })
     expect(streamEvents).toEqual(['DONE'])

@@ -219,6 +219,7 @@ const PARAM_PRESETS: Record<TrainingAlgorithm, Record<string, unknown>> = {
   catboost: { iterations: 200, learning_rate: 0.05, depth: 6 },
   random_forest: { n_estimators: 300, max_depth: 12, min_samples_leaf: 2 },
   logistic_regression: { C: 1.0, solver: 'liblinear', max_iter: 1000 },
+  linear_regression: {},
 }
 
 const activeStep = computed(() => {
@@ -428,6 +429,7 @@ function algorithmLabel(value: TrainingAlgorithm): string {
     catboost: 'CatBoost',
     random_forest: '随机森林',
     logistic_regression: '逻辑回归',
+    linear_regression: '线性回归',
   }
   return labels[value]
 }

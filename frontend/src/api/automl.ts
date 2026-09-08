@@ -1,13 +1,15 @@
 import { authorizedFetch, createRequestJson, normalizeApiBaseUrl, streamSseJson } from './client'
+import type { ProblemSpec, ProblemType } from './problem'
 
 export type AutoMLStatus = 'queued' | 'running' | 'cancelling' | 'cancelled' | 'completed' | 'failed'
-export type AutoMLMetric = 'roc_auc' | 'accuracy' | 'f1'
+export type AutoMLMetric = 'auto' | 'roc_auc' | 'accuracy' | 'f1' | 'rmse' | 'mae' | 'r2'
 export type AutoMLModel =
   | 'lightgbm'
   | 'xgboost'
   | 'catboost'
   | 'random_forest'
   | 'logistic_regression'
+  | 'linear_regression'
 
 export interface AutoMLDecisionSummary {
   rows?: number
@@ -35,6 +37,7 @@ export interface AutoMLJob {
   optimization_metric: AutoMLMetric
   target_col: string
   decision_summary: AutoMLDecisionSummary
+  problem_spec: ProblemSpec
   error?: string | null
   artifact_path?: string | null
 }
@@ -62,6 +65,7 @@ export interface AutoMLResult {
   trial_history: AutoMLTrialEvent[]
   decision_summary: AutoMLDecisionSummary
   feature_columns: string[]
+  problem_spec: ProblemSpec
 }
 
 export interface AutoMLSaveResult {
@@ -73,6 +77,7 @@ export interface AutoMLSaveResult {
 export interface CreateAutoMLJobInput {
   file: File
   targetCol?: string
+  problemType?: ProblemType
   nTrials: number
   cvFolds: number
   candidateModels?: AutoMLModel[]
@@ -106,12 +111,15 @@ export function buildAutoMLJobForm(input: CreateAutoMLJobInput): FormData {
   if (input.targetCol?.trim()) {
     form.append('target_col', input.targetCol.trim())
   }
+  if (input.problemType) {
+    form.append('problem_type', input.problemType)
+  }
   form.append('n_trials', String(input.nTrials))
   form.append('cv_folds', String(input.cvFolds))
   if (input.candidateModels?.length) {
     form.append('candidate_models', JSON.stringify(input.candidateModels))
   }
-  form.append('optimization_metric', input.optimizationMetric ?? 'roc_auc')
+  form.append('optimization_metric', input.optimizationMetric ?? 'auto')
   form.append('use_llm', String(input.useLlm ?? true))
   if (input.businessContext?.trim()) {
     form.append('business_context', input.businessContext.trim())
