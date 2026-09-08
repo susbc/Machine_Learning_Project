@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import re
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 import joblib
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+
+from core.automl.problem_spec import ProblemType, normalize_problem_type
 
 from ._common import validate_entity_id
 from ._dataset import predict_with_artifact
@@ -39,28 +42,65 @@ def _safe_relative(path: Path) -> str:
     return str(resolved.relative_to(root))
 
 
-def _try_load_metrics(path: Path) -> Dict[str, Any]:
+def _try_load_registry_metadata(path: Path) -> Dict[str, Any]:
+    """Load the one persisted artifact needed to render a registry record.
+
+    Only schema-v3 artifacts expose their resolved problem semantics.  Older
+    artifacts intentionally remain classification-compatible at prediction
+    time, but are marked as legacy instead of assigning them new metadata.
+    """
+    metadata: Dict[str, Any] = {
+        "metrics": {},
+        "problem_type": None,
+        "problem_spec": None,
+        "legacy": True,
+    }
     try:
         artifact = joblib.load(path)
     except Exception:
-        return {}
-    if isinstance(artifact, dict):
-        metrics = artifact.get("metrics") or {}
-        if isinstance(metrics, dict):
-            return {key: value for key, value in metrics.items() if isinstance(value, (int, float, str, bool)) or value is None}
+        return metadata
+    if not isinstance(artifact, dict):
+        return metadata
+
+    metrics = artifact.get("metrics") or {}
+    if isinstance(metrics, dict):
+        metadata["metrics"] = {
+            key: value
+            for key, value in metrics.items()
+            if isinstance(value, (int, float, str, bool)) or value is None
+        }
+    else:
         best_value = artifact.get("best_value")
         if isinstance(best_value, (int, float)):
-            return {"best_value": float(best_value)}
-    return {}
+            metadata["metrics"] = {"best_value": float(best_value)}
+
+    schema_version = artifact.get("artifact_schema_version", 0)
+    is_schema_v3 = (
+        not isinstance(schema_version, bool)
+        and isinstance(schema_version, Integral)
+        and schema_version >= 3
+    )
+    metadata["legacy"] = not is_schema_v3
+    if not is_schema_v3:
+        return metadata
+
+    problem_spec = artifact.get("problem_spec")
+    metadata["problem_spec"] = problem_spec if isinstance(problem_spec, dict) else None
+    problem_type = artifact.get("problem_type")
+    if problem_type is None and isinstance(metadata["problem_spec"], dict):
+        problem_type = metadata["problem_spec"].get("resolved_type")
+    metadata["problem_type"] = problem_type
+    return metadata
 
 
 def _record(path: Path, source: str, prefix: str) -> Dict[str, Any]:
+    metadata = _try_load_registry_metadata(path)
     return {
         "model_id": f"{prefix}:{path.stem}",
         "source": source,
         "name": path.stem,
         "artifact_path": _safe_relative(path),
-        "metrics": _try_load_metrics(path),
+        **metadata,
         "updated_at": path.stat().st_mtime,
     }
 
@@ -121,10 +161,14 @@ def _n_classes_of(artifact: Dict[str, Any]) -> int:
     return 2
 
 
-def _summarize_predictions(rows: List[Dict[str, Any]], n_classes: int) -> Dict[str, float | int | None]:
+def _summarize_predictions(
+    rows: List[Dict[str, Any]], n_classes: int, is_schema_v3_regression: bool
+) -> Dict[str, float | int | None]:
     """汇总批量预测：positive_rate 仅二分类有定义（encoded==1 占比），多分类为 None。"""
     if not rows:
         return {"count": 0, "positive_rate": None, "average_probability": None}
+    if is_schema_v3_regression:
+        return {"count": len(rows), "positive_rate": None, "average_probability": None}
     encoded = [float(row["encoded_prediction"]) for row in rows]
     probabilities = [float(row["probability"]) for row in rows if row.get("probability") is not None]
     positive_rate = None
@@ -135,6 +179,17 @@ def _summarize_predictions(rows: List[Dict[str, Any]], n_classes: int) -> Dict[s
         "positive_rate": positive_rate,
         "average_probability": (sum(probabilities) / len(probabilities)) if probabilities else None,
     }
+
+
+def _is_schema_v3_regression(artifact: Dict[str, Any]) -> bool:
+    """Read persisted v3 semantics without applying target-type inference."""
+    schema_version = artifact.get("artifact_schema_version", 0)
+    if isinstance(schema_version, bool) or not isinstance(schema_version, Integral) or schema_version < 3:
+        return False
+    problem_type = artifact.get("problem_type")
+    if problem_type is None and isinstance(artifact.get("problem_spec"), dict):
+        problem_type = artifact["problem_spec"].get("resolved_type")
+    return normalize_problem_type(problem_type) == ProblemType.REGRESSION
 
 
 @router.get("")
@@ -173,7 +228,7 @@ async def batch_predict_with_model(model_id: str, payload: ModelBatchPredictionR
     return {
         "model_id": record["model_id"],
         "source": record["source"],
-        "summary": _summarize_predictions(rows, _n_classes_of(artifact)),
+        "summary": _summarize_predictions(rows, _n_classes_of(artifact), _is_schema_v3_regression(artifact)),
         "rows": rows,
     }
 
