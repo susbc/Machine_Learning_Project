@@ -1,5 +1,21 @@
 import { authorizedFetch, createRequestJson, normalizeApiBaseUrl, streamSseJson } from './client'
+import type { PredictionDiagnostics, PredictionValue } from './models'
 import type { ProblemSpec, ProblemType } from './problem'
+
+export type AgentCorrectionValue =
+  | string
+  | number
+  | boolean
+  | null
+  | Array<string | number | boolean | null>
+  | Record<string, unknown>
+
+export interface AgentCorrection {
+  field: string
+  suggested: AgentCorrectionValue
+  resolved: AgentCorrectionValue
+  reason: string
+}
 
 export interface WorkflowRetrieveInput {
   user_query: string
@@ -44,8 +60,8 @@ export interface WorkflowTrainEvent {
   best_value?: number | null
   best_metric?: string
   problem_spec?: ProblemSpec
-  suggested_type?: string
-  agent_corrections?: string[]
+  suggested_type?: string | null
+  agent_corrections?: AgentCorrection[]
   params?: Record<string, unknown>
   msg?: string
 }
@@ -61,8 +77,8 @@ export interface WorkflowTaskStatus {
   best_metric?: string
   best_value?: number
   problem_spec?: ProblemSpec
-  suggested_type?: string
-  agent_corrections?: string[]
+  suggested_type?: string | null
+  agent_corrections?: AgentCorrection[]
   feature_columns?: string[]
 }
 
@@ -84,9 +100,10 @@ export interface WorkflowPredictInput {
 export interface WorkflowPredictResponse {
   status: string
   model_version?: string
-  prediction: number
-  encoded_prediction: number | null
-  probability: number | null
+  prediction: PredictionValue
+  encoded_prediction?: number | null
+  probability?: number | null
+  diagnostics?: PredictionDiagnostics
   input_features?: Record<string, unknown>
 }
 

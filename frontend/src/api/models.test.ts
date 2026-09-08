@@ -1,13 +1,25 @@
 import { describe, expect, expectTypeOf, it, vi } from 'vitest'
 
-import { createModelsApi, type ModelBatchPredictionRow, type ModelPredictionResponse } from './models'
+import {
+  createModelsApi,
+  type ModelBatchPredictionRow,
+  type ModelMetadataError,
+  type ModelPredictionResponse,
+} from './models'
+import type { ProblemSpec } from './problem'
 
 describe('models api', () => {
-  it('types regression-only prediction fields as nullable', () => {
+  it('types predictions, diagnostics, and malformed-v3 metadata exactly', () => {
+    expectTypeOf<ModelPredictionResponse['prediction']>().toEqualTypeOf<string | number>()
     expectTypeOf<ModelPredictionResponse['encoded_prediction']>().toEqualTypeOf<number | null>()
     expectTypeOf<ModelPredictionResponse['probability']>().toEqualTypeOf<number | null>()
+    expectTypeOf<ModelPredictionResponse['diagnostics']>().toEqualTypeOf<import('./models').PredictionDiagnostics>()
     expectTypeOf<ModelBatchPredictionRow['encoded_prediction']>().toEqualTypeOf<number | null>()
     expectTypeOf<ModelBatchPredictionRow['probability']>().toEqualTypeOf<number | null>()
+    expectTypeOf<ModelMetadataError>().toMatchTypeOf<{ code: string; field: string; message: string }>()
+    expectTypeOf<ProblemSpec['source']>().toEqualTypeOf<
+      'auto_inferred' | 'user_override' | 'legacy_compatibility'
+    >()
   })
 
   it('lists model registry records and fetches one model', async () => {
@@ -20,11 +32,15 @@ describe('models api', () => {
                 model_id: 'automl:automl_1',
                 source: 'automl',
                 artifact_path: 'saved/automl/automl_1.joblib',
-                metrics: { rmse: 1.2 },
-                problem_type: 'regression',
+                metrics: {},
+                problem_type: null,
                 problem_spec: null,
                 legacy: false,
-                metadata_error: null,
+                metadata_error: {
+                  code: 'invalid_artifact_problem_type',
+                  field: 'problem_type',
+                  message: 'schema-v3 模型产物必须保存已解析的任务类型，不能使用 auto',
+                },
               },
             ],
           }),
@@ -37,11 +53,15 @@ describe('models api', () => {
             model_id: 'automl:automl_1',
             source: 'automl',
             artifact_path: 'saved/automl/automl_1.joblib',
-            metrics: { rmse: 1.2 },
-            problem_type: 'regression',
+            metrics: {},
+            problem_type: null,
             problem_spec: null,
             legacy: false,
-            metadata_error: null,
+            metadata_error: {
+              code: 'invalid_artifact_problem_type',
+              field: 'problem_type',
+              message: 'schema-v3 模型产物必须保存已解析的任务类型，不能使用 auto',
+            },
           }),
           { status: 200 },
         )
@@ -52,9 +72,10 @@ describe('models api', () => {
             model_id: 'automl:automl_1',
             source: 'automl',
             input_features: { age: 30 },
-            prediction: 12.5,
-            encoded_prediction: null,
-            probability: null,
+            prediction: '高风险',
+            encoded_prediction: 1,
+            probability: 0.82,
+            diagnostics: { unknown_input_keys: ['aeg'], missing_columns_imputed: ['age'] },
           }),
           { status: 200 },
         )
@@ -66,8 +87,22 @@ describe('models api', () => {
             source: 'automl',
             summary: { count: 2, positive_rate: null, average_probability: null },
             rows: [
-              { index: 0, features: { age: 30 }, prediction: 12.5, encoded_prediction: null, probability: null },
-              { index: 1, features: { age: 70 }, prediction: 13.5, encoded_prediction: null, probability: null },
+              {
+                index: 0,
+                features: { age: 30 },
+                prediction: 12.5,
+                encoded_prediction: null,
+                probability: null,
+                diagnostics: { unknown_input_keys: [], missing_columns_imputed: [] },
+              },
+              {
+                index: 1,
+                features: { age: 70 },
+                prediction: 13.5,
+                encoded_prediction: null,
+                probability: null,
+                diagnostics: { unknown_input_keys: [], missing_columns_imputed: [] },
+              },
             ],
           }),
           { status: 200 },
@@ -84,11 +119,16 @@ describe('models api', () => {
     const batch = await api.batchPredict('automl:automl_1', { rows: [{ age: 30 }, { age: 70 }] })
 
     expect(list.models[0].model_id).toBe('automl:automl_1')
-    expect(list.models[0].problem_type).toBe('regression')
+    expect(list.models[0].problem_type).toBeNull()
     expect(list.models[0].legacy).toBe(false)
+    expect(list.models[0].metadata_error).toEqual({
+      code: 'invalid_artifact_problem_type',
+      field: 'problem_type',
+      message: 'schema-v3 模型产物必须保存已解析的任务类型，不能使用 auto',
+    })
     expect(model.source).toBe('automl')
-    expect(prediction.encoded_prediction).toBeNull()
-    expect(prediction.probability).toBeNull()
+    expect(prediction.prediction).toBe('高风险')
+    expect(prediction.diagnostics.unknown_input_keys).toEqual(['aeg'])
     expect(batch.rows[0].probability).toBeNull()
     expect(batch.summary.count).toBe(2)
   })

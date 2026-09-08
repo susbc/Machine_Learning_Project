@@ -1,6 +1,19 @@
 import { createRequestJson } from './client'
 import type { ProblemSpec, ResolvedProblemType } from './problem'
 
+export type PredictionValue = string | number
+
+export interface PredictionDiagnostics {
+  unknown_input_keys: string[]
+  missing_columns_imputed: string[]
+}
+
+export interface ModelMetadataError {
+  code: string
+  field: string
+  message: string
+}
+
 export interface ModelRegistryRecord {
   model_id: string
   source: 'automl' | 'manual_training' | 'agent_workflow' | 'legacy' | string
@@ -10,7 +23,7 @@ export interface ModelRegistryRecord {
   problem_type: ResolvedProblemType | null
   problem_spec: ProblemSpec | null
   legacy: boolean
-  metadata_error: unknown | null
+  metadata_error: ModelMetadataError | null
   updated_at: number
 }
 
@@ -22,9 +35,10 @@ export interface ModelPredictionResponse {
   model_id: string
   source: string
   input_features: Record<string, unknown>
-  prediction: number
+  prediction: PredictionValue
   encoded_prediction: number | null
   probability: number | null
+  diagnostics: PredictionDiagnostics
 }
 
 export interface ModelBatchPredictionInput {
@@ -34,9 +48,10 @@ export interface ModelBatchPredictionInput {
 export interface ModelBatchPredictionRow {
   index: number
   features: Record<string, unknown>
-  prediction: number
+  prediction: PredictionValue
   encoded_prediction: number | null
   probability: number | null
+  diagnostics: PredictionDiagnostics
 }
 
 export interface ModelBatchPredictionResponse {

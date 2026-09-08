@@ -50,6 +50,7 @@ export interface AutoMLTrialEvent {
   best_value?: number
   params?: Record<string, unknown>
   model_type?: AutoMLModel
+  problem_spec?: ProblemSpec
   progress?: number
   message?: string
   timestamp?: string
