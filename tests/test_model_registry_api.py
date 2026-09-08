@@ -6,11 +6,12 @@ import joblib
 import numpy as np
 import pandas as pd
 import pytest
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression
 
 from backend.api._dataset import prepare_train_pipeline
 from backend.main import app
 import backend.api.models as model_registry
+from core.automl.problem_spec import resolve_problem_spec
 
 
 def test_model_registry_lists_saved_models_with_sources():
@@ -82,6 +83,87 @@ def test_model_registry_batch_predicts_rows_with_summary(tmp_path, monkeypatch):
     assert payload["summary"]["count"] == 2
     assert len(payload["rows"]) == 2
     assert {"index", "features", "prediction", "probability"}.issubset(payload["rows"][0])
+
+
+def test_registry_exposes_regression_metadata_and_null_class_summary(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    artifact_dir = tmp_path / "saved" / "manual_training"
+    artifact_dir.mkdir(parents=True)
+    model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+    joblib.dump(
+        {
+            "artifact_schema_version": 3,
+            "problem_type": "regression",
+            "problem_spec": resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression").to_dict(),
+            "model": model,
+            "feature_columns": ["x"],
+            "metrics": {"rmse": 0.1, "mae": 0.08, "r2": 0.99},
+        },
+        artifact_dir / "manual_training_reg.joblib",
+    )
+
+    client = TestClient(app)
+    listed = client.get("/api/models").json()["models"][0]
+    assert listed["problem_type"] == "regression"
+    assert listed["problem_spec"]["resolved_type"] == "regression"
+    assert listed["legacy"] is False
+
+    response = client.post(
+        "/api/models/manual%3Amanual_training_reg/batch-predict",
+        json={"rows": [{"x": 3}, {"x": 4}]},
+    )
+
+    assert response.status_code == 200
+    batch = response.json()
+    assert batch["summary"] == {"count": 2, "positive_rate": None, "average_probability": None}
+    assert batch["rows"][0]["prediction"] == pytest.approx(7.5)
+    assert batch["rows"][0]["encoded_prediction"] is None
+
+
+def test_registry_treats_integer_schema_v3_as_non_legacy(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    artifact_dir = tmp_path / "saved" / "manual_training"
+    artifact_dir.mkdir(parents=True)
+    model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+    joblib.dump(
+        {
+            "artifact_schema_version": np.int64(3),
+            "problem_spec": resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression").to_dict(),
+            "model": model,
+            "feature_columns": ["x"],
+        },
+        artifact_dir / "manual_training_numpy_schema.joblib",
+    )
+
+    listed = TestClient(app).get("/api/models").json()["models"][0]
+
+    assert listed["legacy"] is False
+    assert listed["problem_type"] == "regression"
+
+
+def test_registry_batch_summary_matches_normalized_v3_regression_semantics(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    artifact_dir = tmp_path / "saved" / "manual_training"
+    artifact_dir.mkdir(parents=True)
+    model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+    joblib.dump(
+        {
+            "artifact_schema_version": 3,
+            "problem_type": "REGRESSION",
+            "problem_spec": resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression").to_dict(),
+            "model": model,
+            "feature_columns": ["x"],
+        },
+        artifact_dir / "manual_training_normalized_regression.joblib",
+    )
+
+    response = TestClient(app).post(
+        "/api/models/manual%3Amanual_training_normalized_regression/batch-predict",
+        json={"rows": [{"x": 3}, {"x": 4}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["summary"] == {"count": 2, "positive_rate": None, "average_probability": None}
 
 
 def _train_v2_artifact(labels=("正常", "违约"), n: int = 60):
