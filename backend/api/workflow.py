@@ -45,7 +45,7 @@ from model_code.feature_executor import FeatureEngineeringExecutor
 from core.automl.automl_optimizer import AutoMLOptimizer
 from core.llm.agent_schemas import FeatureAction, FeatureStrategy
 
-from ._dataset import predict_with_artifact
+from ._dataset import compute_regression_metrics, predict_with_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -783,6 +783,18 @@ async def train_stream(
             artifact_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
 
             best_metric = optuna_config["optimization_metric"]
+            if spec.resolved_type == ProblemType.REGRESSION:
+                metrics = compute_regression_metrics(best_model, X, y)
+                metrics_evaluation = {
+                    "scope": "training_data",
+                    "rows": int(len(y)),
+                }
+            else:
+                metrics = {best_metric: best_value}
+                metrics_evaluation = {
+                    "scope": "cross_validation",
+                    "folds": max(3, cv_folds),
+                }
             artifact = {
                 "artifact_schema_version": 3,
                 "problem_type": spec.resolved_type.value,
@@ -794,7 +806,8 @@ async def train_stream(
                 "config": optuna_config,
                 "best_metric": best_metric,
                 "best_value": best_value,
-                "metrics": {best_metric: best_value},
+                "metrics": metrics,
+                "metrics_evaluation": metrics_evaluation,
                 "selected_algorithm": selected_algorithm,
                 "suggested_type": suggested_type,
                 "agent_corrections": agent_corrections,
@@ -808,6 +821,8 @@ async def train_stream(
                 **state_metadata,
                 "best_metric": best_metric,
                 "best_value": best_value,
+                "metrics": metrics,
+                "metrics_evaluation": metrics_evaluation,
                 "selected_algorithm": selected_algorithm,
             }
             _write_workflow_state(task_id, completed_state)
@@ -829,6 +844,8 @@ async def train_stream(
                     "agent_corrections": agent_corrections,
                     "best_metric": best_metric,
                     "best_value": best_value,
+                    "metrics": metrics,
+                    "metrics_evaluation": metrics_evaluation,
                     "selected_algorithm": selected_algorithm,
                 }
             )
@@ -1015,7 +1032,13 @@ async def get_task_status(task_id: str):
             )
             status["best_value"] = artifact.get("best_value", 0)
             status["feature_columns"] = artifact.get("feature_columns", [])
-            for field in ("problem_spec", "suggested_type", "agent_corrections"):
+            for field in (
+                "problem_spec",
+                "suggested_type",
+                "agent_corrections",
+                "metrics",
+                "metrics_evaluation",
+            ):
                 if field in artifact:
                     status[field] = artifact[field]
 

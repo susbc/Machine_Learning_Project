@@ -1,6 +1,7 @@
 """Workflow optimizer, task reconciliation, persistence, and inference tests."""
 import json
 import logging
+import math
 
 import joblib
 import numpy as np
@@ -177,6 +178,10 @@ def test_workflow_regression_corrects_agent_suggestion_and_predicts_float(
     assert done["metric"] == "rmse"
     assert done["value"] == done["best_value"]
     assert done["agent_corrections"]
+    assert set(done["metrics"]) == {"rmse", "mae", "r2"}
+    assert all(math.isfinite(value) for value in done["metrics"].values())
+    assert done["metrics"]["r2"] >= 0.95
+    assert done["metrics_evaluation"] == {"scope": "training_data", "rows": 80}
 
     artifact = joblib.load(tmp_path / "saved" / f"model_{task_id}.pkl")
     assert artifact["artifact_schema_version"] == 3
@@ -185,6 +190,8 @@ def test_workflow_regression_corrects_agent_suggestion_and_predicts_float(
     assert artifact["label_encoder"] is None
     assert artifact["best_metric"] == "rmse"
     assert artifact["best_value"] == done["best_value"]
+    assert artifact["metrics"] == done["metrics"]
+    assert artifact["metrics_evaluation"] == done["metrics_evaluation"]
     assert artifact["selected_algorithm"] == "linear_regression"
 
     completion_logs = [
@@ -209,6 +216,8 @@ def test_workflow_regression_corrects_agent_suggestion_and_predicts_float(
     assert status["problem_spec"]["resolved_type"] == "regression"
     assert status["best_metric"] == "rmse"
     assert status["best_value"] == done["best_value"]
+    assert status["metrics"] == done["metrics"]
+    assert status["metrics_evaluation"] == done["metrics_evaluation"]
     assert "best_auc" not in status
     assert isinstance(prediction["prediction"], float)
     assert prediction["probability"] is None
