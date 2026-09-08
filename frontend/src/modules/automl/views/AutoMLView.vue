@@ -285,6 +285,7 @@ function modelLabel(model?: AutoMLModel): string {
     catboost: 'CatBoost',
     random_forest: '随机森林',
     logistic_regression: '逻辑回归',
+    linear_regression: '线性回归',
   }
   return model ? labels[model] : '-'
 }

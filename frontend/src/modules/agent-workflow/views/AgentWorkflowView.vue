@@ -129,7 +129,7 @@
           <span>预测值</span>
           <strong>{{ predictionResult.prediction }}</strong>
           <span>概率</span>
-          <strong>{{ predictionResult.probability.toFixed(4) }}</strong>
+          <strong>{{ predictionResult.probability == null ? '-' : predictionResult.probability.toFixed(4) }}</strong>
         </div>
       </section>
     </div>
