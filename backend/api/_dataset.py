@@ -25,7 +25,9 @@ from fastapi import HTTPException, UploadFile
 
 from core.automl.problem_spec import (
     ProblemSpec,
+    ProblemSpecError,
     ProblemType,
+    normalize_problem_type,
     resolve_problem_spec,
     validate_train_test_split,
 )
@@ -418,6 +420,53 @@ def feature_importance_rows(model: Any, feature_names: List[str], top_n: int = 3
     return sorted(rows, key=lambda item: item["importance"], reverse=True)[:top_n]
 
 
+def _artifact_problem_type(artifact: Dict[str, Any]) -> Optional[ProblemType]:
+    """校验 schema-v3 的持久化任务语义；旧产物返回 None。"""
+    if "artifact_schema_version" not in artifact:
+        return None
+    schema_version = artifact["artifact_schema_version"]
+    if isinstance(schema_version, bool) or not isinstance(schema_version, (int, np.integer)):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_artifact_schema_version",
+                "field": "artifact_schema_version",
+                "message": "模型产物的 schema 版本必须是整数",
+            },
+        )
+    if int(schema_version) < 3:
+        return None
+
+    persisted_type = artifact.get("problem_type")
+    if persisted_type is None:
+        saved_spec = artifact.get("problem_spec")
+        if isinstance(saved_spec, ProblemSpec):
+            persisted_type = saved_spec.resolved_type
+        elif isinstance(saved_spec, dict):
+            persisted_type = saved_spec.get("resolved_type")
+    try:
+        resolved = normalize_problem_type(persisted_type)
+    except ProblemSpecError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_artifact_problem_type",
+                "field": "problem_type",
+                "message": f"模型产物的任务类型无效：{exc.message}",
+            },
+        ) from exc
+    if resolved == ProblemType.AUTO:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_artifact_problem_type",
+                "field": "problem_type",
+                "message": "schema-v3 模型产物必须保存已解析的任务类型，不能使用 auto",
+            },
+        )
+    return resolved
+
+
 def predict_with_artifact(artifact: Dict[str, Any], features_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """统一推理入口，按 artifact 形态路由：
 
@@ -437,20 +486,8 @@ def predict_with_artifact(artifact: Dict[str, Any], features_list: List[Dict[str
     label_encoder = artifact.get("label_encoder")
     preprocessor = artifact.get("preprocessor")
     executor = artifact.get("feature_executor")
-    try:
-        is_schema_v3 = int(artifact.get("artifact_schema_version", 0)) >= 3
-    except (TypeError, ValueError):
-        is_schema_v3 = False
-    persisted_problem_type = artifact.get("problem_type")
-    if persisted_problem_type is None:
-        saved_spec = artifact.get("problem_spec")
-        if isinstance(saved_spec, ProblemSpec):
-            persisted_problem_type = saved_spec.resolved_type
-        elif isinstance(saved_spec, dict):
-            persisted_problem_type = saved_spec.get("resolved_type")
-    if isinstance(persisted_problem_type, ProblemType):
-        persisted_problem_type = persisted_problem_type.value
-    is_regression = is_schema_v3 and persisted_problem_type == ProblemType.REGRESSION.value
+    artifact_problem_type = _artifact_problem_type(artifact)
+    is_regression = artifact_problem_type == ProblemType.REGRESSION
 
     frame = pd.DataFrame(features_list)
     unknown_keys: List[str] = []
