@@ -113,14 +113,64 @@ export ML_RUNTIME_STATE_DIR=/path/to/runtime_state
 
 ## 主要功能
 
-- 模型训练：支持 LightGBM、XGBoost、CatBoost、随机森林、逻辑回归。
-- 预测输出：加载训练摘要和最佳模型，使用训练阈值生成预测结果。
-- AutoML：基于 Optuna TPE 进行贝叶斯调参和模型选择。
+- 模型训练：分类支持 LightGBM、XGBoost、CatBoost、随机森林和逻辑回归；回归支持 LightGBM、XGBoost、CatBoost、随机森林和线性回归。
+- 预测输出：加载训练摘要和 schema-v3 模型产物；分类使用训练阈值，回归直接返回连续浮点预测值。
+- AutoML：基于 Optuna TPE 进行贝叶斯调参和模型选择，并按任务类型选择指标及优化方向。
 - Agent 工作流：自然语言取数、结构化特征策略生成、SSE 训练进度推送、在线预测。
 - 数据库连接：支持 SQLite、MySQL、PostgreSQL 等常见数据库连接与查询构建。
 - 知识检索：提供 Neo4j 图谱、FAISS 向量索引和 Schema Embedding 组件。
 - MLOps：支持 PSI 数据漂移检测、基线保存、巡检日志和重训触发接口。
 - Web UI：Vue 工作台提供数据管理、手动训练、AutoML、自动迭代兼容入口、AI 智能分析、数据库连接、LLM 配置、Agent 工作流、MLOps 监控、模型管理与多模型对比、预测实验室（单条和 CSV 批量预测）等主线页面；Streamlit 暂时保留为回退和历史功能对照入口。
+
+## 分类与回归任务
+
+手动训练、AutoML 和 Agent 工作流共享同一套任务类型规则。默认的 `auto`
+模式按照目标列的原生数据类型解析任务：连续数值目标解析为回归；字符串或类别目标解析为
+分类（即使字符串内容看起来像数字）；低基数整数目标也可能解析为分类。创建任务前，界面会
+显示最终解析类型、原因以及可用模型和指标。
+
+需要覆盖自动判断时，可显式选择二分类、多分类或回归。显式回归允许目标列是可转换为有限
+数值的内容；无法转换、包含无穷值，或选择了与最终任务类型不兼容的算法和指标时，API 会在
+任务入队前返回 HTTP 422。显式选择不会静默回退到另一个任务类型。
+
+回归目前支持以下五种算法：
+
+- LightGBM（`lightgbm`）
+- XGBoost（`xgboost`）
+- CatBoost（`catboost`）
+- 随机森林（`random_forest`）
+- 线性回归（`linear_regression`）
+
+回归结果使用 RMSE、MAE 和 R²；RMSE/MAE 越小越好，R² 越大越好。AutoML 可将
+`optimization_metric` 设为 `auto`，此时回归默认优化 RMSE，也可显式选择
+`rmse`、`mae` 或 `r2`。保存后的 schema-v3 产物会保留最终任务类型和指标方向，
+模型注册表及后续预测不会重新推断任务类型。
+
+在 Vue 工作台中，可从“手动训练”或“AutoML”上传 CSV，选择目标列，将任务类型保留为
+“自动识别”或改为“回归”，再选择兼容算法并启动任务。等任务完成并保存模型后，可在
+“模型管理”查看任务类型，并在“预测实验室”进行单条或 CSV 批量预测。也可直接创建一个
+最小 AutoML 回归任务：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/automl/jobs \
+  -F 'file=@linear-regression.csv;type=text/csv' \
+  -F 'target_col=price' \
+  -F 'problem_type=auto' \
+  -F 'optimization_metric=auto' \
+  -F 'candidate_models=["linear_regression"]' \
+  -F 'n_trials=1' \
+  -F 'cv_folds=3' \
+  -F 'use_llm=false'
+```
+
+响应中的 `job_id` 可用于轮询 `GET /api/automl/jobs/{job_id}`，完成后通过结果接口查看
+结果，并通过 `POST /api/automl/jobs/{job_id}/save` 保存模型。若启用了 `API_KEY`，
+以上请求还需添加 `X-API-Key` 请求头。
+
+回归单条和批量预测中的 `prediction` 是连续浮点值；分类专属的
+`encoded_prediction` 与 `probability` 均为 `null`。批量汇总中的
+`positive_rate` 和 `average_probability` 也为 `null`。当前范围仅支持单目标、独立同分布
+的表格回归；时间序列预测和多输出回归尚不支持。
 
 ## 传统训练流水线
 
@@ -222,4 +272,4 @@ docker compose --profile training up trainer
 
 ---
 
-Last Updated: 2026-09-08
+Last Updated: 2026-09-09
