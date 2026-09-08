@@ -249,3 +249,30 @@ def test_recovery_hides_first_run_if_process_stops_after_replace_before_state_co
     assert prediction.status_code == 404
     assert not artifact_path.exists()
     assert _transaction_residue(artifact_path, new_run_id) == []
+
+
+def test_registry_hides_old_artifact_without_persisted_completed_evidence(recovery_paths):
+    task_id, artifact_path = recovery_paths
+    joblib.dump(_artifact("old-run", 10.0), artifact_path)
+    workflow._write_workflow_state(task_id, _state("new-run", "running"))
+
+    assert _registry_workflow_records(task_id) == []
+
+
+def test_running_state_persists_last_known_good_completed_evidence(recovery_paths):
+    task_id, artifact_path = recovery_paths
+    old_state = _state("old-run")
+    joblib.dump(_artifact("old-run", 10.0), artifact_path)
+    workflow._write_workflow_state(task_id, old_state)
+
+    control = workflow._claim_workflow_run(task_id)
+    workflow._write_run_state(task_id, control.run_id, {"status": "running"})
+    persisted = json.loads(
+        (artifact_path.parents[1] / "output" / task_id / "workflow_state.json").read_text()
+    )
+    workflow.active_workflow_runs.clear()
+
+    assert persisted["committed_artifact_state"]["status"] == "completed"
+    assert persisted["committed_artifact_state"]["run_id"] == "old-run"
+    assert len(_registry_workflow_records(task_id)) == 1
+    assert joblib.load(artifact_path)["run_id"] == "old-run"
