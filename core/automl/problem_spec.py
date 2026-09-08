@@ -51,15 +51,25 @@ EXPLANATIONS = {
 class ProblemSpecError(ValueError):
     """A stable, field-oriented validation error for task resolution."""
 
-    def __init__(self, code: str, field: str, message: str, allowed: Sequence[str] | None = None):
+    def __init__(
+        self,
+        code: str,
+        field: str,
+        message: str,
+        allowed: Sequence[str] | None = None,
+        received: Any | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.field = field
         self.message = message
         self.allowed = allowed
+        self.received = received
 
     def as_detail(self) -> dict[str, Any]:
         detail = {"code": self.code, "field": self.field, "message": self.message}
+        if self.received is not None:
+            detail["received"] = self.received
         if self.allowed is not None:
             detail["allowed"] = list(self.allowed)
         return detail
@@ -125,15 +135,32 @@ class ProblemSpec:
         )
 
 
-def normalize_problem_type(value: str | None) -> ProblemType:
-    normalized = (value or "auto").strip().lower()
+def normalize_problem_type(value: Any | None) -> ProblemType:
+    allowed = [item.value for item in ProblemType]
+    if value is None:
+        normalized = "auto"
+    elif not isinstance(value, str):
+        raise ProblemSpecError(
+            "unsupported_problem_type",
+            "problem_type",
+            f"不支持的任务类型：{value}",
+            allowed,
+            received=value,
+        )
+    else:
+        normalized = value.strip().lower()
     if normalized in ALIASES:
         return ALIASES[normalized]
     try:
         return ProblemType(normalized)
     except ValueError as exc:
-        allowed = [item.value for item in ProblemType]
-        raise ProblemSpecError("unsupported_problem_type", "problem_type", f"不支持的任务类型：{value}", allowed) from exc
+        raise ProblemSpecError(
+            "unsupported_problem_type",
+            "problem_type",
+            f"不支持的任务类型：{value}",
+            allowed,
+            received=value,
+        ) from exc
 
 
 def _validate_target_for_type(clean: pd.Series, resolved: ProblemType, convertible_numeric: bool) -> None:

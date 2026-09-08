@@ -77,8 +77,82 @@ def test_unsupported_problem_type_reports_all_canonical_values():
         "code": "unsupported_problem_type",
         "field": "problem_type",
         "message": "不支持的任务类型：clustering",
+        "received": "clustering",
         "allowed": ["auto", "binary_classification", "multiclass_classification", "regression"],
     }
+
+
+@pytest.mark.parametrize("value", [17, False, ["binary"]])
+def test_normalize_problem_type_rejects_non_string_values_with_stable_detail(value):
+    with pytest.raises(ProblemSpecError) as caught:
+        normalize_problem_type(value)
+
+    assert caught.value.as_detail() == {
+        "code": "unsupported_problem_type",
+        "field": "problem_type",
+        "message": f"不支持的任务类型：{value}",
+        "received": value,
+        "allowed": ["auto", "binary_classification", "multiclass_classification", "regression"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_unique_count", "expected_type", "expected_reason"),
+    [
+        (list(range(10)) * 10, 10, "multiclass_classification", "low_cardinality_integer_target"),
+        (list(range(11)) * 9 + [0], 11, "regression", "numeric_continuous_target"),
+    ],
+)
+def test_auto_integer_target_changes_at_the_hand_derived_cardinality_threshold(
+    values, expected_unique_count, expected_type, expected_reason
+):
+    # Both datasets contain 100 valid rows, so min(20, ceil(sqrt(100))) is 10.
+    spec = resolve_problem_spec(pd.Series(values), "target", "auto")
+
+    assert len(values) == 100
+    assert spec.target.unique_count == expected_unique_count
+    assert spec.resolved_type.value == expected_type
+    assert spec.reason == expected_reason
+
+
+def test_multiclass_alias_resolves_to_the_canonical_override_type():
+    spec = resolve_problem_spec(pd.Series([0, 1, 2] * 3), "label", "multiclass")
+
+    assert spec.requested_type.value == "multiclass_classification"
+    assert spec.resolved_type.value == "multiclass_classification"
+    assert spec.source == "user_override"
+
+
+@pytest.mark.parametrize(
+    ("requested_type", "values", "expected_detail"),
+    [
+        (
+            "binary",
+            [0, 1, 2],
+            {
+                "code": "invalid_binary_target",
+                "field": "problem_type",
+                "message": "二分类目标必须恰好有两个不同值",
+            },
+        ),
+        (
+            "multiclass",
+            [0, 1],
+            {
+                "code": "invalid_multiclass_target",
+                "field": "problem_type",
+                "message": "多分类目标至少需要三个不同值",
+            },
+        ),
+    ],
+)
+def test_explicit_classification_override_rejects_incompatible_target_cardinality(
+    requested_type, values, expected_detail
+):
+    with pytest.raises(ProblemSpecError) as caught:
+        resolve_problem_spec(pd.Series(values), "label", requested_type)
+
+    assert caught.value.as_detail() == expected_detail
 
 
 def test_regression_capabilities_and_metric_direction():
