@@ -53,7 +53,7 @@ export interface WorkflowFeatureResponse {
 }
 
 export interface WorkflowTrainEvent {
-  status: 'RUNNING' | 'DONE' | 'ERROR' | 'HEARTBEAT' | string
+  status: 'RUNNING' | 'DONE' | 'ERROR' | 'CANCELLED' | 'HEARTBEAT' | string
   trial?: number
   value?: number | null
   metric?: string
@@ -63,7 +63,9 @@ export interface WorkflowTrainEvent {
   suggested_type?: string | null
   agent_corrections?: AgentCorrection[]
   params?: Record<string, unknown>
-  msg?: string
+  error?: string
+  run_id?: string
+  cv_folds?: number
 }
 
 export interface WorkflowTaskStatus {
@@ -80,6 +82,9 @@ export interface WorkflowTaskStatus {
   suggested_type?: string | null
   agent_corrections?: AgentCorrection[]
   feature_columns?: string[]
+  error?: string
+  run_id?: string
+  cv_folds?: number
 }
 
 export interface WorkflowImportance {

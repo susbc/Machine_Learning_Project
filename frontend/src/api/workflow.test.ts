@@ -5,6 +5,7 @@ import {
   parseSseEvent,
   type AgentCorrection,
   type WorkflowPredictResponse,
+  type WorkflowTaskStatus,
   type WorkflowTrainEvent,
 } from './workflow'
 import type { ProblemSpec } from './problem'
@@ -19,6 +20,8 @@ describe('workflow api', () => {
     >()
     expectTypeOf<WorkflowTrainEvent['problem_spec']>().toEqualTypeOf<ProblemSpec | undefined>()
     expectTypeOf<WorkflowTrainEvent['agent_corrections']>().toEqualTypeOf<AgentCorrection[] | undefined>()
+    expectTypeOf<WorkflowTrainEvent['error']>().toEqualTypeOf<string | undefined>()
+    expectTypeOf<WorkflowTaskStatus['error']>().toEqualTypeOf<string | undefined>()
   })
 
   it('adds problem type to workflow training stream URL', () => {

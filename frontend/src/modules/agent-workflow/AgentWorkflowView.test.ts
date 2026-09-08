@@ -138,8 +138,8 @@ describe('AgentWorkflowView', () => {
 
   it('submits the rendered automatic or user-selected task type to the training stream', async () => {
     workflowMocks.streamTraining.mockImplementation(async (...args: unknown[]) => {
-      const onEvent = args[4] as (event: { status: string; msg: string }) => Promise<void>
-      await onEvent({ status: 'ERROR', msg: '测试结束训练流' })
+      const onEvent = args[4] as (event: { status: string; error: string }) => Promise<void>
+      await onEvent({ status: 'ERROR', error: '测试结束训练流' })
     })
     const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
     await flushPromises()
@@ -319,10 +319,8 @@ describe('AgentWorkflowView', () => {
     wrapper.unmount()
   })
 
-  it('aborts training and clears task-dependent state when the task type selector changes', async () => {
-    let streamSignal: AbortSignal | undefined
+  it('locks task/type replacement and rejects duplicate starts while a server run is active', async () => {
     workflowMocks.streamTraining.mockImplementation((...args: unknown[]) => {
-      streamSignal = args[5] as AbortSignal
       const onEvent = args[4] as (event: Record<string, unknown>) => Promise<void>
       void onEvent({ status: 'RUNNING', trial: 1, metric: 'rmse', value: 0.27, problem_spec: regressionSpec })
       return new Promise<void>(() => undefined)
@@ -330,25 +328,53 @@ describe('AgentWorkflowView', () => {
     const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
     await flushPromises()
     await createWorkflow(wrapper)
-    await actionButton(wrapper, '执行预测').trigger('click')
     await actionButton(wrapper, '开始训练').trigger('click')
     await flushPromises()
 
     expect(wrapper.text()).toContain('0.2700')
-    expect(wrapper.text()).toContain('123.45')
-    expect(streamSignal?.aborted).toBe(false)
-
-    await selectOption(wrapper, '工作流问题类型', '回归')
-
-    expect(streamSignal?.aborted).toBe(true)
-    expect(wrapper.text()).not.toContain('0.2700')
-    expect(wrapper.text()).not.toContain('任务类型解析')
-    expect(wrapper.text()).not.toContain('123.45')
-    expect(actionButton(wrapper, '执行预测').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="workflow-problem-type-select"] input').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="workflow-retrieve-button"]').attributes('disabled')).toBeDefined()
+    await actionButton(wrapper, '开始训练').trigger('click')
+    await wrapper.get('[data-testid="workflow-retrieve-button"]').trigger('click')
+    await flushPromises()
+    expect(workflowMocks.streamTraining).toHaveBeenCalledTimes(1)
+    expect(workflowMocks.retrieveData).toHaveBeenCalledTimes(1)
     wrapper.unmount()
   })
 
-  it('ignores late callbacks from an aborted stream after replacing the workflow task', async () => {
+  it('renders the canonical safe error from a real backend SSE payload shape', async () => {
+    workflowMocks.streamTraining.mockImplementation(async (...args: unknown[]) => {
+      const onEvent = args[4] as (event: Record<string, unknown>) => Promise<void>
+      await onEvent({ status: 'ERROR', error: '模型训练失败，请检查配置后重试', run_id: 'run_123' })
+    })
+    const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await createWorkflow(wrapper)
+
+    await actionButton(wrapper, '开始训练').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="workflow-error-alert"]').text()).toContain('模型训练失败，请检查配置后重试')
+    wrapper.unmount()
+  })
+
+  it('renders the canonical safe error restored from the backend status snapshot', async () => {
+    workflowMocks.getTaskStatus.mockResolvedValue({
+      task_id: 'task_ab12cd34',
+      status: 'failed',
+      error: '模型训练失败，请检查配置后重试',
+    })
+    const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await actionButton(wrapper, '生成 SQL 并提取数据').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="workflow-error-alert"]').text()).toContain('模型训练失败，请检查配置后重试')
+    wrapper.unmount()
+  })
+
+  it('ignores late callbacks after the server run ends and the workflow task is replaced', async () => {
     let lateEvent: ((event: Record<string, unknown>) => Promise<void>) | undefined
     let oldSignal: AbortSignal | undefined
     workflowMocks.retrieveData
@@ -370,6 +396,8 @@ describe('AgentWorkflowView', () => {
     await flushPromises()
     await createWorkflow(wrapper)
     await actionButton(wrapper, '开始训练').trigger('click')
+    await flushPromises()
+    await lateEvent?.({ status: 'ERROR', error: '训练流已断开' })
     await flushPromises()
     const statusCallsBeforeReplacement = workflowMocks.getTaskStatus.mock.calls.length
     const modelCallsBeforeReplacement = workflowMocks.listModels.mock.calls.length
