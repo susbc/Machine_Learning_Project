@@ -167,7 +167,7 @@ class AutoMLConfig(BaseModel):
     
     candidate_models: List[Literal[
         "lightgbm", "xgboost", "catboost",
-        "random_forest", "logistic_regression"
+        "random_forest", "logistic_regression", "linear_regression"
     ]] = Field(..., description="候选模型列表")
     
     n_trials: int = Field(..., description="Optuna Trial 次数", ge=10, le=200)

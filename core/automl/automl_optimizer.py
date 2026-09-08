@@ -14,6 +14,8 @@ from typing import Dict, Any, Optional, Tuple, List
 import logging
 import numpy as np
 
+from core.automl.problem_spec import METRIC_DIRECTION
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,117 +126,19 @@ class AutoMLOptimizer:
             except Exception as e:
                 logger.warning(f"参数 {param_name} 解析失败：{e}")
         
-        # 工厂模式实例化模型
+        # 委托统一模型工厂，确保分类/回归能力校验和默认参数只有一个来源。
         try:
-            if model_name == "lightgbm":
-                return self._build_lightgbm(params)
-            elif model_name == "xgboost":
-                return self._build_xgboost(params)
-            elif model_name == "catboost":
-                return self._build_catboost(params)
-            elif model_name == "random_forest":
-                return self._build_random_forest(params)
-            elif model_name == "logistic_regression":
-                return self._build_logistic_regression(params)
-            else:
-                raise ValueError(f"不支持的模型：{model_name}")
+            from model_code.model_factory import ModelFactory
+
+            safe_params = dict(params)
+            if model_name in {"lightgbm", "xgboost", "random_forest"}:
+                safe_params["n_jobs"] = 1
+            if model_name == "catboost":
+                safe_params.update({"thread_count": 1, "verbose": False})
+            return ModelFactory.build(model_name, task_type=self.task_type, params=safe_params)
         except ImportError as e:
             logger.error(f"模型 {model_name} 依赖缺失：{e}")
             raise
-    
-    def _build_lightgbm(self, params: Dict):
-        """构建 LightGBM 模型"""
-        import lightgbm as lgb
-        
-        # 默认配置
-        default_params = {
-            "objective": "binary" if self.task_type == "binary_classification" else "multiclass",
-            "n_estimators": 200,
-            "verbose": -1,
-            "n_jobs": -1,
-            "random_state": 42
-        }
-        
-        # 多分类任务
-        if self.task_type == "multiclass_classification":
-            # 需要知道类别数（LightGBM 参数名为 num_class）
-            default_params["num_class"] = len(np.unique(self.y))
-        
-        default_params.update(params)
-        return lgb.LGBMClassifier(**default_params)
-    
-    def _build_xgboost(self, params: Dict):
-        """构建 XGBoost 模型"""
-        import xgboost as xgb
-        
-        # 默认配置
-        default_params = {
-            "objective": "binary:logistic" if self.task_type == "binary_classification" else "multi:softprob",
-            "n_estimators": 200,
-            "eval_metric": "auc" if self.task_type == "binary_classification" else "mlogloss",
-            "n_jobs": -1,
-            "random_state": 42,
-            "use_label_encoder": False
-        }
-        
-        # 多分类任务
-        if self.task_type == "multiclass_classification":
-            default_params["num_class"] = len(np.unique(self.y))
-        
-        default_params.update(params)
-        return xgb.XGBClassifier(**default_params)
-    
-    def _build_catboost(self, params: Dict):
-        """构建 CatBoost 模型"""
-        from catboost import CatBoostClassifier
-
-        # 默认配置
-        default_params = {
-            "iterations": 200,
-            "verbose": False,
-            "random_state": 42,
-            "task_type": "CPU"
-        }
-
-        # 多分类任务需要设置 num_class
-        if self.task_type == "multiclass_classification":
-            default_params["classes_count"] = len(np.unique(self.y))
-
-        # 自动类别权重 (处理不平衡)
-        if "auto_class_weights" in params:
-            default_params["auto_class_weights"] = params.pop("auto_class_weights")
-
-        default_params.update(params)
-        return CatBoostClassifier(**default_params)
-    
-    def _build_random_forest(self, params: Dict):
-        """构建随机森林模型"""
-        from sklearn.ensemble import RandomForestClassifier
-        
-        # 默认配置
-        default_params = {
-            "n_estimators": 200,
-            "n_jobs": -1,
-            "random_state": 42,
-            "class_weight": "balanced"  # 自动处理不平衡
-        }
-        
-        default_params.update(params)
-        return RandomForestClassifier(**default_params)
-    
-    def _build_logistic_regression(self, params: Dict):
-        """构建逻辑回归模型"""
-        from sklearn.linear_model import LogisticRegression
-        
-        # 默认配置
-        default_params = {
-            "max_iter": 1000,
-            "random_state": 42,
-            "class_weight": "balanced"
-        }
-        
-        default_params.update(params)
-        return LogisticRegression(**default_params)
     
     def objective(self, trial):
         """
@@ -246,7 +150,7 @@ class AutoMLOptimizer:
         Returns:
             float: 交叉验证得分
         """
-        from sklearn.model_selection import StratifiedKFold, cross_val_score
+        from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
         
         try:
             # 1. 动态选择本次 Trial 要尝试的模型类型
@@ -273,7 +177,6 @@ class AutoMLOptimizer:
                     random_state=42
                 )
             else:
-                from sklearn.model_selection import KFold
                 cv = KFold(
                     n_splits=self.cv_splits,
                     shuffle=True,
@@ -290,10 +193,12 @@ class AutoMLOptimizer:
                 self.y,
                 cv=cv,
                 scoring=scoring,
-                n_jobs=self.n_jobs
+                n_jobs=self.n_jobs,
+                error_score="raise",
             )
-            
-            return np.mean(scores)
+
+            mean_score = float(np.mean(scores))
+            return -mean_score if self.metric in {"rmse", "mae"} else mean_score
             
         except Exception as e:
             logger.warning(f"Trial 失败：{e}")
@@ -342,9 +247,8 @@ class AutoMLOptimizer:
         if n_trials is None:
             n_trials = self.config.get("n_trials", 30)
         
-        # 确定优化方向
-        # sklearn 的误差 scorer 也返回负值，因此这里统一“越大越好”。
-        direction = "maximize"
+        # 使用可读分数：误差为正数并最小化，收益指标最大化。
+        direction = METRIC_DIRECTION[self.metric]
         
         # 创建 Study
         self.best_study = optuna.create_study(

@@ -38,11 +38,12 @@ from concurrent.futures import ThreadPoolExecutor
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from core.llm.agent_orchestrator import AgentOrchestrator, create_orchestrator
+from core.llm.agent_orchestrator import create_orchestrator
+from core.automl.automl_agent import AutoMLAgent, extract_data_features
+from core.automl.problem_spec import ProblemSpec, ProblemType, resolve_metric, resolve_problem_spec
 from model_code.feature_executor import FeatureEngineeringExecutor
-from model_code.model_factory import ModelFactory
 from core.automl.automl_optimizer import AutoMLOptimizer
-from core.llm.agent_schemas import FeatureStrategy
+from core.llm.agent_schemas import FeatureAction, FeatureStrategy
 
 from ._dataset import predict_with_artifact
 
@@ -89,6 +90,136 @@ orchestrator = create_orchestrator(
     model_name="qwen-plus",
     max_retries=3
 )
+
+
+def recommend_automl_config(data_features: Dict[str, Any], scenario: str) -> Dict[str, Any]:
+    """Return an Agent recommendation, with an offline-safe deterministic fallback."""
+    try:
+        return orchestrator.run_automl_agent(
+            json.dumps(data_features, ensure_ascii=False), scenario
+        ).model_dump()
+    except Exception:
+        logger.exception("AutoML Agent 调用失败，使用任务感知规则配置")
+        return AutoMLAgent().generate_config(data_features, scenario)
+
+
+def _coordinate_automl_config(
+    suggested: Dict[str, Any], spec: ProblemSpec, n_trials: int
+) -> tuple[Dict[str, Any], Optional[str], list[Dict[str, Any]]]:
+    """Reconcile advisory LLM output with the canonical resolved problem spec."""
+    resolved_type = spec.resolved_type.value
+    suggested_type = suggested.get("task_type")
+    corrections: list[Dict[str, Any]] = []
+
+    if suggested_type != resolved_type:
+        corrections.append(
+            {
+                "field": "task_type",
+                "suggested": suggested_type,
+                "resolved": resolved_type,
+                "reason": "Agent 建议不能覆盖规范任务类型",
+            }
+        )
+
+    suggested_metric = suggested.get("optimization_metric")
+    try:
+        metric = resolve_metric(spec, suggested_metric)
+    except Exception:
+        metric = resolve_metric(spec, "auto")
+        corrections.append(
+            {
+                "field": "optimization_metric",
+                "suggested": suggested_metric,
+                "resolved": metric,
+                "reason": "指标与规范任务类型不兼容",
+            }
+        )
+
+    raw_candidates = suggested.get("candidate_models")
+    if not isinstance(raw_candidates, list):
+        raw_candidates = []
+    candidates = []
+    for model_name in raw_candidates:
+        if model_name in spec.algorithms:
+            if model_name not in candidates:
+                candidates.append(model_name)
+        else:
+            corrections.append(
+                {
+                    "field": "candidate_models",
+                    "suggested": model_name,
+                    "resolved": None,
+                    "reason": "模型与规范任务类型不兼容，已移除",
+                }
+            )
+
+    if not candidates:
+        baseline = "linear_regression" if spec.resolved_type == ProblemType.REGRESSION else "random_forest"
+        candidates = [baseline]
+        corrections.append(
+            {
+                "field": "candidate_models",
+                "suggested": raw_candidates,
+                "resolved": candidates,
+                "reason": "没有兼容候选模型，使用确定性基线",
+            }
+        )
+
+    suggested_spaces = suggested.get("search_spaces")
+    if not isinstance(suggested_spaces, dict):
+        suggested_spaces = {}
+    if suggested_type != resolved_type:
+        search_spaces = {model_name: {} for model_name in candidates}
+        if suggested_spaces:
+            corrections.append(
+                {
+                    "field": "search_spaces",
+                    "suggested": suggested_spaces,
+                    "resolved": search_spaces,
+                    "reason": "Agent 任务类型不匹配，丢弃可能不兼容的搜索参数",
+                }
+            )
+    else:
+        search_spaces = {
+            model_name: suggested_spaces.get(model_name, {}) for model_name in candidates
+        }
+    return (
+        {
+            "task_type": resolved_type,
+            "optimization_metric": metric,
+            "candidate_models": candidates,
+            "n_trials": n_trials,
+            "search_spaces": search_spaces,
+            "rationale": suggested.get("rationale", ""),
+        },
+        suggested_type,
+        corrections,
+    )
+
+
+def _with_residual_categorical_encoding(
+    df: pd.DataFrame, target_col: str, strategy: FeatureStrategy
+) -> FeatureStrategy:
+    """Ensure workflow estimators receive numeric features and inference reuses the encoding."""
+    handled = {
+        action.column
+        for action in strategy.actions
+        if action.action == "drop" or action.action.endswith("_encode")
+    }
+    automatic = [
+        FeatureAction(
+            column=column,
+            action="frequency_encode",
+            reason="工作流为残留类别特征应用确定性无监督编码",
+        )
+        for column in df.columns
+        if column != target_col
+        and column not in handled
+        and (str(df[column].dtype) == "object" or "category" in str(df[column].dtype))
+    ]
+    if not automatic:
+        return strategy
+    return FeatureStrategy(actions=[*strategy.actions, *automatic])
 
 # ==================== 请求体定义 ====================
 
@@ -294,6 +425,7 @@ async def generate_features(req: FeatureGenerationRequest):
 @router.get("/step3_train_stream")
 async def train_stream(
     task_id: str = Query(..., description="任务 ID"),
+    problem_type: str = Query("auto", description="任务类型：auto/分类/回归"),
     n_trials: int = Query(30, description="Optuna Trial 次数", ge=10, le=100),
     cv_folds: int = Query(5, description="交叉验证折数", ge=3, le=10)
 ):
@@ -311,11 +443,12 @@ async def train_stream(
     """
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
+    completion_payload: Dict[str, Any] = {}
     
     def background_training_task():
         """后台训练任务 (在线程池中运行)"""
         try:
-            logger.info(f"任务 {task_id}: 开始训练...")
+            logger.info("任务 %s: 开始训练，requested_type=%s", task_id, problem_type)
 
             # 1. 加载前置数据
             task_dir = get_task_dir(task_id)
@@ -337,9 +470,10 @@ async def train_stream(
             strategy_obj = FeatureStrategy.model_validate_json(strategy_json)
             logger.info(f"策略加载完成：{len(strategy_obj.actions)} 个动作")
 
-            # 加载 eda_summary 获取目标变量列名
+            # 加载 eda_summary 获取目标变量列名和业务场景
             eda_path = task_dir / "eda_summary.json"
             target_col = "is_fraud"  # 默认值
+            eda_summary: Dict[str, Any] = {}
             if os.path.exists(eda_path):
                 with open(eda_path, "r", encoding='utf-8') as f:
                     eda_summary = json.load(f)
@@ -348,43 +482,50 @@ async def train_stream(
             # 2. 执行特征工程 (fit_transform)
             # 特征工程先于 AutoML CV 执行，因此禁用监督式 Target Encoding；高基数
             # 类别会由执行器自动采用频率编码，避免验证折标签泄漏。
+            execution_strategy = _with_residual_categorical_encoding(
+                df_raw, target_col, strategy_obj
+            )
             feature_executor = FeatureEngineeringExecutor(target_col=target_col, allow_target_encoding=False)
-            df_clean = feature_executor.fit_transform(df_raw, strategy_obj)
+            df_clean = feature_executor.fit_transform(df_raw, execution_strategy)
             logger.info(f"特征工程完成：{df_clean.shape}")
 
             # 检查目标变量是否在清洗后的数据中
             if target_col not in df_clean.columns:
                 raise ValueError(f"目标变量 '{target_col}' 不在清洗后的数据中")
 
-            # 准备训练数据（标签统一编码，字符串目标不再崩溃；编码器随 artifact 保存）
-            from sklearn.preprocessing import LabelEncoder
+            # 真实目标和用户请求共同解析最终规范；Agent 输出只作为建议。
+            spec = resolve_problem_spec(df_clean[target_col], target_col, problem_type)
+            problem_spec = spec.to_dict()
+            data_features = extract_data_features(df_clean, target_col)
+            data_features["task_type"] = spec.resolved_type.value
+            scenario = eda_summary.get("user_query", "通用机器学习建模")
+            suggested_config = recommend_automl_config(data_features, scenario)
+            optuna_config, suggested_type, agent_corrections = _coordinate_automl_config(
+                suggested_config, spec, n_trials
+            )
+            logger.info(
+                "任务 %s: resolved_type=%s suggested_type=%s metric=%s candidates=%s corrections=%s",
+                task_id,
+                spec.resolved_type.value,
+                suggested_type,
+                optuna_config["optimization_metric"],
+                optuna_config["candidate_models"],
+                agent_corrections,
+            )
 
+            # 只有分类任务编码标签；回归目标保持有限浮点值。
             X = df_clean.drop(columns=[target_col])
-            label_encoder = LabelEncoder()
-            y = pd.Series(label_encoder.fit_transform(df_clean[target_col]), name=target_col)
-            n_classes = int(y.nunique())
-            if n_classes < 2:
-                raise ValueError("目标变量至少需要 2 个类别")
+            if spec.resolved_type == ProblemType.REGRESSION:
+                label_encoder = None
+                y = pd.Series(
+                    pd.to_numeric(df_clean[target_col], errors="raise").astype(float),
+                    name=target_col,
+                )
+            else:
+                from sklearn.preprocessing import LabelEncoder
 
-            # 3. AutoML 配置（task_type 按实际类别数推断）
-            optuna_config = {
-                "task_type": "binary_classification" if n_classes == 2 else "multiclass_classification",
-                "optimization_metric": "roc_auc",
-                "candidate_models": ModelFactory.get_supported_algorithms(),
-                "n_trials": n_trials,
-                "search_spaces": {
-                    "lightgbm": {
-                        "learning_rate": {"type": "loguniform", "low": 0.01, "high": 0.2},
-                        "num_leaves": {"type": "int", "low": 15, "high": 127},
-                        "n_estimators": {"type": "int", "low": 100, "high": 500}
-                    },
-                    "catboost": {
-                        "depth": {"type": "int", "low": 4, "high": 10},
-                        "l2_leaf_reg": {"type": "int", "low": 1, "high": 10},
-                        "n_estimators": {"type": "int", "low": 100, "high": 500}
-                    }
-                }
-            }
+                label_encoder = LabelEncoder()
+                y = pd.Series(label_encoder.fit_transform(df_clean[target_col]), name=target_col)
 
             # 4. SSE 回调函数 (适配 AutoMLOptimizer.optimize() 的返回值)
             import optuna
@@ -401,7 +542,11 @@ async def train_stream(
                         "trial": trial.number,
                         "value": float(trial.value) if trial.value is not None else None,
                         "best_value": current_best,
-                        "params": trial.params
+                        "best_metric": optuna_config["optimization_metric"],
+                        "params": trial.params,
+                        "problem_spec": problem_spec,
+                        "suggested_type": suggested_type,
+                        "agent_corrections": agent_corrections,
                     }
                     try:
                         asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
@@ -413,35 +558,50 @@ async def train_stream(
             optimizer = AutoMLOptimizer(X, y, optuna_config, cv_splits=max(3, cv_folds), n_jobs=1)
 
             # 运行优化并获取最佳模型
-            best_value = 0.5
-            best_model = None
-            study = None
-
             try:
                 # sse_callback 实时推送每个 Trial（不再结束后回放）
                 study, best_model = optimizer.optimize(
                     n_trials=n_trials, show_progress=False, callbacks=[sse_callback]
                 )
-                if study and study.best_value is not None:
-                    best_value = float(study.best_value)
+                best_value = float(study.best_value)
             except Exception as e:
                 logger.error(f"Optuna 优化失败：{e}")
                 raise
 
             # 6. 持久化打包 (模型 + 执行器 + 最佳模型)
-            SAVED_DIR.mkdir(exist_ok=True)
+            SAVED_DIR.mkdir(parents=True, exist_ok=True)
             artifact_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
 
-            joblib.dump({
+            best_metric = optuna_config["optimization_metric"]
+            artifact = {
+                "artifact_schema_version": 3,
+                "problem_type": spec.resolved_type.value,
+                "problem_spec": problem_spec,
+                "metric_directions": spec.metric_directions,
                 "feature_executor": feature_executor,
                 "model": best_model,
                 "label_encoder": label_encoder,
                 "config": optuna_config,
+                "best_metric": best_metric,
                 "best_value": best_value,
-                "feature_columns": list(X.columns)
-            }, artifact_path)
+                "metrics": {best_metric: best_value},
+                "suggested_type": suggested_type,
+                "agent_corrections": agent_corrections,
+                "feature_columns": list(X.columns),
+            }
+            joblib.dump(artifact, artifact_path)
 
             logger.info(f"模型已保存：{artifact_path}")
+            completion_payload.update(
+                {
+                    "status": "DONE",
+                    "problem_spec": problem_spec,
+                    "suggested_type": suggested_type,
+                    "agent_corrections": agent_corrections,
+                    "best_metric": best_metric,
+                    "best_value": best_value,
+                }
+            )
 
             # 7. 保存基线数据 (用于 MLOps PSI 漂移检测)
             try:
@@ -481,7 +641,8 @@ async def train_stream(
                 data = await asyncio.wait_for(queue.get(), timeout=60)
 
                 if data is None:
-                    yield f"data: {json.dumps({'status': 'DONE'})}\n\n"
+                    if completion_payload:
+                        yield f"data: {json.dumps(completion_payload, ensure_ascii=False)}\n\n"
                     break
 
                 yield f"data: {json.dumps(data)}\n\n"
@@ -595,12 +756,23 @@ async def get_task_status(task_id: str):
         status["step3"] = "done"
         status["status"] = "completed"
 
-        # 加载模型获取最佳 AUC
+        # 加载模型获取通用指标和持久化任务语义。
         try:
             import joblib
             artifact = joblib.load(model_path)
-            status["best_auc"] = artifact.get("best_value", 0)
+            status["best_metric"] = artifact.get("best_metric") or artifact.get("config", {}).get(
+                "optimization_metric", "roc_auc"
+            )
+            status["best_value"] = artifact.get("best_value", 0)
             status["feature_columns"] = artifact.get("feature_columns", [])
+            for field in ("problem_spec", "suggested_type", "agent_corrections"):
+                if field in artifact:
+                    status[field] = artifact[field]
+
+            # 只有没有 schema-v3 任务元数据的旧分类产物保留 best_auc。
+            schema_version = artifact.get("artifact_schema_version", 0)
+            if int(schema_version) < 3 and artifact.get("problem_type") != "regression":
+                status["best_auc"] = artifact.get("best_value", 0)
         except Exception as e:
             logger.warning(f"读取模型状态失败：{e}")
 
