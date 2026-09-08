@@ -26,6 +26,7 @@ from backend.runtime_state import TaskQueueFullError, background_tasks, runtime_
 from ._dataset import (
     calibrate_binary_threshold,
     compute_classification_metrics,
+    compute_regression_metrics,
     dataframe_quality_report,
     detect_key_columns,
     detect_target_col,
@@ -34,6 +35,15 @@ from ._dataset import (
     read_uploaded_dataframe,
     save_job_artifact,
     with_runtime_params,
+)
+from core.automl.problem_spec import (
+    ProblemSpec,
+    ProblemSpecError,
+    ProblemType,
+    capabilities_payload,
+    resolve_problem_spec,
+    validate_algorithm,
+    validate_train_test_split,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +64,7 @@ class TrainingDataset:
     target_col: str
     fields: List[Dict[str, Any]]
     created_at: str
+    problem_spec: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,6 +80,7 @@ class TrainingJob:
     error: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     artifact_path: Optional[str] = None
+    problem_spec: Dict[str, Any] = field(default_factory=dict)
     test_size: float = 0.3
     random_state: int = 42
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -86,6 +98,7 @@ RESULT_BLOB_NAMESPACE = "training_job_results"
 class TrainingJobRequest(BaseModel):
     dataset_id: str
     algorithm: str
+    problem_type: str = "auto"
     params: Dict[str, Any] = Field(default_factory=dict)
     test_size: float = Field(0.3, ge=0.1, le=0.5)
     random_state: int = Field(42, ge=0, le=10000)
@@ -110,6 +123,7 @@ def _persist_dataset(dataset: TrainingDataset) -> None:
             "target_col": dataset.target_col,
             "fields": dataset.fields,
             "created_at": dataset.created_at,
+            "problem_spec": dataset.problem_spec,
         },
     )
 
@@ -123,7 +137,15 @@ def _restore_dataset(dataset_id: str) -> Optional[TrainingDataset]:
     except FileNotFoundError:
         logger.error("Persisted training dataset is incomplete: %s", dataset_id)
         return None
-    return TrainingDataset(df=frame, **payload)
+    restored_payload = dict(payload)
+    if "problem_spec" not in restored_payload:
+        try:
+            restored_payload["problem_spec"] = resolve_problem_spec(
+                frame[restored_payload["target_col"]], restored_payload["target_col"], "auto"
+            ).to_dict()
+        except (KeyError, ProblemSpecError):
+            restored_payload["problem_spec"] = _legacy_classification_problem_spec()
+    return TrainingDataset(df=frame, **restored_payload)
 
 
 def _persist_job(job: TrainingJob) -> None:
@@ -146,6 +168,7 @@ def _persist_job(job: TrainingJob) -> None:
             "artifact_path": job.artifact_path,
             "test_size": job.test_size,
             "random_state": job.random_state,
+            "problem_spec": job.problem_spec,
             "has_result": has_result,
         },
     )
@@ -155,14 +178,39 @@ def _restore_job(job_id: str) -> Optional[TrainingJob]:
     payload = runtime_state.get(JOB_NAMESPACE, job_id)
     if payload is None:
         return None
-    has_result = bool(payload.pop("has_result", False))
+    restored_payload = dict(payload)
+    has_result = bool(restored_payload.pop("has_result", False))
     result = None
     if has_result:
         try:
             result = runtime_state.load_blob(RESULT_BLOB_NAMESPACE, job_id)
         except FileNotFoundError:
             logger.error("Persisted training result is incomplete: %s", job_id)
-    return TrainingJob(result=result, **payload)
+    if "problem_spec" not in restored_payload:
+        try:
+            dataset = _get_dataset(restored_payload["dataset_id"])
+        except HTTPException:
+            restored_payload["problem_spec"] = _legacy_classification_problem_spec()
+        else:
+            restored_payload["problem_spec"] = dataset.problem_spec or _legacy_classification_problem_spec()
+    if isinstance(result, dict) and "problem_spec" not in result:
+        result["problem_spec"] = restored_payload["problem_spec"]
+    return TrainingJob(result=result, **restored_payload)
+
+
+def _legacy_classification_problem_spec() -> Dict[str, Any]:
+    """Provide a safe snapshot for pre-v3 jobs that have no recoverable target."""
+    spec = resolve_problem_spec(pd.Series([0, 1]), "legacy_target", "binary")
+    payload = spec.to_dict()
+    payload["source"] = "legacy_compatibility"
+    return payload
+
+
+def _resolve_problem_spec_or_422(target: pd.Series, target_col: str, problem_type: Any) -> ProblemSpec:
+    try:
+        return resolve_problem_spec(target, target_col, problem_type)
+    except ProblemSpecError as exc:
+        raise HTTPException(status_code=422, detail=exc.as_detail()) from exc
 
 
 def recover_interrupted_training_jobs() -> int:
@@ -270,6 +318,7 @@ def _dataset_snapshot(dataset: TrainingDataset) -> Dict[str, Any]:
         "rows": int(dataset.df.shape[0]),
         "columns": int(dataset.df.shape[1]),
         "target_col": dataset.target_col,
+        "problem_spec": dataset.problem_spec,
         "created_at": dataset.created_at,
         "quality": dataframe_quality_report(dataset.df, dataset.target_col),
         "preview": preview.to_dict(orient="records"),
@@ -287,6 +336,7 @@ def _job_snapshot(job: TrainingJob) -> Dict[str, Any]:
         "updated_at": job.updated_at,
         "error": job.error,
         "artifact_path": job.artifact_path,
+        "problem_spec": job.problem_spec,
     }
 
 
@@ -312,7 +362,7 @@ def _eda_summary(dataset: TrainingDataset) -> Dict[str, Any]:
     }
 
 
-def _prepare_data(dataset: TrainingDataset, test_size: float, random_state: int):
+def _prepare_data(dataset: TrainingDataset, test_size: float, random_state: int, problem_spec: ProblemSpec):
     key_cols = [item["field_name"] for item in dataset.fields if item["field_type"] == "key"]
     return prepare_train_pipeline(
         dataset.df,
@@ -320,6 +370,7 @@ def _prepare_data(dataset: TrainingDataset, test_size: float, random_state: int)
         key_cols,
         test_size=test_size,
         random_state=random_state,
+        problem_spec=problem_spec,
     )
 
 
@@ -351,7 +402,10 @@ def _run_training_job(job_id: str, test_size: float, random_state: int) -> None:
         if _mark_cancelled(job):
             return
 
-        bundle = _prepare_data(dataset, test_size, random_state)
+        spec = ProblemSpec.from_dict(job.problem_spec) if job.problem_spec else _resolve_problem_spec_or_422(
+            dataset.df[dataset.target_col], dataset.target_col, "auto"
+        )
+        bundle = _prepare_data(dataset, test_size, random_state, spec)
         with training_lock:
             job.progress = 45
             job.updated_at = _now()
@@ -359,11 +413,11 @@ def _run_training_job(job_id: str, test_size: float, random_state: int) -> None:
         if _mark_cancelled(job):
             return
 
-        task_type = "binary" if bundle.y_train.nunique() == 2 else "multiclass"
+        task_type = spec.resolved_type.value
         preprocessor = bundle.preprocessor
         model = ModelFactory.build(job.algorithm, task_type=task_type, params=with_runtime_params(job.algorithm, job.params))
-        calibration = {"threshold": 0.5, "source": "default", "calibration_size": 0}
-        if task_type == "binary":
+        calibration = None
+        if spec.resolved_type == ProblemType.BINARY:
             calibration = calibrate_binary_threshold(
                 Pipeline([("prep", clone(preprocessor)), ("model", clone(model))]),
                 bundle.X_train,
@@ -380,33 +434,44 @@ def _run_training_job(job_id: str, test_size: float, random_state: int) -> None:
         if _mark_cancelled(job):
             return
 
-        metrics = compute_classification_metrics(
-            model,
-            X_test,
-            bundle.y_test,
-            decision_threshold=float(calibration["threshold"]),
-        )
+        if spec.resolved_type == ProblemType.REGRESSION:
+            metrics = compute_regression_metrics(model, X_test, bundle.y_test)
+            confusion_matrix = None
+            threshold_calibration = None
+        else:
+            metrics = compute_classification_metrics(
+                model,
+                X_test,
+                bundle.y_test,
+                decision_threshold=float(calibration["threshold"]) if calibration else 0.5,
+            )
+            confusion_matrix = metrics["confusion_matrix"]
+            threshold_calibration = calibration
         feature_importance = feature_importance_rows(model, list(preprocessor.get_feature_names_out()))
         result = {
             "job_id": job.job_id,
             "dataset_id": job.dataset_id,
             "algorithm": job.algorithm,
             "params": job.params,
+            "problem_spec": spec.to_dict(),
             "metrics": {key: value for key, value in metrics.items() if key != "confusion_matrix"},
-            "confusion_matrix": metrics["confusion_matrix"],
+            "confusion_matrix": confusion_matrix,
             "feature_importance": feature_importance,
             "train_size": int(len(bundle.X_train)),
             "test_size": int(len(bundle.X_test)),
             "feature_columns": bundle.feature_columns,
-            "threshold_calibration": calibration,
+            "threshold_calibration": threshold_calibration,
             "_artifact": {
-                "artifact_version": 2,
+                "artifact_schema_version": 3,
+                "problem_type": spec.resolved_type.value,
+                "problem_spec": spec.to_dict(),
+                "metric_directions": spec.metric_directions,
                 "model": model,
                 "preprocessor": preprocessor,
                 "label_encoder": bundle.label_encoder,
                 "feature_columns": bundle.feature_columns,
-                "decision_threshold": float(calibration["threshold"]),
-                "threshold_calibration": calibration,
+                "decision_threshold": float(calibration["threshold"]) if calibration else None,
+                "threshold_calibration": threshold_calibration,
                 "field_config": dataset.fields,
                 "metrics": metrics,
             },
@@ -427,11 +492,14 @@ def _run_training_job(job_id: str, test_size: float, random_state: int) -> None:
 
 
 @router.post("/datasets", status_code=status.HTTP_201_CREATED)
-async def upload_training_dataset(file: UploadFile = File(...), target_col: Optional[str] = Form(None)):
+async def upload_training_dataset(
+    file: UploadFile = File(...), target_col: Optional[str] = Form(None), problem_type: str = Form("auto")
+):
     df = await read_uploaded_dataframe(file)
     if df.shape[1] < 2:
         raise HTTPException(status_code=400, detail="数据至少需要 1 个特征列和 1 个目标列")
     target = detect_target_col(df, target_col)
+    spec = _resolve_problem_spec_or_422(df[target], target, problem_type)
     dataset_id = uuid.uuid4().hex
     dataset = TrainingDataset(
         dataset_id=dataset_id,
@@ -440,11 +508,17 @@ async def upload_training_dataset(file: UploadFile = File(...), target_col: Opti
         target_col=target,
         fields=_infer_fields(df, target),
         created_at=_now(),
+        problem_spec=spec.to_dict(),
     )
     _persist_dataset(dataset)
     with training_lock:
         training_datasets[dataset_id] = dataset
     return _dataset_snapshot(dataset)
+
+
+@router.get("/capabilities")
+async def get_training_capabilities():
+    return capabilities_payload()
 
 
 @router.get("/datasets/{dataset_id}")
@@ -472,10 +546,12 @@ async def run_training_eda(payload: EdaRequest):
 @router.post("/jobs", status_code=status.HTTP_201_CREATED)
 async def create_training_job(payload: TrainingJobRequest):
     dataset = _get_dataset(payload.dataset_id)
-    from model_code.model_factory import ModelFactory
-
-    if payload.algorithm not in ModelFactory.get_supported_algorithms():
-        raise HTTPException(status_code=400, detail=f"不支持的算法：{payload.algorithm}")
+    spec = _resolve_problem_spec_or_422(dataset.df[dataset.target_col], dataset.target_col, payload.problem_type)
+    try:
+        validate_algorithm(spec, payload.algorithm)
+        validate_train_test_split(spec, dataset.df[dataset.target_col], payload.test_size)
+    except ProblemSpecError as exc:
+        raise HTTPException(status_code=422, detail=exc.as_detail()) from exc
     job_id = uuid.uuid4().hex
     now = _now()
     job = TrainingJob(
@@ -489,6 +565,7 @@ async def create_training_job(payload: TrainingJobRequest):
         updated_at=now,
         test_size=payload.test_size,
         random_state=payload.random_state,
+        problem_spec=spec.to_dict(),
     )
     _persist_job(job)
     with training_lock:

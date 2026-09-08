@@ -2,11 +2,14 @@ import io
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 from fastapi.testclient import TestClient
 
+import backend.api.training as training_api
 from backend.api.training import TrainingJob, _run_training_job, training_datasets, training_jobs
 from backend.main import app
 
@@ -27,6 +30,161 @@ def _training_csv(rows: int = 80) -> tuple[str, io.BytesIO, str]:
         }
     )
     return "training.csv", io.BytesIO(df.to_csv(index=False).encode("utf-8")), "text/csv"
+
+
+def _upload_regression_dataset(client: TestClient, rows: int = 60) -> str:
+    x = np.linspace(-5.0, 5.0, rows)
+    frame = pd.DataFrame({"x": x, "price": 3.0 * x + 7.0})
+    response = client.post(
+        "/api/training/datasets",
+        files={"file": ("prices.csv", io.BytesIO(frame.to_csv(index=False).encode()), "text/csv")},
+        data={"target_col": "price", "problem_type": "auto"},
+    )
+    assert response.status_code == 201
+    return response.json()["dataset_id"]
+
+
+def test_training_capabilities_expose_regression():
+    """The manual-training client can discover the canonical regression contract."""
+    response = TestClient(app).get("/api/training/capabilities")
+
+    assert response.status_code == 200
+    regression = response.json()["problem_types"]["regression"]
+    assert regression["default_metric"] == "rmse"
+    assert "linear_regression" in regression["algorithms"]
+
+
+def test_training_upload_auto_detects_regression():
+    """A continuous numeric target is retained as a regression dataset snapshot."""
+    client = TestClient(app)
+    df = pd.DataFrame({"x": range(40), "price": np.linspace(10.1, 80.9, 40)})
+
+    response = client.post(
+        "/api/training/datasets",
+        files={"file": ("prices.csv", io.BytesIO(df.to_csv(index=False).encode()), "text/csv")},
+        data={"target_col": "price", "problem_type": "auto"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["problem_spec"]["resolved_type"] == "regression"
+
+
+def test_training_upload_rejects_unknown_problem_type_with_stable_detail():
+    """Unsupported task labels are rejected by the shared contract, not coerced locally."""
+    client = TestClient(app)
+    df = pd.DataFrame({"x": range(4), "price": [1.1, 2.2, 3.3, 4.4]})
+
+    response = client.post(
+        "/api/training/datasets",
+        files={"file": ("prices.csv", io.BytesIO(df.to_csv(index=False).encode()), "text/csv")},
+        data={"target_col": "price", "problem_type": "clustering"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "unsupported_problem_type",
+        "field": "problem_type",
+        "message": "不支持的任务类型：clustering",
+        "received": "clustering",
+        "allowed": ["auto", "binary_classification", "multiclass_classification", "regression"],
+    }
+
+
+def test_restoring_legacy_job_without_dataset_uses_classification_compatibility():
+    """A pre-problem-spec job remains inspectable even after its dataset has expired."""
+    job_id = uuid.uuid4().hex
+    now = datetime.now().isoformat(timespec="seconds")
+    training_api.runtime_state.put(
+        training_api.JOB_NAMESPACE,
+        job_id,
+        {
+            "job_id": job_id,
+            "dataset_id": "expireddataset",
+            "algorithm": "logistic_regression",
+            "params": {},
+            "status": "completed",
+            "progress": 100,
+            "created_at": now,
+            "updated_at": now,
+            "error": None,
+            "artifact_path": None,
+            "test_size": 0.3,
+            "random_state": 42,
+            "has_result": True,
+        },
+    )
+    training_api.runtime_state.save_blob(training_api.RESULT_BLOB_NAMESPACE, job_id, {"job_id": job_id, "metrics": {}})
+    try:
+        restored = training_api._restore_job(job_id)
+    finally:
+        training_api.runtime_state.delete(training_api.JOB_NAMESPACE, job_id, (training_api.RESULT_BLOB_NAMESPACE,))
+
+    assert restored is not None
+    assert restored.problem_spec["resolved_type"] == "binary_classification"
+    assert restored.problem_spec["source"] == "legacy_compatibility"
+    assert restored.result is not None
+    assert restored.result["problem_spec"]["resolved_type"] == "binary_classification"
+
+
+def test_training_rejects_incompatible_algorithm_before_enqueue():
+    """A classification-only algorithm never creates a job for a regression target."""
+    client = TestClient(app)
+    regression_dataset_id = _upload_regression_dataset(client)
+
+    response = client.post(
+        "/api/training/jobs",
+        json={
+            "dataset_id": regression_dataset_id,
+            "problem_type": "regression",
+            "algorithm": "logistic_regression",
+            "params": {},
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["field"] == "algorithm"
+
+
+def test_manual_linear_regression_completes_with_regression_metrics():
+    """Manual regression trains continuously and saves a schema-v3 regression artifact."""
+    client = TestClient(app)
+    regression_dataset_id = _upload_regression_dataset(client)
+
+    created = client.post(
+        "/api/training/jobs",
+        json={
+            "dataset_id": regression_dataset_id,
+            "problem_type": "regression",
+            "algorithm": "linear_regression",
+            "params": {},
+            "test_size": 0.25,
+        },
+    )
+
+    assert created.status_code == 201
+    assert created.json()["problem_spec"]["resolved_type"] == "regression"
+    job = _wait_for_job(client, created.json()["job_id"])
+    assert job["status"] == "completed"
+    assert job["problem_spec"]["resolved_type"] == "regression"
+
+    result_response = client.get(f"/api/training/jobs/{job['job_id']}/result")
+    assert result_response.status_code == 200
+    result = result_response.json()
+    assert set(result["metrics"]) == {"rmse", "mae", "r2"}
+    assert result["metrics"]["rmse"] < 1e-10
+    assert result["metrics"]["mae"] < 1e-10
+    assert result["metrics"]["r2"] > 0.999999999
+    assert result["confusion_matrix"] is None
+    assert result["threshold_calibration"] is None
+    assert result["problem_spec"]["resolved_type"] == "regression"
+
+    saved = client.post(f"/api/training/jobs/{job['job_id']}/save")
+    assert saved.status_code == 200
+    artifact = joblib.load(Path(__file__).parents[1] / saved.json()["artifact_path"])
+    assert artifact["artifact_schema_version"] == 3
+    assert artifact["problem_type"] == "regression"
+    assert artifact["problem_spec"]["resolved_type"] == "regression"
+    assert artifact["metric_directions"] == {"rmse": "minimize", "mae": "minimize", "r2": "maximize"}
 
 
 def _wait_for_job(client: TestClient, job_id: str, timeout: float = 12.0) -> dict:
