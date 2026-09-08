@@ -11,7 +11,7 @@ from sklearn.linear_model import LinearRegression, LogisticRegression
 from backend.api._dataset import prepare_train_pipeline
 from backend.main import app
 import backend.api.models as model_registry
-from core.automl.problem_spec import resolve_problem_spec
+from core.automl.problem_spec import ProblemSpec, resolve_problem_spec
 
 
 def test_model_registry_lists_saved_models_with_sources():
@@ -157,13 +157,122 @@ def test_registry_batch_summary_matches_normalized_v3_regression_semantics(tmp_p
         artifact_dir / "manual_training_normalized_regression.joblib",
     )
 
-    response = TestClient(app).post(
+    client = TestClient(app)
+    listed = client.get("/api/models").json()["models"][0]
+    assert listed["problem_type"] == "regression"
+
+    response = client.post(
         "/api/models/manual%3Amanual_training_normalized_regression/batch-predict",
         json={"rows": [{"x": 3}, {"x": 4}]},
     )
 
     assert response.status_code == 200
     assert response.json()["summary"] == {"count": 2, "positive_rate": None, "average_probability": None}
+
+
+@pytest.mark.parametrize(
+    ("task_metadata", "expected_code", "expected_field"),
+    [
+        ({"artifact_schema_version": "3", "problem_type": "regression"}, "invalid_artifact_schema_version", "artifact_schema_version"),
+        ({"artifact_schema_version": 3}, "invalid_artifact_problem_type", "problem_type"),
+        ({"artifact_schema_version": 3, "problem_type": "auto"}, "invalid_artifact_problem_type", "problem_type"),
+        ({"artifact_schema_version": 3, "problem_type": "clustering"}, "invalid_artifact_problem_type", "problem_type"),
+        ({"artifact_schema_version": 3, "problem_spec": {"resolved_type": 17}}, "invalid_artifact_problem_type", "problem_type"),
+    ],
+)
+def test_registry_exposes_invalid_v3_metadata_and_matches_batch_error(
+    tmp_path, monkeypatch, task_metadata, expected_code, expected_field
+):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    artifact_dir = tmp_path / "saved" / "manual_training"
+    artifact_dir.mkdir(parents=True)
+    model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+    joblib.dump(
+        {
+            "model": model,
+            "feature_columns": ["x"],
+            **task_metadata,
+        },
+        artifact_dir / "manual_training_invalid_v3.joblib",
+    )
+
+    client = TestClient(app)
+    listed = client.get("/api/models").json()["models"][0]
+    assert listed["legacy"] is False
+    assert listed["problem_type"] is None
+    assert listed["problem_spec"] is None
+    assert listed["metadata_error"]["code"] == expected_code
+    assert listed["metadata_error"]["field"] == expected_field
+
+    detail = client.get("/api/models/manual%3Amanual_training_invalid_v3").json()
+    assert detail == listed
+
+    response = client.post(
+        "/api/models/manual%3Amanual_training_invalid_v3/batch-predict",
+        json={"rows": [{"x": 3}]},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == listed["metadata_error"]
+
+
+def test_registry_and_batch_accept_nested_persisted_problem_spec_object(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    artifact_dir = tmp_path / "saved" / "manual_training"
+    artifact_dir.mkdir(parents=True)
+    model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+    spec = resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression")
+    assert isinstance(spec, ProblemSpec)
+    joblib.dump(
+        {
+            "artifact_schema_version": 3,
+            "problem_spec": spec,
+            "model": model,
+            "feature_columns": ["x"],
+        },
+        artifact_dir / "manual_training_problem_spec_object.joblib",
+    )
+
+    client = TestClient(app)
+    listed = client.get("/api/models").json()["models"][0]
+    assert listed["legacy"] is False
+    assert listed["problem_type"] == "regression"
+    assert listed["problem_spec"] == spec.to_dict()
+
+    response = client.post(
+        "/api/models/manual%3Amanual_training_problem_spec_object/batch-predict",
+        json={"rows": [{"x": 3}, {"x": 4}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["summary"] == {"count": 2, "positive_rate": None, "average_probability": None}
+
+
+@pytest.mark.parametrize("task_metadata", [{}, {"artifact_schema_version": 2}, {"artifact_schema_version": np.int64(2)}])
+def test_registry_marks_only_missing_or_older_valid_schema_as_legacy(tmp_path, monkeypatch, task_metadata):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    artifact_dir = tmp_path / "saved" / "manual_training"
+    artifact_dir.mkdir(parents=True)
+    joblib.dump(
+        {"model": LogisticRegression().fit([[0], [1], [2], [3]], [0, 0, 1, 1]), "feature_columns": ["x"], **task_metadata},
+        artifact_dir / "manual_training_legacy.joblib",
+    )
+
+    listed = TestClient(app).get("/api/models").json()["models"][0]
+    assert listed["legacy"] is True
+    assert listed["metadata_error"] is None
+
+
+def test_registry_safely_lists_non_dict_artifacts_as_legacy(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    artifact_dir = tmp_path / "saved" / "manual_training"
+    artifact_dir.mkdir(parents=True)
+    joblib.dump(["not", "an", "artifact", "dictionary"], artifact_dir / "manual_training_non_dict.joblib")
+
+    listed = TestClient(app).get("/api/models").json()["models"][0]
+
+    assert listed["legacy"] is True
+    assert listed["problem_type"] is None
+    assert listed["problem_spec"] is None
+    assert listed["metadata_error"] is None
 
 
 def _train_v2_artifact(labels=("正常", "违约"), n: int = 60):

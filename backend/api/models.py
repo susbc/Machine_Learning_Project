@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from numbers import Integral
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -11,10 +10,10 @@ import joblib
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from core.automl.problem_spec import ProblemType, normalize_problem_type
+from core.automl.problem_spec import ProblemSpec, ProblemType
 
 from ._common import validate_entity_id
-from ._dataset import predict_with_artifact
+from ._dataset import predict_with_artifact, resolve_artifact_problem_type
 
 router = APIRouter(prefix="/api/models", tags=["Model Registry"])
 
@@ -54,6 +53,7 @@ def _try_load_registry_metadata(path: Path) -> Dict[str, Any]:
         "problem_type": None,
         "problem_spec": None,
         "legacy": True,
+        "metadata_error": None,
     }
     try:
         artifact = joblib.load(path)
@@ -74,22 +74,23 @@ def _try_load_registry_metadata(path: Path) -> Dict[str, Any]:
         if isinstance(best_value, (int, float)):
             metadata["metrics"] = {"best_value": float(best_value)}
 
-    schema_version = artifact.get("artifact_schema_version", 0)
-    is_schema_v3 = (
-        not isinstance(schema_version, bool)
-        and isinstance(schema_version, Integral)
-        and schema_version >= 3
-    )
-    metadata["legacy"] = not is_schema_v3
-    if not is_schema_v3:
+    try:
+        problem_type = resolve_artifact_problem_type(artifact)
+    except HTTPException as exc:
+        metadata["legacy"] = False
+        metadata["metadata_error"] = exc.detail
+        return metadata
+
+    metadata["legacy"] = problem_type is None
+    if problem_type is None:
         return metadata
 
     problem_spec = artifact.get("problem_spec")
-    metadata["problem_spec"] = problem_spec if isinstance(problem_spec, dict) else None
-    problem_type = artifact.get("problem_type")
-    if problem_type is None and isinstance(metadata["problem_spec"], dict):
-        problem_type = metadata["problem_spec"].get("resolved_type")
-    metadata["problem_type"] = problem_type
+    if isinstance(problem_spec, ProblemSpec):
+        metadata["problem_spec"] = problem_spec.to_dict()
+    elif isinstance(problem_spec, dict):
+        metadata["problem_spec"] = problem_spec
+    metadata["problem_type"] = problem_type.value
     return metadata
 
 
@@ -162,12 +163,12 @@ def _n_classes_of(artifact: Dict[str, Any]) -> int:
 
 
 def _summarize_predictions(
-    rows: List[Dict[str, Any]], n_classes: int, is_schema_v3_regression: bool
+    rows: List[Dict[str, Any]], n_classes: int, problem_type: ProblemType | None
 ) -> Dict[str, float | int | None]:
     """汇总批量预测：positive_rate 仅二分类有定义（encoded==1 占比），多分类为 None。"""
     if not rows:
         return {"count": 0, "positive_rate": None, "average_probability": None}
-    if is_schema_v3_regression:
+    if problem_type == ProblemType.REGRESSION:
         return {"count": len(rows), "positive_rate": None, "average_probability": None}
     encoded = [float(row["encoded_prediction"]) for row in rows]
     probabilities = [float(row["probability"]) for row in rows if row.get("probability") is not None]
@@ -179,17 +180,6 @@ def _summarize_predictions(
         "positive_rate": positive_rate,
         "average_probability": (sum(probabilities) / len(probabilities)) if probabilities else None,
     }
-
-
-def _is_schema_v3_regression(artifact: Dict[str, Any]) -> bool:
-    """Read persisted v3 semantics without applying target-type inference."""
-    schema_version = artifact.get("artifact_schema_version", 0)
-    if isinstance(schema_version, bool) or not isinstance(schema_version, Integral) or schema_version < 3:
-        return False
-    problem_type = artifact.get("problem_type")
-    if problem_type is None and isinstance(artifact.get("problem_spec"), dict):
-        problem_type = artifact["problem_spec"].get("resolved_type")
-    return normalize_problem_type(problem_type) == ProblemType.REGRESSION
 
 
 @router.get("")
@@ -216,6 +206,7 @@ async def batch_predict_with_model(model_id: str, payload: ModelBatchPredictionR
         raise HTTPException(status_code=400, detail="批量预测至少需要一行特征")
     record = _find_record(model_id)
     artifact = _load_artifact(record)
+    problem_type = resolve_artifact_problem_type(artifact)
     predictions = predict_with_artifact(artifact, payload.rows)
     rows = [
         {
@@ -228,7 +219,7 @@ async def batch_predict_with_model(model_id: str, payload: ModelBatchPredictionR
     return {
         "model_id": record["model_id"],
         "source": record["source"],
-        "summary": _summarize_predictions(rows, _n_classes_of(artifact), _is_schema_v3_regression(artifact)),
+        "summary": _summarize_predictions(rows, _n_classes_of(artifact), problem_type),
         "rows": rows,
     }
 
