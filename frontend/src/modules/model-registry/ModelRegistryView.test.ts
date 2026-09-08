@@ -146,14 +146,14 @@ describe('ModelRegistryView', () => {
     wrapper.unmount()
   })
 
-  it('does not invent a primary metric when persisted metric identity is unavailable', async () => {
+  it('uses the real manual v3 record shape and falls back to r2 without metric identity', async () => {
     registryMocks.listModels.mockResolvedValue({
       models: [{ ...regressionRecord, optimization_metric: null, best_metric: null }],
     })
     const wrapper = mount(ModelRegistryView, { global: { plugins: [ElementPlus] } })
     await flushPromises()
 
-    expect(tableRows(wrapper, 0)[0]?.[2]).toBe('-')
+    expect(tableRows(wrapper, 0)[0]?.[2]).toBe('R² 0.9900（越大越好）')
     wrapper.unmount()
   })
 

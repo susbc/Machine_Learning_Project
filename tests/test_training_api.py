@@ -248,6 +248,7 @@ def test_manual_linear_regression_completes_with_regression_metrics():
     assert artifact["problem_type"] == "regression"
     assert artifact["problem_spec"]["resolved_type"] == "regression"
     assert artifact["metric_directions"] == {"rmse": "minimize", "mae": "minimize", "r2": "maximize"}
+    assert artifact["best_metric"] == "r2"
 
 
 def _wait_for_job(client: TestClient, job_id: str, timeout: float = 12.0) -> dict:

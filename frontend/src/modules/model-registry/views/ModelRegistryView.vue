@@ -213,8 +213,10 @@ function primaryMetricName(record: ModelRegistryRecord): string | null {
   if (record.metadata_error) return null
   const persistedMetric = record.optimization_metric ?? record.best_metric
   if (persistedMetric && typeof record.metrics[persistedMetric] === 'number') return persistedMetric
-  if (!record.legacy) return null
-  return ['best_auc', 'roc_auc', 'val_auc', 'accuracy', 'best_value']
+  const fallback = record.problem_type === 'regression' && !record.legacy
+    ? ['r2', 'rmse', 'mae']
+    : ['best_auc', 'roc_auc', 'val_auc', 'accuracy', 'best_value']
+  return fallback
     .find((metric) => typeof record.metrics[metric] === 'number') ?? null
 }
 
