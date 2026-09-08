@@ -71,6 +71,9 @@ TASK_ID_PATTERN = re.compile(r"^task_[a-f0-9]{8}$")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = PROJECT_ROOT / "output"
 SAVED_DIR = PROJECT_ROOT / "saved"
+WORKFLOW_HOLDOUT_SIZE = 0.25
+WORKFLOW_RANDOM_STATE = 42
+WORKFLOW_PARTITION_FILENAME = "workflow_partition.json"
 
 
 class StaleWorkflowRun(RuntimeError):
@@ -199,6 +202,122 @@ def _read_workflow_state(task_id: str) -> Optional[Dict[str, Any]]:
         logger.warning("读取工作流状态失败 task_id=%s error=%s", task_id, exc)
         return None
     return state if isinstance(state, dict) else None
+
+
+def _write_workflow_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Atomically persist workflow metadata alongside the immutable raw frame."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _build_workflow_eda_summary(
+    train_frame: pd.DataFrame,
+    target_col: str,
+    *,
+    source_rows: int,
+    user_query: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build Agent-visible statistics exclusively from the persisted training partition."""
+    features: Dict[str, Dict[str, Any]] = {}
+    for column in train_frame.columns:
+        values = train_frame[column]
+        stats: Dict[str, Any] = {
+            "type": str(values.dtype),
+            "null_rate": float(values.isnull().mean()),
+            "unique_values": int(values.nunique()),
+        }
+        if pd.api.types.is_numeric_dtype(values):
+            stats["mean"] = float(values.mean())
+            stats["std"] = float(values.std())
+        features[column] = stats
+    summary: Dict[str, Any] = {
+        "rows": int(len(train_frame)),
+        "source_rows": int(source_rows),
+        "columns": int(len(train_frame.columns)),
+        "target": target_col,
+        "features": features,
+        "evaluation_scope": "train_partition",
+    }
+    if user_query:
+        summary["user_query"] = user_query
+    return summary
+
+
+def _validate_workflow_partition(
+    partition: Dict[str, Any], frame: pd.DataFrame, target_col: str
+) -> tuple[list[int], list[int]]:
+    """Validate persisted positional assignment before any Agent-visible statistics are read."""
+    train_positions = partition.get("train_positions")
+    holdout_positions = partition.get("holdout_positions")
+    if (
+        partition.get("schema_version") != 1
+        or partition.get("target") != target_col
+        or partition.get("row_count") != len(frame)
+        or partition.get("holdout_size") != WORKFLOW_HOLDOUT_SIZE
+        or partition.get("random_state") != WORKFLOW_RANDOM_STATE
+        or not isinstance(train_positions, list)
+        or not isinstance(holdout_positions, list)
+        or not all(type(position) is int for position in [*train_positions, *holdout_positions])
+    ):
+        raise ValueError("工作流数据分区元数据无效")
+    train_set = set(train_positions)
+    holdout_set = set(holdout_positions)
+    valid_positions = set(np.flatnonzero(frame[target_col].notna()).tolist())
+    if (
+        len(train_set) != len(train_positions)
+        or len(holdout_set) != len(holdout_positions)
+        or train_set & holdout_set
+        or train_set | holdout_set != valid_positions
+    ):
+        raise ValueError("工作流数据分区行号无效")
+    return train_positions, holdout_positions
+
+
+def _load_or_create_workflow_partition(
+    task_dir: Path, frame: pd.DataFrame, target_col: str
+) -> tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    """Create the immutable train/holdout assignment before EDA or Agent selection."""
+    from sklearn.model_selection import train_test_split
+
+    partition_path = task_dir / WORKFLOW_PARTITION_FILENAME
+    if partition_path.is_file():
+        partition = json.loads(partition_path.read_text(encoding="utf-8"))
+        if not isinstance(partition, dict):
+            raise ValueError("工作流数据分区元数据无效")
+        train_positions, holdout_positions = _validate_workflow_partition(
+            partition, frame, target_col
+        )
+    else:
+        valid_positions = np.flatnonzero(frame[target_col].notna()).tolist()
+        target = frame.iloc[valid_positions][target_col]
+        preliminary_spec = resolve_problem_spec(target, target_col, "auto")
+        validate_train_test_split(preliminary_spec, target, WORKFLOW_HOLDOUT_SIZE)
+        stratify = target if preliminary_spec.resolved_type != ProblemType.REGRESSION else None
+        train_positions, holdout_positions = train_test_split(
+            valid_positions,
+            test_size=WORKFLOW_HOLDOUT_SIZE,
+            random_state=WORKFLOW_RANDOM_STATE,
+            stratify=stratify,
+        )
+        partition = {
+            "schema_version": 1,
+            "target": target_col,
+            "row_count": int(len(frame)),
+            "holdout_size": WORKFLOW_HOLDOUT_SIZE,
+            "random_state": WORKFLOW_RANDOM_STATE,
+            "train_positions": [int(position) for position in train_positions],
+            "holdout_positions": [int(position) for position in holdout_positions],
+        }
+        _write_workflow_json(partition_path, partition)
+    return partition, frame.iloc[train_positions].copy(), frame.iloc[holdout_positions].copy()
 
 # 初始化 LLM 编排器 (从环境变量读取 API Key)
 orchestrator = create_orchestrator(
@@ -587,38 +706,20 @@ async def retrieve_data(req: DataRetrievalRequest):
         
         logger.info(f"数据提取完成：{df.shape}")
         
-        # 4. 统计学压缩计算 (生成 eda_summary)
-        eda_summary = {
-            "rows": len(df),
-            "columns": len(df.columns),
-            "target": req.target_col,
-            "features": {}
-        }
-        
-        for col in df.columns:
-            col_data = df[col]
-            feature_stats = {
-                "type": str(col_data.dtype),
-                "null_rate": float(col_data.isnull().mean()),
-                "unique_values": int(col_data.nunique())
-            }
-            
-            if col_data.dtype in ['int64', 'float64']:
-                feature_stats["mean"] = float(col_data.mean())
-                feature_stats["std"] = float(col_data.std())
-            
-            eda_summary["features"][col] = feature_stats
-        
-        # 5. 落盘保存中间结果
+        # 4. 先持久化原始数据与不可变 train/holdout assignment，再计算任何 Agent 可见统计。
         task_dir = get_task_dir(task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 保存原始数据
         df.to_parquet(task_dir / "raw_data.parquet", index=False)
-        
-        # 保存 eda_summary
-        with open(task_dir / "eda_summary.json", "w", encoding='utf-8') as f:
-            json.dump(eda_summary, f, indent=2, ensure_ascii=False)
+        _, train_frame, _ = _load_or_create_workflow_partition(
+            task_dir, df, req.target_col
+        )
+        eda_summary = _build_workflow_eda_summary(
+            train_frame,
+            req.target_col,
+            source_rows=len(df),
+            user_query=req.user_query,
+        )
+        _write_workflow_json(task_dir / "eda_summary.json", eda_summary)
         
         # 保存 SQL
         with open(task_dir / "query.sql", "w", encoding='utf-8') as f:
@@ -668,7 +769,23 @@ async def generate_features(req: FeatureGenerationRequest):
             raise HTTPException(status_code=404, detail=f"未找到任务 {req.task_id} 的 eda_summary")
         
         with open(eda_summary_path, "r", encoding='utf-8') as f:
-            eda_summary_json = f.read()
+            previous_summary = json.load(f)
+        if not isinstance(previous_summary, dict):
+            raise ValueError("工作流 EDA 摘要无效")
+        target_col = previous_summary.get("target", "is_fraud")
+        data_path = task_dir / "raw_data.parquet"
+        frame = pd.read_parquet(data_path)
+        _, train_frame, _ = _load_or_create_workflow_partition(
+            task_dir, frame, target_col
+        )
+        eda_summary = _build_workflow_eda_summary(
+            train_frame,
+            target_col,
+            source_rows=len(frame),
+            user_query=previous_summary.get("user_query"),
+        )
+        _write_workflow_json(eda_summary_path, eda_summary)
+        eda_summary_json = json.dumps(eda_summary, ensure_ascii=False)
         
         # 2. Feature_Agent 生成策略
         logger.info("调用 Feature_Agent 生成策略...")
@@ -701,9 +818,6 @@ async def generate_features(req: FeatureGenerationRequest):
 
 # ==================== 步骤 3: 训练 + SSE 推送 ====================
 
-WORKFLOW_HOLDOUT_SIZE = 0.25
-WORKFLOW_RANDOM_STATE = 42
-
 
 @dataclass
 class WorkflowTrainingContext:
@@ -719,6 +833,7 @@ class WorkflowTrainingContext:
     X_holdout: pd.DataFrame
     y_train: pd.Series
     y_holdout: pd.Series
+    train_frame: pd.DataFrame
     cv_folds: int
 
 
@@ -733,8 +848,6 @@ def _prepare_workflow_training(
     task_id: str, problem_type: str, cv_folds: int
 ) -> WorkflowTrainingContext:
     """Resolve target semantics, holdout, and exact CV feasibility before SSE."""
-    from sklearn.model_selection import train_test_split
-
     task_dir = get_task_dir(task_id)
     data_path = task_dir / "raw_data.parquet"
     if not data_path.is_file():
@@ -768,31 +881,43 @@ def _prepare_workflow_training(
     if not isinstance(target_col, str) or target_col not in frame.columns:
         raise _workflow_detail(422, "target_not_found", "target_col", "目标列不存在")
 
-    clean_frame = frame.loc[frame[target_col].notna()].copy()
     try:
-        spec = resolve_problem_spec(clean_frame[target_col], target_col, problem_type)
+        _, train_frame, holdout_frame = _load_or_create_workflow_partition(
+            task_dir, frame, target_col
+        )
+    except (OSError, ValueError, ProblemSpecError) as exc:
+        logger.exception("读取工作流数据分区失败 task_id=%s", task_id)
+        raise _workflow_detail(
+            422, "workflow_partition_invalid", "task_id", "工作流数据分区无效"
+        ) from exc
+
+    clean_frame = pd.concat([train_frame, holdout_frame]).sort_index()
+    try:
+        spec = resolve_problem_spec(train_frame[target_col], target_col, problem_type)
         validate_train_test_split(spec, clean_frame[target_col], WORKFLOW_HOLDOUT_SIZE)
     except ProblemSpecError as exc:
         raise HTTPException(status_code=422, detail=exc.as_detail()) from exc
 
-    X = clean_frame.drop(columns=[target_col])
-    if X.shape[1] == 0:
+    X_train = train_frame.drop(columns=[target_col])
+    X_holdout = holdout_frame.drop(columns=[target_col])
+    if X_train.shape[1] == 0:
         raise _workflow_detail(422, "features_missing", "target_col", "未找到可训练特征列")
-    y = clean_frame[target_col]
-    stratify = y if spec.resolved_type != ProblemType.REGRESSION else None
-    X_train, X_holdout, y_train, y_holdout = train_test_split(
-        X,
-        y,
-        test_size=WORKFLOW_HOLDOUT_SIZE,
-        random_state=WORKFLOW_RANDOM_STATE,
-        stratify=stratify,
-    )
+    y_train = train_frame[target_col]
+    y_holdout = holdout_frame[target_col]
     try:
         validate_cv(spec, y_train, cv_folds)
     except ProblemSpecError as exc:
         raise HTTPException(status_code=422, detail=exc.as_detail()) from exc
 
-    execution_strategy = _with_residual_categorical_encoding(clean_frame, target_col, strategy)
+    user_query = eda_summary.get("user_query")
+    eda_summary = _build_workflow_eda_summary(
+        train_frame,
+        target_col,
+        source_rows=len(frame),
+        user_query=user_query,
+    )
+    _write_workflow_json(eda_path, eda_summary)
+    execution_strategy = _with_residual_categorical_encoding(train_frame, target_col, strategy)
     return WorkflowTrainingContext(
         task_id=task_id,
         task_dir=task_dir,
@@ -806,6 +931,7 @@ def _prepare_workflow_training(
         X_holdout=X_holdout,
         y_train=y_train,
         y_holdout=y_holdout,
+        train_frame=train_frame,
         cv_folds=cv_folds,
     )
 
@@ -853,7 +979,7 @@ async def train_stream(
             )
             _require_current_run(task_id, run_id)
             spec = context.spec
-            data_features = extract_data_features(context.clean_frame, context.target_col)
+            data_features = extract_data_features(context.train_frame, context.target_col)
             data_features["task_type"] = spec.resolved_type.value
             scenario = context.eda_summary.get("user_query", "通用机器学习建模")
             suggested_config = recommend_automl_config(data_features, scenario)

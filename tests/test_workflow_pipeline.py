@@ -4,6 +4,7 @@ import logging
 import math
 import threading
 import time
+from types import SimpleNamespace
 
 import joblib
 import numpy as np
@@ -144,6 +145,182 @@ def test_workflow_public_endpoints_do_not_expose_internal_exception_paths(tmp_pa
     assert prediction.status_code == 500
     assert prediction.json()["detail"] == "模型预测失败，请检查输入后重试"
     assert all("/private/" not in response.text for response in (retrieve, features, prediction))
+
+
+def test_workflow_step1_persists_partition_and_reports_train_only_eda(tmp_path, monkeypatch):
+    """Catches Step 1 exposing full-data statistics before a holdout is assigned."""
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(
+        workflow.orchestrator,
+        "run_data_retrieval_agent",
+        lambda *args, **kwargs: SimpleNamespace(
+            is_executable=True,
+            sql="SELECT * FROM orders",
+            thought_process="deterministic test query",
+        ),
+    )
+
+    response = TestClient(app).post(
+        "/api/workflow/step1_retrieve_data",
+        json={"user_query": "预测欺诈", "target_col": "is_fraud"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    task_dir = tmp_path / "output" / payload["task_id"]
+    partition = json.loads((task_dir / "workflow_partition.json").read_text(encoding="utf-8"))
+    persisted_eda = json.loads((task_dir / "eda_summary.json").read_text(encoding="utf-8"))
+    assert partition["target"] == "is_fraud"
+    assert partition["row_count"] == 1000
+    assert len(partition["train_positions"]) == 750
+    assert len(partition["holdout_positions"]) == 250
+    assert set(partition["train_positions"]).isdisjoint(partition["holdout_positions"])
+    assert payload["eda_summary"] == persisted_eda
+    assert persisted_eda["rows"] == 750
+    assert persisted_eda["source_rows"] == 1000
+
+
+def _full_frame_eda(frame: pd.DataFrame, target_col: str) -> dict:
+    """Reproduce the pre-fix full-frame EDA artifact used by legacy workflow tasks."""
+    features = {}
+    for column in frame.columns:
+        values = frame[column]
+        stats = {
+            "type": str(values.dtype),
+            "null_rate": float(values.isnull().mean()),
+            "unique_values": int(values.nunique()),
+        }
+        if pd.api.types.is_numeric_dtype(values):
+            stats.update({"mean": float(values.mean()), "std": float(values.std())})
+        features[column] = stats
+    return {
+        "rows": len(frame),
+        "columns": len(frame.columns),
+        "target": target_col,
+        "user_query": "holdout isolation sentinel",
+        "features": features,
+    }
+
+
+def test_workflow_holdout_only_mutations_cannot_change_strategy_agent_or_fitted_search(
+    tmp_path, monkeypatch
+):
+    """Catches any holdout statistic entering strategy, Agent, evaluator, or CV selection."""
+    output_dir = tmp_path / "output"
+    saved_dir = tmp_path / "saved"
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", output_dir)
+    monkeypatch.setattr(workflow, "SAVED_DIR", saved_dir)
+
+    train_rows = 60
+    base = pd.DataFrame(
+        {
+            "signal": np.arange(80, dtype=float),
+            "category_code": np.tile([0, 1], 40),
+            "is_fraud": [0] * 45 + [1] * 15 + [0] * 15 + [1] * 5,
+        }
+    )
+    mutated = base.copy()
+    mutated.loc[60:69, "signal"] = np.nan
+    mutated.loc[70:79, "signal"] = np.arange(10_000, 10_010, dtype=float)
+    mutated.loc[60:79, "category_code"] = np.arange(100, 120)
+    mutated.loc[60:79, "is_fraud"] = [0] + [1] * 19
+
+    partition = {
+        "schema_version": 1,
+        "target": "is_fraud",
+        "row_count": 80,
+        "holdout_size": 0.25,
+        "random_state": 42,
+        "train_positions": list(range(train_rows)),
+        "holdout_positions": list(range(train_rows, 80)),
+    }
+    task_frames = {
+        "task_aaaa0001": base,
+        "task_bbbb0002": mutated,
+    }
+    for task_id, frame in task_frames.items():
+        task_dir = output_dir / task_id
+        task_dir.mkdir(parents=True)
+        frame.to_parquet(task_dir / "raw_data.parquet", index=False)
+        (task_dir / "workflow_partition.json").write_text(
+            json.dumps(partition), encoding="utf-8"
+        )
+        (task_dir / "eda_summary.json").write_text(
+            json.dumps(_full_frame_eda(frame, "is_fraud")), encoding="utf-8"
+        )
+
+    feature_agent_inputs: list[dict] = []
+
+    def sentinel_feature_agent(eda_json: str, _report: str):
+        summary = json.loads(eda_json)
+        feature_agent_inputs.append(summary)
+        action = (
+            "fillna_mean"
+            if summary["features"]["signal"]["null_rate"] > 0
+            else "scale_standard"
+        )
+        return FeatureStrategy(
+            actions=[FeatureAction(column="signal", action=action, reason="sentinel strategy")]
+        )
+
+    monkeypatch.setattr(workflow.orchestrator, "run_feature_agent", sentinel_feature_agent)
+    client = TestClient(app)
+    strategies = []
+    for task_id in task_frames:
+        generated = client.post(
+            "/api/workflow/step2_generate_features",
+            json={"task_id": task_id, "eda_report_text": ""},
+        )
+        assert generated.status_code == 200
+        strategies.append(generated.json()["strategy"])
+
+    automl_agent_inputs: list[dict] = []
+
+    def sentinel_automl_agent(data_features: dict, _scenario: str) -> dict:
+        automl_agent_inputs.append(dict(data_features))
+        return {
+            "task_type": "binary_classification",
+            "optimization_metric": "accuracy",
+            "candidate_models": ["logistic_regression"],
+            "n_trials": 10,
+            "search_spaces": {},
+            "rationale": "holdout isolation sentinel",
+        }
+
+    monkeypatch.setattr(workflow, "recommend_automl_config", sentinel_automl_agent)
+    optimizer_inputs: list[tuple[pd.DataFrame, np.ndarray, dict]] = []
+    original_optimizer_init = AutoMLOptimizer.__init__
+
+    def recording_optimizer_init(self, X, y, agent_config, *args, **kwargs):
+        optimizer_inputs.append((X.copy(), np.asarray(y).copy(), dict(agent_config)))
+        original_optimizer_init(self, X, y, agent_config, *args, **kwargs)
+
+    monkeypatch.setattr(AutoMLOptimizer, "__init__", recording_optimizer_init)
+
+    terminal_events = []
+    for task_id in task_frames:
+        events = _read_workflow_sse(task_id, "auto", 10, 3)
+        terminal_events.append(events[-1])
+        assert events[-1]["status"] == "DONE"
+
+    artifacts = [joblib.load(saved_dir / f"model_{task_id}.pkl") for task_id in task_frames]
+    pd.testing.assert_frame_equal(optimizer_inputs[0][0], optimizer_inputs[1][0])
+    np.testing.assert_array_equal(optimizer_inputs[0][1], optimizer_inputs[1][1])
+    assert optimizer_inputs[0][2] == optimizer_inputs[1][2]
+    assert feature_agent_inputs[0] == feature_agent_inputs[1]
+    assert automl_agent_inputs[0] == automl_agent_inputs[1]
+    assert strategies[0] == strategies[1]
+    assert artifacts[0]["config"] == artifacts[1]["config"]
+    assert artifacts[0]["best_value"] == pytest.approx(artifacts[1]["best_value"])
+
+    train_features = base.iloc[:train_rows].drop(columns=["is_fraud"])
+    transformed = [artifact["feature_executor"].transform(train_features) for artifact in artifacts]
+    pd.testing.assert_frame_equal(transformed[0], transformed[1])
+    np.testing.assert_allclose(
+        artifacts[0]["model"].predict_proba(transformed[0]),
+        artifacts[1]["model"].predict_proba(transformed[1]),
+    )
+    assert terminal_events[0]["metrics"] != terminal_events[1]["metrics"]
 
 
 def _prepare_workflow_task(tmp_path) -> str:
