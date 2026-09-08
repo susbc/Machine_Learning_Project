@@ -19,6 +19,7 @@ API 端点:
 import os
 import json
 import uuid
+import hashlib
 import joblib
 import asyncio
 import time
@@ -74,6 +75,7 @@ SAVED_DIR = PROJECT_ROOT / "saved"
 WORKFLOW_HOLDOUT_SIZE = 0.25
 WORKFLOW_RANDOM_STATE = 42
 WORKFLOW_PARTITION_FILENAME = "workflow_partition.json"
+WORKFLOW_SELECTION_SCHEMA_VERSION = 2
 
 
 class StaleWorkflowRun(RuntimeError):
@@ -312,6 +314,7 @@ def _build_workflow_eda_summary(
     train_frame: pd.DataFrame,
     target_col: str,
     *,
+    partition: Dict[str, Any],
     source_rows: int,
     user_query: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -335,29 +338,132 @@ def _build_workflow_eda_summary(
         "target": target_col,
         "features": features,
         "evaluation_scope": "train_partition",
+        "schema_version": WORKFLOW_SELECTION_SCHEMA_VERSION,
+        "dataset_fingerprint": partition["dataset_fingerprint"],
+        "provenance_id": partition["provenance_id"],
+        "requested_type": partition["requested_type"],
+        "resolved_type": partition["resolved_type"],
+        "split_semantics": partition["split_semantics"],
     }
     if user_query:
         summary["user_query"] = user_query
     return summary
 
 
+def _agent_visible_eda(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep provenance persisted but out of the statistical Agent prompt."""
+    return {
+        key: value
+        for key, value in summary.items()
+        if key not in {"dataset_fingerprint", "provenance_id"}
+    }
+
+
+def _workflow_dataset_fingerprint(frame: pd.DataFrame, target_col: str) -> str:
+    """Hash ordered schema and values so same-shape replacement/reordering is detectable."""
+    schema = {
+        "target": target_col,
+        "columns": [str(column) for column in frame.columns],
+        "dtypes": [str(dtype) for dtype in frame.dtypes],
+        "rows": int(len(frame)),
+    }
+    digest = hashlib.sha256(
+        json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    row_hashes = pd.util.hash_pandas_object(frame, index=True).to_numpy(dtype="uint64")
+    digest.update(row_hashes.tobytes())
+    return digest.hexdigest()
+
+
+def _partition_provenance_id(partition: Dict[str, Any]) -> str:
+    identity = {
+        key: partition[key]
+        for key in (
+            "schema_version",
+            "dataset_fingerprint",
+            "target",
+            "row_count",
+            "requested_type",
+            "resolved_type",
+            "split_semantics",
+            "stratified",
+            "holdout_size",
+            "random_state",
+            "train_positions",
+            "holdout_positions",
+        )
+    }
+    return hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _build_workflow_partition(
+    frame: pd.DataFrame, target_col: str, problem_type: Optional[str]
+) -> Dict[str, Any]:
+    """Build a deterministic partition for neutral or already-resolved task semantics."""
+    from sklearn.model_selection import train_test_split
+
+    valid_positions = np.flatnonzero(frame[target_col].notna()).tolist()
+    target = frame.iloc[valid_positions][target_col]
+    if problem_type is None:
+        requested_type = None
+        resolved_type = None
+        split_semantics = "type_neutral"
+        stratify = None
+    else:
+        spec = resolve_problem_spec(target, target_col, problem_type)
+        validate_train_test_split(spec, target, WORKFLOW_HOLDOUT_SIZE)
+        requested_type = spec.requested_type.value
+        resolved_type = spec.resolved_type.value
+        stratify = target if spec.resolved_type != ProblemType.REGRESSION else None
+        split_semantics = "stratified" if stratify is not None else "random"
+    train_positions, holdout_positions = train_test_split(
+        valid_positions,
+        test_size=WORKFLOW_HOLDOUT_SIZE,
+        random_state=WORKFLOW_RANDOM_STATE,
+        stratify=stratify,
+    )
+    partition: Dict[str, Any] = {
+        "schema_version": WORKFLOW_SELECTION_SCHEMA_VERSION,
+        "dataset_fingerprint": _workflow_dataset_fingerprint(frame, target_col),
+        "target": target_col,
+        "row_count": int(len(frame)),
+        "requested_type": requested_type,
+        "resolved_type": resolved_type,
+        "split_semantics": split_semantics,
+        "stratified": stratify is not None,
+        "holdout_size": WORKFLOW_HOLDOUT_SIZE,
+        "random_state": WORKFLOW_RANDOM_STATE,
+        "train_positions": [int(position) for position in train_positions],
+        "holdout_positions": [int(position) for position in holdout_positions],
+    }
+    partition["provenance_id"] = _partition_provenance_id(partition)
+    return partition
+
+
 def _validate_workflow_partition(
-    partition: Dict[str, Any], frame: pd.DataFrame, target_col: str
+    partition: Dict[str, Any],
+    frame: pd.DataFrame,
+    target_col: str,
+    problem_type: Optional[str] = None,
 ) -> tuple[list[int], list[int]]:
     """Validate persisted positional assignment before any Agent-visible statistics are read."""
     train_positions = partition.get("train_positions")
     holdout_positions = partition.get("holdout_positions")
     if (
-        partition.get("schema_version") != 1
+        partition.get("schema_version") != WORKFLOW_SELECTION_SCHEMA_VERSION
         or partition.get("target") != target_col
         or partition.get("row_count") != len(frame)
+        or partition.get("dataset_fingerprint") != _workflow_dataset_fingerprint(frame, target_col)
         or partition.get("holdout_size") != WORKFLOW_HOLDOUT_SIZE
         or partition.get("random_state") != WORKFLOW_RANDOM_STATE
+        or partition.get("provenance_id") != _partition_provenance_id(partition)
         or not isinstance(train_positions, list)
         or not isinstance(holdout_positions, list)
         or not all(type(position) is int for position in [*train_positions, *holdout_positions])
     ):
-        raise ValueError("工作流数据分区元数据无效")
+        raise ValueError("工作流数据分区指纹或元数据无效")
     train_set = set(train_positions)
     holdout_set = set(holdout_positions)
     valid_positions = set(np.flatnonzero(frame[target_col].notna()).tolist())
@@ -368,46 +474,115 @@ def _validate_workflow_partition(
         or train_set | holdout_set != valid_positions
     ):
         raise ValueError("工作流数据分区行号无效")
+    if problem_type is not None:
+        target = frame.iloc[sorted(valid_positions)][target_col]
+        spec = resolve_problem_spec(target, target_col, problem_type)
+        expected_semantics = (
+            "random" if spec.resolved_type == ProblemType.REGRESSION else "stratified"
+        )
+        if (
+            partition.get("requested_type") != spec.requested_type.value
+            or partition.get("resolved_type") != spec.resolved_type.value
+            or partition.get("split_semantics") != expected_semantics
+            or partition.get("stratified") != (expected_semantics == "stratified")
+        ):
+            raise ValueError("工作流数据分区任务语义不一致")
     return train_positions, holdout_positions
 
 
 def _load_or_create_workflow_partition(
-    task_dir: Path, frame: pd.DataFrame, target_col: str
+    task_dir: Path,
+    frame: pd.DataFrame,
+    target_col: str,
+    problem_type: Optional[str] = "auto",
 ) -> tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame]:
     """Create the immutable train/holdout assignment before EDA or Agent selection."""
-    from sklearn.model_selection import train_test_split
-
     partition_path = task_dir / WORKFLOW_PARTITION_FILENAME
     if partition_path.is_file():
         partition = json.loads(partition_path.read_text(encoding="utf-8"))
         if not isinstance(partition, dict):
             raise ValueError("工作流数据分区元数据无效")
         train_positions, holdout_positions = _validate_workflow_partition(
-            partition, frame, target_col
+            partition, frame, target_col, problem_type
         )
     else:
-        valid_positions = np.flatnonzero(frame[target_col].notna()).tolist()
-        target = frame.iloc[valid_positions][target_col]
-        preliminary_spec = resolve_problem_spec(target, target_col, "auto")
-        validate_train_test_split(preliminary_spec, target, WORKFLOW_HOLDOUT_SIZE)
-        stratify = target if preliminary_spec.resolved_type != ProblemType.REGRESSION else None
-        train_positions, holdout_positions = train_test_split(
-            valid_positions,
-            test_size=WORKFLOW_HOLDOUT_SIZE,
-            random_state=WORKFLOW_RANDOM_STATE,
-            stratify=stratify,
-        )
-        partition = {
-            "schema_version": 1,
-            "target": target_col,
-            "row_count": int(len(frame)),
-            "holdout_size": WORKFLOW_HOLDOUT_SIZE,
-            "random_state": WORKFLOW_RANDOM_STATE,
-            "train_positions": [int(position) for position in train_positions],
-            "holdout_positions": [int(position) for position in holdout_positions],
-        }
+        partition = _build_workflow_partition(frame, target_col, problem_type)
+        train_positions = partition["train_positions"]
+        holdout_positions = partition["holdout_positions"]
         _write_workflow_json(partition_path, partition)
     return partition, frame.iloc[train_positions].copy(), frame.iloc[holdout_positions].copy()
+
+
+def _strategy_document(
+    strategy: FeatureStrategy, partition: Dict[str, Any], eda_report_text: str
+) -> Dict[str, Any]:
+    return {
+        "schema_version": WORKFLOW_SELECTION_SCHEMA_VERSION,
+        "dataset_fingerprint": partition["dataset_fingerprint"],
+        "provenance_id": partition["provenance_id"],
+        "requested_type": partition["requested_type"],
+        "resolved_type": partition["resolved_type"],
+        "split_semantics": partition["split_semantics"],
+        "eda_report_text": eda_report_text,
+        "strategy": strategy.model_dump(),
+    }
+
+
+def _load_provenanced_strategy(
+    strategy_path: Path, partition: Dict[str, Any]
+) -> tuple[FeatureStrategy, Dict[str, Any]]:
+    try:
+        document = json.loads(strategy_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise _workflow_detail(
+            422, "workflow_strategy_invalid", "feature_strategy", "工作流特征策略无效"
+        ) from exc
+    if not isinstance(document, dict) or document.get("schema_version") != WORKFLOW_SELECTION_SCHEMA_VERSION:
+        raise _workflow_detail(
+            422,
+            "workflow_strategy_provenance_required",
+            "feature_strategy",
+            "工作流特征策略缺少可信来源，请重新运行特征生成",
+        )
+    if any(
+        document.get(field) != partition.get(field)
+        for field in (
+            "dataset_fingerprint",
+            "provenance_id",
+            "requested_type",
+            "resolved_type",
+            "split_semantics",
+        )
+    ):
+        raise _workflow_detail(
+            422,
+            "workflow_strategy_provenance_mismatch",
+            "feature_strategy",
+            "工作流特征策略与数据分区来源不一致，请重新运行特征生成",
+        )
+    try:
+        strategy = FeatureStrategy.model_validate(document.get("strategy"))
+    except Exception as exc:
+        raise _workflow_detail(
+            422, "workflow_strategy_invalid", "feature_strategy", "工作流特征策略无效"
+        ) from exc
+    return strategy, document
+
+
+def _persist_workflow_selection(
+    task_dir: Path,
+    partition: Dict[str, Any],
+    eda_summary: Dict[str, Any],
+    strategy: FeatureStrategy,
+    eda_report_text: str,
+) -> None:
+    """Publish a matching selection generation; provenance rejects any interrupted mix."""
+    _write_workflow_json(task_dir / WORKFLOW_PARTITION_FILENAME, partition)
+    _write_workflow_json(task_dir / "eda_summary.json", eda_summary)
+    _write_workflow_json(
+        task_dir / "feature_strategy.json",
+        _strategy_document(strategy, partition, eda_report_text),
+    )
 
 # 初始化 LLM 编排器 (从环境变量读取 API Key)
 orchestrator = create_orchestrator(
@@ -800,12 +975,13 @@ async def retrieve_data(req: DataRetrievalRequest):
         task_dir = get_task_dir(task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
         df.to_parquet(task_dir / "raw_data.parquet", index=False)
-        _, train_frame, _ = _load_or_create_workflow_partition(
-            task_dir, df, req.target_col
+        partition, train_frame, _ = _load_or_create_workflow_partition(
+            task_dir, df, req.target_col, problem_type=None
         )
         eda_summary = _build_workflow_eda_summary(
             train_frame,
             req.target_col,
+            partition=partition,
             source_rows=len(df),
             user_query=req.user_query,
         )
@@ -865,17 +1041,39 @@ async def generate_features(req: FeatureGenerationRequest):
         target_col = previous_summary.get("target", "is_fraud")
         data_path = task_dir / "raw_data.parquet"
         frame = pd.read_parquet(data_path)
-        _, train_frame, _ = _load_or_create_workflow_partition(
-            task_dir, frame, target_col
-        )
+        try:
+            desired_partition = _build_workflow_partition(frame, target_col, "auto")
+        except ProblemSpecError:
+            # Step 2 precedes the user's final override.  A neutral split keeps a
+            # valid numeric-string regression override reachable without applying
+            # an incompatible auto-classification split validation first.
+            desired_partition = _build_workflow_partition(frame, target_col, None)
+        partition_path = task_dir / WORKFLOW_PARTITION_FILENAME
+        partition: Dict[str, Any]
+        if partition_path.is_file():
+            try:
+                loaded_partition = json.loads(partition_path.read_text(encoding="utf-8"))
+                if not isinstance(loaded_partition, dict):
+                    raise ValueError("工作流数据分区元数据无效")
+                _validate_workflow_partition(loaded_partition, frame, target_col)
+                same_semantics = all(
+                    loaded_partition.get(field) == desired_partition.get(field)
+                    for field in ("requested_type", "resolved_type", "split_semantics")
+                )
+                partition = loaded_partition if same_semantics else desired_partition
+            except (OSError, ValueError, KeyError):
+                partition = desired_partition
+        else:
+            partition = desired_partition
+        train_frame = frame.iloc[partition["train_positions"]].copy()
         eda_summary = _build_workflow_eda_summary(
             train_frame,
             target_col,
+            partition=partition,
             source_rows=len(frame),
             user_query=previous_summary.get("user_query"),
         )
-        _write_workflow_json(eda_summary_path, eda_summary)
-        eda_summary_json = json.dumps(eda_summary, ensure_ascii=False)
+        eda_summary_json = json.dumps(_agent_visible_eda(eda_summary), ensure_ascii=False)
         
         # 2. Feature_Agent 生成策略
         logger.info("调用 Feature_Agent 生成策略...")
@@ -886,9 +1084,10 @@ async def generate_features(req: FeatureGenerationRequest):
         
         logger.info(f"策略生成完成：{len(strategy_obj.actions)} 个动作")
         
-        # 3. 落盘保存策略
-        with open(task_dir / "feature_strategy.json", "w", encoding='utf-8') as f:
-            json.dump(strategy_obj.dict(), f, indent=2, ensure_ascii=False)
+        # 3. 作为同一 provenance generation 落盘，Step 3 不接受裸 legacy 策略。
+        _persist_workflow_selection(
+            task_dir, partition, eda_summary, strategy_obj, req.eda_report_text
+        )
         
         return {
             "status": "success",
@@ -951,12 +1150,6 @@ def _prepare_workflow_training(
     except Exception as exc:
         logger.exception("读取工作流数据失败 task_id=%s", task_id)
         raise _workflow_detail(400, "workflow_data_invalid", "task_id", "工作流原始数据无法读取") from exc
-    try:
-        strategy = FeatureStrategy.model_validate_json(strategy_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.exception("读取工作流特征策略失败 task_id=%s", task_id)
-        raise _workflow_detail(422, "workflow_strategy_invalid", "feature_strategy", "工作流特征策略无效") from exc
-
     eda_summary: Dict[str, Any] = {}
     eda_path = task_dir / "eda_summary.json"
     if eda_path.is_file():
@@ -972,21 +1165,98 @@ def _prepare_workflow_training(
         raise _workflow_detail(422, "target_not_found", "target_col", "目标列不存在")
 
     try:
-        _, train_frame, holdout_frame = _load_or_create_workflow_partition(
-            task_dir, frame, target_col
-        )
-    except (OSError, ValueError, ProblemSpecError) as exc:
-        logger.exception("读取工作流数据分区失败 task_id=%s", task_id)
-        raise _workflow_detail(
-            422, "workflow_partition_invalid", "task_id", "工作流数据分区无效"
-        ) from exc
-
-    clean_frame = pd.concat([train_frame, holdout_frame]).sort_index()
-    try:
-        spec = resolve_problem_spec(train_frame[target_col], target_col, problem_type)
-        validate_train_test_split(spec, clean_frame[target_col], WORKFLOW_HOLDOUT_SIZE)
+        # Resolve the explicit override before any type-specific partition
+        # validation.  In particular, finite numeric strings remain a valid
+        # regression target even though native-dtype auto inference is multiclass.
+        valid_target = frame.loc[frame[target_col].notna(), target_col]
+        spec = resolve_problem_spec(valid_target, target_col, problem_type)
+        validate_train_test_split(spec, valid_target, WORKFLOW_HOLDOUT_SIZE)
     except ProblemSpecError as exc:
         raise HTTPException(status_code=422, detail=exc.as_detail()) from exc
+
+    partition_path = task_dir / WORKFLOW_PARTITION_FILENAME
+    if not partition_path.is_file():
+        # A pre-round-2 task has no way to prove which rows informed its strategy.
+        raise _workflow_detail(
+            422,
+            "workflow_strategy_provenance_required",
+            "feature_strategy",
+            "工作流特征策略缺少可信来源，请重新运行特征生成",
+        )
+    try:
+        current_partition = json.loads(partition_path.read_text(encoding="utf-8"))
+        if not isinstance(current_partition, dict):
+            raise ValueError("工作流数据分区元数据无效")
+        current_train_positions, current_holdout_positions = _validate_workflow_partition(
+            current_partition, frame, target_col
+        )
+    except (OSError, ValueError, KeyError, ProblemSpecError) as exc:
+        logger.exception("读取工作流数据分区失败 task_id=%s", task_id)
+        raise _workflow_detail(
+            422,
+            "workflow_partition_provenance_mismatch",
+            "task_id",
+            "工作流原始数据与分区来源不一致，请重新运行特征生成",
+        ) from exc
+
+    strategy, strategy_document = _load_provenanced_strategy(
+        strategy_path, current_partition
+    )
+    if (
+        eda_summary.get("schema_version") != WORKFLOW_SELECTION_SCHEMA_VERSION
+        or eda_summary.get("dataset_fingerprint") != current_partition["dataset_fingerprint"]
+        or eda_summary.get("provenance_id") != current_partition["provenance_id"]
+    ):
+        raise _workflow_detail(
+            422,
+            "workflow_eda_provenance_mismatch",
+            "task_id",
+            "工作流 EDA 与数据分区来源不一致，请重新运行特征生成",
+        )
+
+    desired_partition = _build_workflow_partition(frame, target_col, problem_type)
+    desired_semantics_match = all(
+        current_partition.get(field) == desired_partition.get(field)
+        for field in ("requested_type", "resolved_type", "split_semantics", "stratified")
+    )
+    if not desired_semantics_match:
+        desired_train = frame.iloc[desired_partition["train_positions"]].copy()
+        desired_eda = _build_workflow_eda_summary(
+            desired_train,
+            target_col,
+            partition=desired_partition,
+            source_rows=len(frame),
+            user_query=eda_summary.get("user_query"),
+        )
+        if desired_partition["train_positions"] != current_train_positions:
+            try:
+                strategy = orchestrator.run_feature_agent(
+                    json.dumps(_agent_visible_eda(desired_eda), ensure_ascii=False),
+                    str(strategy_document.get("eda_report_text") or ""),
+                )
+            except Exception as exc:
+                logger.exception("按最终任务语义重新生成特征策略失败 task_id=%s", task_id)
+                raise _workflow_detail(
+                    422,
+                    "workflow_strategy_regeneration_failed",
+                    "feature_strategy",
+                    "最终任务类型需要重新生成特征策略，请重试",
+                ) from exc
+        _persist_workflow_selection(
+            task_dir,
+            desired_partition,
+            desired_eda,
+            strategy,
+            str(strategy_document.get("eda_report_text") or ""),
+        )
+        current_partition = desired_partition
+        eda_summary = desired_eda
+        current_train_positions = desired_partition["train_positions"]
+        current_holdout_positions = desired_partition["holdout_positions"]
+
+    train_frame = frame.iloc[current_train_positions].copy()
+    holdout_frame = frame.iloc[current_holdout_positions].copy()
+    clean_frame = pd.concat([train_frame, holdout_frame]).sort_index()
 
     X_train = train_frame.drop(columns=[target_col])
     X_holdout = holdout_frame.drop(columns=[target_col])
@@ -1003,6 +1273,7 @@ def _prepare_workflow_training(
     eda_summary = _build_workflow_eda_summary(
         train_frame,
         target_col,
+        partition=current_partition,
         source_rows=len(frame),
         user_query=user_query,
     )

@@ -225,15 +225,6 @@ def test_workflow_holdout_only_mutations_cannot_change_strategy_agent_or_fitted_
     mutated.loc[60:79, "category_code"] = np.arange(100, 120)
     mutated.loc[60:79, "is_fraud"] = [0] + [1] * 19
 
-    partition = {
-        "schema_version": 1,
-        "target": "is_fraud",
-        "row_count": 80,
-        "holdout_size": 0.25,
-        "random_state": 42,
-        "train_positions": list(range(train_rows)),
-        "holdout_positions": list(range(train_rows, 80)),
-    }
     task_frames = {
         "task_aaaa0001": base,
         "task_bbbb0002": mutated,
@@ -242,6 +233,21 @@ def test_workflow_holdout_only_mutations_cannot_change_strategy_agent_or_fitted_
         task_dir = output_dir / task_id
         task_dir.mkdir(parents=True)
         frame.to_parquet(task_dir / "raw_data.parquet", index=False)
+        partition = {
+            "schema_version": 2,
+            "dataset_fingerprint": workflow._workflow_dataset_fingerprint(frame, "is_fraud"),
+            "target": "is_fraud",
+            "row_count": 80,
+            "requested_type": "auto",
+            "resolved_type": "binary_classification",
+            "split_semantics": "stratified",
+            "stratified": True,
+            "holdout_size": 0.25,
+            "random_state": 42,
+            "train_positions": list(range(train_rows)),
+            "holdout_positions": list(range(train_rows, 80)),
+        }
+        partition["provenance_id"] = workflow._partition_provenance_id(partition)
         (task_dir / "workflow_partition.json").write_text(
             json.dumps(partition), encoding="utf-8"
         )
@@ -323,6 +329,245 @@ def test_workflow_holdout_only_mutations_cannot_change_strategy_agent_or_fitted_
     assert terminal_events[0]["metrics"] != terminal_events[1]["metrics"]
 
 
+def test_workflow_rejects_legacy_strategy_before_optimizer_can_use_it(tmp_path, monkeypatch):
+    """Catches a pre-partition, full-data strategy entering model selection after upgrade."""
+    task_id = "task_ab12cd34"
+    task_dir = tmp_path / "output" / task_id
+    task_dir.mkdir(parents=True)
+    frame = pd.DataFrame(
+        {
+            "signal": np.linspace(0.0, 1.0, 40),
+            "amount": np.linspace(10.0, 90.0, 40),
+        }
+    )
+    frame.to_parquet(task_dir / "raw_data.parquet", index=False)
+    (task_dir / "eda_summary.json").write_text(
+        json.dumps(_full_frame_eda(frame, "amount")), encoding="utf-8"
+    )
+    legacy_strategy = FeatureStrategy(
+        actions=[FeatureAction(column="signal", action="scale_standard", reason="full-data")]
+    )
+    (task_dir / "feature_strategy.json").write_text(
+        legacy_strategy.model_dump_json(), encoding="utf-8"
+    )
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    optimizer_constructed = False
+
+    def reject_optimizer(*args, **kwargs):
+        nonlocal optimizer_constructed
+        optimizer_constructed = True
+        raise AssertionError("legacy strategy reached optimizer")
+
+    monkeypatch.setattr(AutoMLOptimizer, "__init__", reject_optimizer)
+
+    response = TestClient(app).get(
+        "/api/workflow/step3_train_stream",
+        params={"task_id": task_id, "problem_type": "regression", "n_trials": 10, "cv_folds": 3},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "workflow_strategy_provenance_required",
+        "field": "feature_strategy",
+        "message": "工作流特征策略缺少可信来源，请重新运行特征生成",
+    }
+    assert not optimizer_constructed
+
+
+@pytest.mark.parametrize("mutation", ["replacement", "reorder"])
+def test_workflow_partition_rejects_same_shape_dataset_fingerprint_mismatch(
+    tmp_path, mutation
+):
+    """Catches positional partition reuse after same-shape content replacement or row reorder."""
+    task_dir = tmp_path / "task_ab12cd34"
+    task_dir.mkdir()
+    frame = pd.DataFrame(
+        {
+            "feature": np.arange(40, dtype=float),
+            "amount": np.linspace(1.25, 80.75, 40),
+        }
+    )
+    workflow._load_or_create_workflow_partition(task_dir, frame, "amount")
+    if mutation == "replacement":
+        changed = frame.copy()
+        changed["feature"] = changed["feature"] + 10_000.0
+    else:
+        changed = frame.iloc[::-1].reset_index(drop=True)
+
+    with pytest.raises(ValueError, match="指纹"):
+        workflow._load_or_create_workflow_partition(task_dir, changed, "amount")
+
+
+def test_workflow_numeric_string_explicit_regression_is_not_blocked_by_auto_split(
+    tmp_path, monkeypatch
+):
+    """Catches native object auto classification rejecting a valid explicit regression override."""
+    task_id = "task_ab12cd34"
+    task_dir = tmp_path / "output" / task_id
+    task_dir.mkdir(parents=True)
+    frame = pd.DataFrame(
+        {
+            "feature": np.linspace(-4.0, 4.0, 80),
+            "amount": [f"{value / 10:.1f}" for value in range(80)],
+        }
+    )
+    frame.to_parquet(task_dir / "raw_data.parquet", index=False)
+    (task_dir / "eda_summary.json").write_text(
+        json.dumps({"target": "amount", "user_query": "预测数值字符串"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    monkeypatch.setattr(
+        workflow.orchestrator,
+        "run_feature_agent",
+        lambda *_args, **_kwargs: FeatureStrategy(
+            actions=[FeatureAction(column="feature", action="scale_standard", reason="test")]
+        ),
+    )
+    monkeypatch.setattr(workflow, "recommend_automl_config", _linear_regression_agent_config)
+    client = TestClient(app)
+
+    generated = client.post(
+        "/api/workflow/step2_generate_features",
+        json={"task_id": task_id, "eda_report_text": ""},
+    )
+    events = _read_workflow_sse(task_id, "regression", 10, 3) if generated.status_code == 200 else []
+
+    assert generated.status_code == 200
+    assert events[-1]["status"] == "DONE"
+    assert events[-1]["problem_spec"]["requested_type"] == "regression"
+    assert events[-1]["problem_spec"]["resolved_type"] == "regression"
+    assert all(math.isfinite(value) for value in events[-1]["metrics"].values())
+
+
+def test_workflow_explicit_multiclass_rebuilds_auto_regression_partition_with_coverage(
+    tmp_path, monkeypatch
+):
+    """Catches an explicit classification override retaining an unstratified auto split."""
+    task_id = "task_ab12cd34"
+    task_dir = tmp_path / "output" / task_id
+    task_dir.mkdir(parents=True)
+    classes = np.repeat(np.arange(21), 4)
+    frame = pd.DataFrame({"feature": np.arange(len(classes), dtype=float), "label": classes})
+    frame.to_parquet(task_dir / "raw_data.parquet", index=False)
+    (task_dir / "eda_summary.json").write_text(
+        json.dumps({"target": "label", "user_query": "显式多分类"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    feature_agent_inputs: list[dict] = []
+
+    def feature_agent(eda_json: str, _report: str):
+        feature_agent_inputs.append(json.loads(eda_json))
+        return FeatureStrategy(
+            actions=[FeatureAction(column="feature", action="scale_standard", reason="test")]
+        )
+
+    monkeypatch.setattr(workflow.orchestrator, "run_feature_agent", feature_agent)
+    monkeypatch.setattr(
+        workflow,
+        "recommend_automl_config",
+        lambda *_args, **_kwargs: {
+            "task_type": "multiclass_classification",
+            "optimization_metric": "accuracy",
+            "candidate_models": ["logistic_regression"],
+            "n_trials": 10,
+            "search_spaces": {},
+            "rationale": "explicit multiclass coverage",
+        },
+    )
+    client = TestClient(app)
+
+    generated = client.post(
+        "/api/workflow/step2_generate_features",
+        json={"task_id": task_id, "eda_report_text": ""},
+    )
+    assert generated.status_code == 200
+    events = _read_workflow_sse(task_id, "multiclass_classification", 10, 3)
+    partition = json.loads((task_dir / "workflow_partition.json").read_text(encoding="utf-8"))
+    train_classes = set(frame.iloc[partition["train_positions"]]["label"])
+    holdout_classes = set(frame.iloc[partition["holdout_positions"]]["label"])
+
+    assert events[-1]["status"] == "DONE"
+    assert partition["requested_type"] == "multiclass_classification"
+    assert partition["resolved_type"] == "multiclass_classification"
+    assert partition["split_semantics"] == "stratified"
+    assert train_classes == set(range(21))
+    assert holdout_classes == set(range(21))
+    assert len(feature_agent_inputs) == 2
+
+
+def test_workflow_rejects_strategy_with_mismatched_partition_provenance(tmp_path, monkeypatch):
+    """Catches a valid-shaped strategy being paired with a different partition generation."""
+    task_id = "task_ab12cd34"
+    task_dir = tmp_path / "output" / task_id
+    task_dir.mkdir(parents=True)
+    frame = pd.DataFrame(
+        {"feature": np.arange(60, dtype=float), "amount": np.linspace(1.0, 10.0, 60)}
+    )
+    frame.to_parquet(task_dir / "raw_data.parquet", index=False)
+    (task_dir / "eda_summary.json").write_text(
+        json.dumps({"target": "amount", "user_query": "provenance mismatch"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    monkeypatch.setattr(
+        workflow.orchestrator,
+        "run_feature_agent",
+        lambda *_args, **_kwargs: FeatureStrategy(
+            actions=[FeatureAction(column="feature", action="scale_standard", reason="test")]
+        ),
+    )
+    client = TestClient(app)
+    generated = client.post(
+        "/api/workflow/step2_generate_features",
+        json={"task_id": task_id, "eda_report_text": ""},
+    )
+    assert generated.status_code == 200
+    persisted = json.loads((task_dir / "feature_strategy.json").read_text(encoding="utf-8"))
+    (task_dir / "feature_strategy.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "provenance_id": "0" * 64,
+                "strategy": persisted.get("strategy", persisted),
+                "eda_report_text": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get(
+        "/api/workflow/step3_train_stream",
+        params={"task_id": task_id, "problem_type": "regression", "n_trials": 10, "cv_folds": 3},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "workflow_strategy_provenance_mismatch",
+        "field": "feature_strategy",
+        "message": "工作流特征策略与数据分区来源不一致，请重新运行特征生成",
+    }
+
+
+def _persist_test_workflow_selection(
+    task_dir, frame: pd.DataFrame, target_col: str, strategy: FeatureStrategy, problem_type: str
+) -> None:
+    partition = workflow._build_workflow_partition(frame, target_col, problem_type)
+    eda = workflow._build_workflow_eda_summary(
+        frame.iloc[partition["train_positions"]],
+        target_col,
+        partition=partition,
+        source_rows=len(frame),
+        user_query="预测订单金额",
+    )
+    workflow._persist_workflow_selection(task_dir, partition, eda, strategy, "")
+
+
 def _prepare_workflow_task(tmp_path) -> str:
     task_id = "task_ab12cd34"
     task_dir = tmp_path / "output" / task_id
@@ -336,16 +581,10 @@ def _prepare_workflow_task(tmp_path) -> str:
         }
     )
     frame.to_parquet(task_dir / "raw_data.parquet", index=False)
-    (task_dir / "eda_summary.json").write_text(
-        json.dumps({"target": "order_fee", "user_query": "预测订单金额"}, ensure_ascii=False),
-        encoding="utf-8",
-    )
     strategy = FeatureStrategy(
         actions=[FeatureAction(column="age", action="fillna_mean", reason="测试填充")]
     )
-    (task_dir / "feature_strategy.json").write_text(
-        strategy.model_dump_json(), encoding="utf-8"
-    )
+    _persist_test_workflow_selection(task_dir, frame, "order_fee", strategy, "auto")
     return task_id
 
 
@@ -378,6 +617,13 @@ def test_workflow_regression_corrects_agent_suggestion_and_predicts_float(
     task_id = _prepare_workflow_task(tmp_path)
     monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    monkeypatch.setattr(
+        workflow.orchestrator,
+        "run_feature_agent",
+        lambda *_args, **_kwargs: FeatureStrategy(
+            actions=[FeatureAction(column="age", action="fillna_mean", reason="override")]
+        ),
+    )
     monkeypatch.setattr(
         workflow,
         "recommend_automl_config",
@@ -721,8 +967,24 @@ def test_workflow_explicit_regression_override_precedes_agent_suggestion(tmp_pat
     frame = pd.read_parquet(task_dir / "raw_data.parquet")
     frame["order_fee"] = np.tile([1, 2, 3, 4], 20)
     frame.to_parquet(task_dir / "raw_data.parquet", index=False)
+    _persist_test_workflow_selection(
+        task_dir,
+        frame,
+        "order_fee",
+        FeatureStrategy(
+            actions=[FeatureAction(column="age", action="fillna_mean", reason="测试填充")]
+        ),
+        "auto",
+    )
     monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    monkeypatch.setattr(
+        workflow.orchestrator,
+        "run_feature_agent",
+        lambda *_args, **_kwargs: FeatureStrategy(
+            actions=[FeatureAction(column="age", action="fillna_mean", reason="override")]
+        ),
+    )
     monkeypatch.setattr(
         workflow,
         "recommend_automl_config",
@@ -758,6 +1020,15 @@ def test_workflow_rejects_invalid_cv_before_opening_sse(tmp_path, monkeypatch):
         }
     )
     frame.to_parquet(task_dir / "raw_data.parquet", index=False)
+    _persist_test_workflow_selection(
+        task_dir,
+        frame,
+        "order_fee",
+        FeatureStrategy(
+            actions=[FeatureAction(column="age", action="fillna_mean", reason="测试填充")]
+        ),
+        "auto",
+    )
     monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
 
@@ -786,6 +1057,16 @@ def test_workflow_rejects_too_few_regression_cv_rows_before_sse(tmp_path, monkey
             "order_fee": [1.1, 2.4, 4.2, 7.9, 13.7],
         }
     ).to_parquet(task_dir / "raw_data.parquet", index=False)
+    small_frame = pd.read_parquet(task_dir / "raw_data.parquet")
+    _persist_test_workflow_selection(
+        task_dir,
+        small_frame,
+        "order_fee",
+        FeatureStrategy(
+            actions=[FeatureAction(column="age", action="fillna_mean", reason="测试填充")]
+        ),
+        "regression",
+    )
     monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
 
