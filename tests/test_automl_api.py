@@ -1,14 +1,19 @@
 import io
+import json
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 from fastapi.testclient import TestClient
 
+import backend.api.automl as automl_api
 from backend.api.automl import AutoMLJob, _run_job, automl_jobs
 from backend.main import app
+from backend.runtime_state import RuntimeStateStore
 
 
 def _csv_upload(rows: int = 64) -> tuple[str, io.BytesIO, str]:
@@ -29,6 +34,30 @@ def _csv_upload(rows: int = 64) -> tuple[str, io.BytesIO, str]:
     return "sample.csv", io.BytesIO(df.to_csv(index=False).encode("utf-8")), "text/csv"
 
 
+def _regression_csv(rows: int = 80) -> tuple[str, io.BytesIO, str]:
+    x = np.linspace(-10.0, 10.0, rows)
+    frame = pd.DataFrame({"x": x, "price": 4.5 * x + 12.0})
+    return "regression.csv", io.BytesIO(frame.to_csv(index=False).encode()), "text/csv"
+
+
+def _create_regression_automl_job(client: TestClient, metric: str = "rmse") -> str:
+    file_name, file_body, content_type = _regression_csv()
+    response = client.post(
+        "/api/automl/jobs",
+        files={"file": (file_name, file_body, content_type)},
+        data={
+            "target_col": "price",
+            "problem_type": "auto",
+            "optimization_metric": metric,
+            "candidate_models": '["linear_regression"]',
+            "n_trials": 1,
+            "cv_folds": 3,
+        },
+    )
+    assert response.status_code == 201
+    return response.json()["job_id"]
+
+
 def _wait_for_completion(client: TestClient, job_id: str, timeout: float = 12.0) -> dict:
     deadline = time.time() + timeout
     last_status: dict = {}
@@ -40,6 +69,222 @@ def _wait_for_completion(client: TestClient, job_id: str, timeout: float = 12.0)
             return last_status
         time.sleep(0.25)
     raise AssertionError(f"AutoML job did not finish in time: {last_status}")
+
+
+def test_automl_regression_auto_metric_and_problem_spec():
+    client = TestClient(app)
+    file_name, file_body, content_type = _regression_csv(rows=80)
+    response = client.post(
+        "/api/automl/jobs",
+        files={"file": (file_name, file_body, content_type)},
+        data={
+            "target_col": "price",
+            "problem_type": "auto",
+            "optimization_metric": "auto",
+            "candidate_models": '["linear_regression"]',
+            "n_trials": 1,
+            "cv_folds": 3,
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["problem_spec"]["resolved_type"] == "regression"
+    assert payload["optimization_metric"] == "rmse"
+
+
+def test_automl_rejects_regression_with_classification_metric():
+    client = TestClient(app)
+    file_name, file_body, content_type = _regression_csv(rows=40)
+    response = client.post(
+        "/api/automl/jobs",
+        files={"file": (file_name, file_body, content_type)},
+        data={"problem_type": "regression", "optimization_metric": "accuracy"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["field"] == "optimization_metric"
+
+
+def test_automl_rejects_incompatible_candidate_before_creating_job():
+    client = TestClient(app)
+    file_name, file_body, content_type = _regression_csv(rows=40)
+    existing_ids = {item["job_id"] for item in automl_api.runtime_state.list(automl_api.JOB_NAMESPACE)}
+
+    response = client.post(
+        "/api/automl/jobs",
+        files={"file": (file_name, file_body, content_type)},
+        data={
+            "problem_type": "regression",
+            "optimization_metric": "rmse",
+            "candidate_models": '["logistic_regression"]',
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "incompatible_algorithm",
+        "field": "algorithm",
+        "message": "算法 logistic_regression 不适用于 regression",
+        "received": "logistic_regression",
+        "allowed": ["lightgbm", "xgboost", "catboost", "random_forest", "linear_regression"],
+    }
+    assert {item["job_id"] for item in automl_api.runtime_state.list(automl_api.JOB_NAMESPACE)} == existing_ids
+
+
+def test_automl_rejects_infeasible_cv_before_creating_job():
+    client = TestClient(app)
+    file_name, file_body, content_type = _regression_csv(rows=5)
+    existing_ids = {item["job_id"] for item in automl_api.runtime_state.list(automl_api.JOB_NAMESPACE)}
+
+    response = client.post(
+        "/api/automl/jobs",
+        files={"file": (file_name, file_body, content_type)},
+        data={
+            "problem_type": "regression",
+            "optimization_metric": "rmse",
+            "candidate_models": '["linear_regression"]',
+            "cv_folds": 5,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["field"] == "cv_folds"
+    assert {item["job_id"] for item in automl_api.runtime_state.list(automl_api.JOB_NAMESPACE)} == existing_ids
+
+
+def test_automl_regression_completes_with_raw_rmse():
+    client = TestClient(app)
+    job_id = _create_regression_automl_job(client, metric="rmse")
+
+    final = _wait_for_completion(client, job_id)
+
+    assert final["status"] == "completed"
+    result = client.get(f"/api/automl/jobs/{job_id}/result").json()
+    assert result["best_value"] >= 0
+    assert set(result["metrics"]) == {"rmse", "mae", "r2"}
+    assert result["threshold_calibration"] is None
+    assert result["problem_spec"]["capabilities"]["metric_directions"]["rmse"] == "minimize"
+    assert all(event["value"] >= 0 for event in result["trial_history"])
+
+
+def test_automl_regression_snapshot_events_and_schema_v3_artifact_survive_reload():
+    client = TestClient(app)
+    job_id = _create_regression_automl_job(client)
+    assert _wait_for_completion(client, job_id)["status"] == "completed"
+
+    with client.stream("GET", f"/api/automl/jobs/{job_id}/stream") as response:
+        events = [json.loads(line.removeprefix("data: ")) for line in response.iter_lines() if line.startswith("data: ")]
+    assert events
+    assert all(event["problem_spec"]["resolved_type"] == "regression" for event in events)
+
+    automl_jobs.pop(job_id)
+    restored = client.get(f"/api/automl/jobs/{job_id}")
+    assert restored.status_code == 200
+    assert restored.json()["problem_spec"]["resolved_type"] == "regression"
+
+    saved = client.post(f"/api/automl/jobs/{job_id}/save")
+    assert saved.status_code == 200
+    artifact_path = Path(__file__).parents[1] / saved.json()["artifact_path"]
+    artifact = joblib.load(artifact_path)
+    assert artifact["artifact_schema_version"] == 3
+    assert artifact["problem_type"] == "regression"
+    assert artifact["problem_spec"]["resolved_type"] == "regression"
+    assert artifact["metric_directions"] == {"rmse": "minimize", "mae": "minimize", "r2": "maximize"}
+
+
+def test_restoring_legacy_automl_job_has_classification_problem_spec():
+    job_id = uuid.uuid4().hex
+    now = datetime.now().isoformat(timespec="seconds")
+    automl_api.runtime_state.put(
+        automl_api.JOB_NAMESPACE,
+        job_id,
+        {
+            "job_id": job_id,
+            "status": "failed",
+            "created_at": now,
+            "updated_at": now,
+            "n_trials": 1,
+            "cv_folds": 2,
+            "optimization_metric": "roc_auc",
+            "target_col": "label",
+            "decision_summary": {"key_columns": [], "candidate_models": ["logistic_regression"]},
+            "candidate_models": ["logistic_regression"],
+            "progress": 0,
+            "current_trial": 0,
+            "error": "interrupted",
+            "artifact_path": None,
+            "events": [],
+            "has_result": False,
+        },
+    )
+    try:
+        restored = automl_api._restore_job(job_id)
+    finally:
+        automl_api.runtime_state.delete(automl_api.JOB_NAMESPACE, job_id)
+
+    assert restored is not None
+    assert restored.problem_spec["resolved_type"] == "binary_classification"
+    assert restored.problem_spec["source"] == "legacy_compatibility"
+
+
+def test_restart_recovery_event_retains_problem_spec(tmp_path, monkeypatch):
+    store = RuntimeStateStore(tmp_path / "automl-recovery")
+    job_id = uuid.uuid4().hex
+    now = datetime.now().isoformat(timespec="seconds")
+    problem_spec = {
+        "schema_version": 1,
+        "requested_type": "regression",
+        "resolved_type": "regression",
+        "source": "user_override",
+        "reason": "user_selected_regression",
+        "explanation": "用户显式选择了regression",
+        "target": {
+            "column": "price",
+            "dtype": "float64",
+            "valid_rows": 20,
+            "unique_count": 20,
+            "unique_ratio": 1.0,
+            "integer_like": False,
+        },
+        "capabilities": {
+            "algorithms": ["lightgbm", "xgboost", "catboost", "random_forest", "linear_regression"],
+            "metrics": ["rmse", "mae", "r2"],
+            "default_metric": "rmse",
+            "metric_directions": {"rmse": "minimize", "mae": "minimize", "r2": "maximize"},
+        },
+    }
+    store.put(
+        automl_api.JOB_NAMESPACE,
+        job_id,
+        {
+            "job_id": job_id,
+            "status": "running",
+            "created_at": now,
+            "updated_at": now,
+            "n_trials": 1,
+            "cv_folds": 3,
+            "optimization_metric": "rmse",
+            "target_col": "price",
+            "decision_summary": {"key_columns": [], "candidate_models": ["linear_regression"]},
+            "problem_spec": problem_spec,
+            "candidate_models": ["linear_regression"],
+            "progress": 50,
+            "current_trial": 0,
+            "error": None,
+            "artifact_path": None,
+            "events": [],
+            "has_result": False,
+        },
+    )
+    monkeypatch.setattr(automl_api, "runtime_state", store)
+
+    assert automl_api.recover_interrupted_automl_jobs() == 1
+    recovered = store.get(automl_api.JOB_NAMESPACE, job_id)
+
+    assert recovered is not None
+    assert recovered["status"] == "failed"
+    assert recovered["events"][-1]["problem_spec"]["resolved_type"] == "regression"
 
 
 def test_automl_job_runs_full_lifecycle_and_saves_result():

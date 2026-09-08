@@ -28,6 +28,7 @@ from backend.runtime_state import TaskQueueFullError, background_tasks, runtime_
 from ._dataset import (
     calibrate_binary_threshold,
     compute_classification_metrics,
+    compute_regression_metrics,
     dataframe_quality_report,
     detect_key_columns,
     detect_target_col,
@@ -37,6 +38,15 @@ from ._dataset import (
     save_job_artifact,
     with_runtime_params,
 )
+from core.automl.problem_spec import (
+    ProblemSpec,
+    ProblemSpecError,
+    ProblemType,
+    resolve_metric,
+    resolve_problem_spec,
+    validate_algorithm,
+    validate_cv,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +54,6 @@ router = APIRouter(prefix="/api/automl", tags=["AutoML"])
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_DIR = PROJECT_ROOT / "saved" / "automl"
-SUPPORTED_METRICS = {"roc_auc", "accuracy", "f1"}
-SUPPORTED_MODELS = {
-    "lightgbm",
-    "xgboost",
-    "catboost",
-    "random_forest",
-    "logistic_regression",
-}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 
@@ -66,6 +68,7 @@ class AutoMLJob:
     optimization_metric: str
     target_col: str
     decision_summary: Dict[str, Any]
+    problem_spec: Dict[str, Any] = field(default_factory=dict)
     candidate_models: List[str] = field(default_factory=list)
     progress: int = 0
     current_trial: int = 0
@@ -104,6 +107,7 @@ def _persist_job(job: AutoMLJob) -> None:
             "optimization_metric": job.optimization_metric,
             "target_col": job.target_col,
             "decision_summary": job.decision_summary,
+            "problem_spec": job.problem_spec,
             "candidate_models": job.candidate_models,
             "progress": job.progress,
             "current_trial": job.current_trial,
@@ -119,14 +123,26 @@ def _restore_job(job_id: str) -> Optional[AutoMLJob]:
     payload = runtime_state.get(JOB_NAMESPACE, job_id)
     if payload is None:
         return None
-    has_result = bool(payload.pop("has_result", False))
+    restored_payload = dict(payload)
+    has_result = bool(restored_payload.pop("has_result", False))
     result = None
     if has_result:
         try:
             result = runtime_state.load_blob(RESULT_BLOB_NAMESPACE, job_id)
         except FileNotFoundError:
             logger.error("Persisted AutoML result is incomplete: %s", job_id)
-    return AutoMLJob(result=result, **payload)
+    if "problem_spec" not in restored_payload:
+        restored_payload["problem_spec"] = _legacy_classification_problem_spec()
+    if isinstance(result, dict) and "problem_spec" not in result:
+        result["problem_spec"] = restored_payload["problem_spec"]
+    return AutoMLJob(result=result, **restored_payload)
+
+
+def _legacy_classification_problem_spec() -> Dict[str, Any]:
+    """Provide task metadata for persisted pre-schema-v3 AutoML jobs."""
+    payload = resolve_problem_spec(pd.Series([0, 1]), "legacy_target", "binary").to_dict()
+    payload["source"] = "legacy_compatibility"
+    return payload
 
 
 def recover_interrupted_automl_jobs() -> int:
@@ -138,10 +154,12 @@ def recover_interrupted_automl_jobs() -> int:
         payload["status"] = "failed"
         payload["error"] = "服务曾重启，原 AutoML 进程已中断，请重新提交任务"
         payload["updated_at"] = _now()
+        problem_spec = payload.setdefault("problem_spec", _legacy_classification_problem_spec())
         events = payload.setdefault("events", [])
         events.append(
             {
                 "timestamp": payload["updated_at"],
+                "problem_spec": problem_spec,
                 "event": "error",
                 "status": "failed",
                 "message": payload["error"],
@@ -195,6 +213,7 @@ def _job_snapshot(job: AutoMLJob) -> Dict[str, Any]:
         "optimization_metric": job.optimization_metric,
         "target_col": job.target_col,
         "decision_summary": job.decision_summary,
+        "problem_spec": job.problem_spec,
         "created_at": job.created_at,
         "updated_at": job.updated_at,
         "error": job.error,
@@ -203,7 +222,7 @@ def _job_snapshot(job: AutoMLJob) -> Dict[str, Any]:
 
 
 def _append_event(job: AutoMLJob, event: Dict[str, Any]) -> None:
-    event = {"timestamp": _now(), **event}
+    event = {"timestamp": _now(), "problem_spec": job.problem_spec, **event}
     with jobs_lock:
         job.events.append(event)
         job.updated_at = event["timestamp"]
@@ -236,14 +255,18 @@ def _parse_candidate_models(candidate_models: Optional[str]) -> Optional[List[st
         raise HTTPException(status_code=400, detail="candidate_models 必须是 JSON 数组") from exc
     if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
         raise HTTPException(status_code=400, detail="candidate_models 必须是字符串数组")
-    invalid = [item for item in parsed if item not in SUPPORTED_MODELS]
-    if invalid:
-        raise HTTPException(status_code=400, detail=f"不支持的候选模型：{', '.join(invalid)}")
+    if not parsed:
+        raise HTTPException(status_code=400, detail="candidate_models 不能为空数组")
     return parsed
 
 
-def _recommend_models(feature_df: pd.DataFrame, target: pd.Series, requested: Optional[List[str]]) -> Dict[str, Any]:
-    if requested:
+def _recommend_models(
+    feature_df: pd.DataFrame,
+    target: pd.Series,
+    requested: Optional[List[str]],
+    allowed_models: List[str],
+) -> Dict[str, Any]:
+    if requested is not None:
         return {
             "candidate_models": requested,
             "recommendation_reason": "使用前端指定候选模型。",
@@ -254,9 +277,9 @@ def _recommend_models(feature_df: pd.DataFrame, target: pd.Series, requested: Op
         from model_code.auto_selector import AutoModelSelector
 
         recommendation = AutoModelSelector.recommend(feature_df, target)
-        candidates = [item for item in recommendation["candidates"] if item in SUPPORTED_MODELS]
+        candidates = [item for item in recommendation["candidates"] if item in allowed_models]
         return {
-            "candidate_models": candidates[:3] or ["random_forest", "logistic_regression"],
+            "candidate_models": candidates[:3] or allowed_models[:3],
             "recommendation_reason": recommendation.get("reason", "启发式模型推荐。"),
             "recommendation_source": "heuristic",
             "selector_analysis": recommendation.get("analysis", {}),
@@ -264,7 +287,7 @@ def _recommend_models(feature_df: pd.DataFrame, target: pd.Series, requested: Op
     except Exception as exc:
         logger.warning("AutoML model recommendation failed: %s", exc)
         return {
-            "candidate_models": ["random_forest", "logistic_regression"],
+            "candidate_models": allowed_models[:3],
             "recommendation_reason": f"启发式推荐失败，使用稳健默认候选模型：{exc}",
             "recommendation_source": "fallback",
         }
@@ -307,15 +330,27 @@ def _suggest_params(trial, model_name: str) -> Dict[str, Any]:
             "thread_count": 1,
             "verbose": False,
         }
+    if model_name == "linear_regression":
+        return {}
     return {}
 
 
-def _scoring(metric: str, n_classes: int) -> str:
-    if metric == "accuracy":
-        return "accuracy"
-    if metric == "f1":
-        return "f1_weighted"
-    return "roc_auc" if n_classes == 2 else "roc_auc_ovr_weighted"
+def _scoring(metric: str, resolved_type: str) -> str:
+    mapping = {
+        "accuracy": "accuracy",
+        "f1": "f1_weighted",
+        "rmse": "neg_root_mean_squared_error",
+        "mae": "neg_mean_absolute_error",
+        "r2": "r2",
+    }
+    if metric == "roc_auc":
+        return "roc_auc" if resolved_type == ProblemType.BINARY.value else "roc_auc_ovr_weighted"
+    return mapping[metric]
+
+
+def _readable_cv_value(metric: str, scores: np.ndarray) -> float:
+    mean = float(np.mean(scores))
+    return -mean if metric in {"rmse", "mae"} else mean
 
 
 def _run_job(
@@ -325,7 +360,7 @@ def _run_job(
 ) -> None:
     import optuna
     from sklearn.base import clone
-    from sklearn.model_selection import StratifiedKFold, cross_val_score
+    from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
     from sklearn.pipeline import Pipeline
     from model_code.model_factory import ModelFactory
 
@@ -340,12 +375,18 @@ def _run_job(
         _append_event(job, {"event": "status", "status": "running", "message": "AutoML 任务开始"})
 
         key_cols = job.decision_summary.get("key_columns", [])
-        bundle = prepare_train_pipeline(df, job.target_col, key_cols)
-        n_classes = int(bundle.y_train.nunique())
-        task_type = "binary" if n_classes == 2 else "multiclass"
-        safe_cv = max(2, min(job.cv_folds, int(bundle.y_train.value_counts().min())))
-        cv = StratifiedKFold(n_splits=safe_cv, shuffle=True, random_state=42)
-        direction = "maximize"
+        spec = ProblemSpec.from_dict(job.problem_spec) if job.problem_spec else resolve_problem_spec(
+            df[job.target_col], job.target_col, "auto"
+        )
+        if not job.problem_spec:
+            job.problem_spec = spec.to_dict()
+        bundle = prepare_train_pipeline(df, job.target_col, key_cols, problem_spec=spec)
+        task_type = spec.resolved_type.value
+        if spec.resolved_type == ProblemType.REGRESSION:
+            cv = KFold(n_splits=job.cv_folds, shuffle=True, random_state=42)
+        else:
+            cv = StratifiedKFold(n_splits=job.cv_folds, shuffle=True, random_state=42)
+        direction = spec.metric_directions[job.optimization_metric]
         study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
         trial_history: List[Dict[str, Any]] = []
 
@@ -362,11 +403,11 @@ def _run_job(
                 bundle.X_train,
                 bundle.y_train,
                 cv=cv,
-                scoring=_scoring(job.optimization_metric, n_classes),
+                scoring=_scoring(job.optimization_metric, task_type),
                 n_jobs=1,
-                error_score=0.0,
+                error_score="raise",
             )
-            return float(np.mean(scores))
+            return _readable_cv_value(job.optimization_metric, scores)
 
         def callback(study_obj, trial) -> None:
             if job.cancel_event.is_set():
@@ -402,8 +443,12 @@ def _run_job(
         best_params = dict(study.best_params)
         best_model_name = best_params.pop("model_type", candidate_models[0])
         best_model = ModelFactory.build(best_model_name, task_type=task_type, params=with_runtime_params(best_model_name, best_params))
-        calibration = {"threshold": 0.5, "source": "default", "calibration_size": 0}
-        if task_type == "binary":
+        calibration = None if spec.resolved_type == ProblemType.REGRESSION else {
+            "threshold": 0.5,
+            "source": "default",
+            "calibration_size": 0,
+        }
+        if spec.resolved_type == ProblemType.BINARY:
             calibration = calibrate_binary_threshold(
                 Pipeline([("prep", clone(bundle.preprocessor)), ("model", clone(best_model))]),
                 bundle.X_train,
@@ -414,12 +459,15 @@ def _run_job(
         X_train_transformed = preprocessor.transform(bundle.X_train)
         X_test_transformed = preprocessor.transform(bundle.X_test)
         best_model.fit(X_train_transformed, bundle.y_train)
-        metrics = compute_classification_metrics(
-            best_model,
-            X_test_transformed,
-            bundle.y_test,
-            decision_threshold=float(calibration["threshold"]),
-        )
+        if spec.resolved_type == ProblemType.REGRESSION:
+            metrics = compute_regression_metrics(best_model, X_test_transformed, bundle.y_test)
+        else:
+            metrics = compute_classification_metrics(
+                best_model,
+                X_test_transformed,
+                bundle.y_test,
+                decision_threshold=float(calibration["threshold"]) if calibration else 0.5,
+            )
         feature_importance = feature_importance_rows(best_model, list(preprocessor.get_feature_names_out()))
 
         result = {
@@ -431,16 +479,20 @@ def _run_job(
             "metrics": metrics,
             "trial_history": trial_history,
             "decision_summary": job.decision_summary,
+            "problem_spec": spec.to_dict(),
             "feature_importance": feature_importance,
             "feature_columns": bundle.feature_columns,
             "threshold_calibration": calibration,
             "_artifact": {
-                "artifact_version": 2,
+                "artifact_schema_version": 3,
+                "problem_type": spec.resolved_type.value,
+                "problem_spec": spec.to_dict(),
+                "metric_directions": spec.metric_directions,
                 "model": best_model,
                 "preprocessor": preprocessor,
                 "label_encoder": bundle.label_encoder,
                 "feature_columns": bundle.feature_columns,
-                "decision_threshold": float(calibration["threshold"]),
+                "decision_threshold": float(calibration["threshold"]) if calibration else None,
                 "threshold_calibration": calibration,
                 "decision_summary": job.decision_summary,
                 "metrics": metrics,
@@ -467,7 +519,8 @@ async def create_automl_job(
     n_trials: int = Form(10),
     cv_folds: int = Form(3),
     candidate_models: Optional[str] = Form(None),
-    optimization_metric: str = Form("roc_auc"),
+    optimization_metric: str = Form("auto"),
+    problem_type: str = Form("auto"),
     use_llm: bool = Form(True),
     business_context: str = Form("通用机器学习建模"),
 ):
@@ -475,23 +528,32 @@ async def create_automl_job(
         raise HTTPException(status_code=400, detail="n_trials 必须在 1 到 100 之间")
     if not 2 <= cv_folds <= 10:
         raise HTTPException(status_code=400, detail="cv_folds 必须在 2 到 10 之间")
-    if optimization_metric not in SUPPORTED_METRICS:
-        raise HTTPException(status_code=400, detail=f"不支持的优化指标：{optimization_metric}")
-
     df = await read_uploaded_dataframe(file)
     if df.shape[1] < 2:
         raise HTTPException(status_code=400, detail="数据至少需要 1 个特征列和 1 个目标列")
 
     target = detect_target_col(df, target_col)
+    try:
+        spec = resolve_problem_spec(df[target], target, problem_type)
+        resolved_metric = resolve_metric(spec, optimization_metric)
+    except ProblemSpecError as exc:
+        raise HTTPException(status_code=422, detail=exc.as_detail()) from exc
     key_cols = detect_key_columns(df, target)
     feature_df = df.drop(columns=[target, *key_cols], errors="ignore")
     requested_models = _parse_candidate_models(candidate_models)
-    recommendation = _recommend_models(feature_df, df[target], requested_models)
+    try:
+        for model_name in requested_models or []:
+            validate_algorithm(spec, model_name)
+        bundle = prepare_train_pipeline(df, target, key_cols, problem_spec=spec)
+        validate_cv(spec, bundle.y_train, cv_folds)
+    except ProblemSpecError as exc:
+        raise HTTPException(status_code=422, detail=exc.as_detail()) from exc
+    recommendation = _recommend_models(feature_df, df[target], requested_models, list(spec.algorithms))
     selected_models = recommendation["candidate_models"]
     summary = {
         **_eda_summary(df, target, key_cols),
         **recommendation,
-        "optimization_metric": optimization_metric,
+        "optimization_metric": resolved_metric,
         "use_llm_requested": use_llm,
         "llm_status": "not_configured_fallback" if use_llm else "disabled",
         "business_context": business_context,
@@ -506,9 +568,10 @@ async def create_automl_job(
         updated_at=now,
         n_trials=n_trials,
         cv_folds=cv_folds,
-        optimization_metric=optimization_metric,
+        optimization_metric=resolved_metric,
         target_col=target,
         decision_summary=summary,
+        problem_spec=spec.to_dict(),
         candidate_models=selected_models,
     )
     runtime_state.save_blob(INPUT_BLOB_NAMESPACE, job_id, df)
