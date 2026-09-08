@@ -25,8 +25,10 @@ import time
 import random
 import logging
 import re
+import threading
 import pandas as pd
 import numpy as np
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Query
@@ -40,12 +42,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from core.llm.agent_orchestrator import create_orchestrator
 from core.automl.automl_agent import AutoMLAgent, extract_data_features
-from core.automl.problem_spec import ProblemSpec, ProblemType, resolve_metric, resolve_problem_spec
-from model_code.feature_executor import FeatureEngineeringExecutor
-from core.automl.automl_optimizer import AutoMLOptimizer
+from core.automl.problem_spec import (
+    ProblemSpec,
+    ProblemSpecError,
+    ProblemType,
+    resolve_metric,
+    resolve_problem_spec,
+    validate_cv,
+    validate_train_test_split,
+)
+from model_code.feature_executor import FeatureEngineeringExecutor, FeatureEngineeringTransformer
+from core.automl.automl_optimizer import AutoMLOptimizer, OptimizationCancelled
 from core.llm.agent_schemas import FeatureAction, FeatureStrategy
 
-from ._dataset import compute_regression_metrics, predict_with_artifact
+from ._dataset import compute_classification_metrics, compute_regression_metrics, predict_with_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +71,72 @@ TASK_ID_PATTERN = re.compile(r"^task_[a-f0-9]{8}$")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = PROJECT_ROOT / "output"
 SAVED_DIR = PROJECT_ROOT / "saved"
+
+
+class StaleWorkflowRun(RuntimeError):
+    """A superseded/cancelled run attempted to mutate shared task state."""
+
+
+@dataclass
+class WorkflowRunControl:
+    run_id: str
+    cancel_event: threading.Event
+
+
+workflow_run_lock = threading.RLock()
+active_workflow_runs: Dict[str, WorkflowRunControl] = {}
+
+
+def _claim_workflow_run(task_id: str) -> WorkflowRunControl:
+    with workflow_run_lock:
+        if task_id in active_workflow_runs:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "workflow_run_active",
+                    "field": "task_id",
+                    "message": "该任务已有训练运行，请等待其结束",
+                },
+            )
+        control = WorkflowRunControl(uuid.uuid4().hex, threading.Event())
+        active_workflow_runs[task_id] = control
+        return control
+
+
+def _require_current_run(task_id: str, run_id: str, *, allow_cancelled: bool = False) -> WorkflowRunControl:
+    with workflow_run_lock:
+        control = active_workflow_runs.get(task_id)
+        if control is None or control.run_id != run_id:
+            raise StaleWorkflowRun("工作流运行已失效")
+        if control.cancel_event.is_set() and not allow_cancelled:
+            raise OptimizationCancelled("工作流运行已取消")
+        return control
+
+
+def _write_run_state(
+    task_id: str, run_id: str, payload: Dict[str, Any], *, allow_cancelled: bool = False
+) -> None:
+    with workflow_run_lock:
+        _require_current_run(task_id, run_id, allow_cancelled=allow_cancelled)
+        _write_workflow_state(task_id, {"run_id": run_id, **payload})
+
+
+def _persist_run_artifact(task_id: str, run_id: str, artifact: Dict[str, Any], path: Path) -> None:
+    temporary = path.with_name(f".{path.name}.{run_id}.tmp")
+    try:
+        joblib.dump(artifact, temporary)
+        with workflow_run_lock:
+            _require_current_run(task_id, run_id)
+            os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _release_workflow_run(task_id: str, run_id: str) -> None:
+    with workflow_run_lock:
+        control = active_workflow_runs.get(task_id)
+        if control is not None and control.run_id == run_id:
+            active_workflow_runs.pop(task_id, None)
 
 
 def validate_task_id(task_id: str) -> str:
@@ -617,6 +693,119 @@ async def generate_features(req: FeatureGenerationRequest):
 
 # ==================== 步骤 3: 训练 + SSE 推送 ====================
 
+WORKFLOW_HOLDOUT_SIZE = 0.25
+WORKFLOW_RANDOM_STATE = 42
+
+
+@dataclass
+class WorkflowTrainingContext:
+    task_id: str
+    task_dir: Path
+    clean_frame: pd.DataFrame
+    target_col: str
+    strategy: FeatureStrategy
+    execution_strategy: FeatureStrategy
+    eda_summary: Dict[str, Any]
+    spec: ProblemSpec
+    X_train: pd.DataFrame
+    X_holdout: pd.DataFrame
+    y_train: pd.Series
+    y_holdout: pd.Series
+    cv_folds: int
+
+
+def _workflow_detail(status_code: int, code: str, field: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "field": field, "message": message},
+    )
+
+
+def _prepare_workflow_training(
+    task_id: str, problem_type: str, cv_folds: int
+) -> WorkflowTrainingContext:
+    """Resolve target semantics, holdout, and exact CV feasibility before SSE."""
+    from sklearn.model_selection import train_test_split
+
+    task_dir = get_task_dir(task_id)
+    data_path = task_dir / "raw_data.parquet"
+    if not data_path.is_file():
+        raise _workflow_detail(404, "workflow_data_missing", "task_id", "工作流原始数据不存在")
+    strategy_path = task_dir / "feature_strategy.json"
+    if not strategy_path.is_file():
+        raise _workflow_detail(404, "workflow_strategy_missing", "task_id", "工作流特征策略不存在")
+
+    try:
+        frame = pd.read_parquet(data_path)
+    except Exception as exc:
+        logger.exception("读取工作流数据失败 task_id=%s", task_id)
+        raise _workflow_detail(400, "workflow_data_invalid", "task_id", "工作流原始数据无法读取") from exc
+    try:
+        strategy = FeatureStrategy.model_validate_json(strategy_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.exception("读取工作流特征策略失败 task_id=%s", task_id)
+        raise _workflow_detail(422, "workflow_strategy_invalid", "feature_strategy", "工作流特征策略无效") from exc
+
+    eda_summary: Dict[str, Any] = {}
+    eda_path = task_dir / "eda_summary.json"
+    if eda_path.is_file():
+        try:
+            loaded = json.loads(eda_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                eda_summary = loaded
+        except (OSError, ValueError) as exc:
+            logger.exception("读取工作流 EDA 摘要失败 task_id=%s", task_id)
+            raise _workflow_detail(422, "workflow_eda_invalid", "task_id", "工作流 EDA 摘要无效") from exc
+    target_col = eda_summary.get("target", "is_fraud")
+    if not isinstance(target_col, str) or target_col not in frame.columns:
+        raise _workflow_detail(422, "target_not_found", "target_col", "目标列不存在")
+
+    clean_frame = frame.loc[frame[target_col].notna()].copy()
+    try:
+        spec = resolve_problem_spec(clean_frame[target_col], target_col, problem_type)
+        validate_train_test_split(spec, clean_frame[target_col], WORKFLOW_HOLDOUT_SIZE)
+    except ProblemSpecError as exc:
+        raise HTTPException(status_code=422, detail=exc.as_detail()) from exc
+
+    X = clean_frame.drop(columns=[target_col])
+    if X.shape[1] == 0:
+        raise _workflow_detail(422, "features_missing", "target_col", "未找到可训练特征列")
+    y = clean_frame[target_col]
+    stratify = y if spec.resolved_type != ProblemType.REGRESSION else None
+    X_train, X_holdout, y_train, y_holdout = train_test_split(
+        X,
+        y,
+        test_size=WORKFLOW_HOLDOUT_SIZE,
+        random_state=WORKFLOW_RANDOM_STATE,
+        stratify=stratify,
+    )
+    try:
+        validate_cv(spec, y_train, cv_folds)
+    except ProblemSpecError as exc:
+        raise HTTPException(status_code=422, detail=exc.as_detail()) from exc
+
+    execution_strategy = _with_residual_categorical_encoding(clean_frame, target_col, strategy)
+    return WorkflowTrainingContext(
+        task_id=task_id,
+        task_dir=task_dir,
+        clean_frame=clean_frame,
+        target_col=target_col,
+        strategy=strategy,
+        execution_strategy=execution_strategy,
+        eda_summary=eda_summary,
+        spec=spec,
+        X_train=X_train,
+        X_holdout=X_holdout,
+        y_train=y_train,
+        y_holdout=y_holdout,
+        cv_folds=cv_folds,
+    )
+
+
+def _safe_workflow_error(exc: Exception) -> str:
+    logger.error("工作流训练失败 error_type=%s", type(exc).__name__, exc_info=True)
+    return "模型训练失败，请检查配置后重试"
+
 @router.get("/step3_train_stream")
 async def train_stream(
     task_id: str = Query(..., description="任务 ID"),
@@ -624,78 +813,41 @@ async def train_stream(
     n_trials: int = Query(30, description="Optuna Trial 次数", ge=10, le=100),
     cv_folds: int = Query(5, description="交叉验证折数", ge=3, le=10)
 ):
-    """
-    步骤 3：数据清洗 + AutoML 调参 + SSE 实时推送
-
-    注意：SSE 必须是 GET 请求，参数通过 Query 传递
-
-    流程:
-    1. 加载前置数据
-    2. FeatureEngineeringExecutor.fit_transform
-    3. AutoMLOptimizer 贝叶斯寻优
-    4. SSE 实时推送 Trial 进度
-    5. 持久化打包 (模型 + 执行器)
-    """
+    """预检并启动一个 task 独占、holdout-safe 的训练运行。"""
+    context = _prepare_workflow_training(task_id, problem_type, cv_folds)
+    control = _claim_workflow_run(task_id)
+    run_id = control.run_id
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
     completion_payload: Dict[str, Any] = {}
-    state_metadata: Dict[str, Any] = {"requested_type": problem_type}
+    problem_spec = context.spec.to_dict()
+    state_metadata: Dict[str, Any] = {
+        "requested_type": problem_type,
+        "problem_spec": problem_spec,
+        "cv_folds": cv_folds,
+    }
+
+    try:
+        _write_run_state(task_id, run_id, {"status": "running", **state_metadata})
+    except Exception:
+        _release_workflow_run(task_id, run_id)
+        raise
     
     def background_training_task():
-        """后台训练任务 (在线程池中运行)"""
+        """Run model selection on training rows and evaluate once on holdout."""
         try:
-            logger.info("任务 %s: 开始训练，requested_type=%s", task_id, problem_type)
-
-            # 1. 加载前置数据
-            task_dir = get_task_dir(task_id)
-            _write_workflow_state(task_id, {"status": "running", **state_metadata})
-            data_path = task_dir / "raw_data.parquet"
-            if not os.path.exists(data_path):
-                raise FileNotFoundError(f"未找到数据文件：{data_path}")
-
-            df_raw = pd.read_parquet(data_path)
-            logger.info(f"数据加载完成：{df_raw.shape}")
-
-            # 加载特征策略
-            strategy_path = task_dir / "feature_strategy.json"
-            if not os.path.exists(strategy_path):
-                raise FileNotFoundError(f"未找到策略文件：{strategy_path}")
-
-            with open(strategy_path, "r", encoding='utf-8') as f:
-                strategy_json = f.read()
-
-            strategy_obj = FeatureStrategy.model_validate_json(strategy_json)
-            logger.info(f"策略加载完成：{len(strategy_obj.actions)} 个动作")
-
-            # 加载 eda_summary 获取目标变量列名和业务场景
-            eda_path = task_dir / "eda_summary.json"
-            target_col = "is_fraud"  # 默认值
-            eda_summary: Dict[str, Any] = {}
-            if os.path.exists(eda_path):
-                with open(eda_path, "r", encoding='utf-8') as f:
-                    eda_summary = json.load(f)
-                    target_col = eda_summary.get("target", "is_fraud")
-
-            # 2. 执行特征工程 (fit_transform)
-            # 特征工程先于 AutoML CV 执行，因此禁用监督式 Target Encoding；高基数
-            # 类别会由执行器自动采用频率编码，避免验证折标签泄漏。
-            execution_strategy = _with_residual_categorical_encoding(
-                df_raw, target_col, strategy_obj
+            logger.info(
+                "任务 %s: 开始训练 run_id=%s requested_type=%s cv_folds=%s",
+                task_id,
+                run_id,
+                problem_type,
+                cv_folds,
             )
-            feature_executor = FeatureEngineeringExecutor(target_col=target_col, allow_target_encoding=False)
-            df_clean = feature_executor.fit_transform(df_raw, execution_strategy)
-            logger.info(f"特征工程完成：{df_clean.shape}")
-
-            # 检查目标变量是否在清洗后的数据中
-            if target_col not in df_clean.columns:
-                raise ValueError(f"目标变量 '{target_col}' 不在清洗后的数据中")
-
-            # 真实目标和用户请求共同解析最终规范；Agent 输出只作为建议。
-            spec = resolve_problem_spec(df_clean[target_col], target_col, problem_type)
-            problem_spec = spec.to_dict()
-            data_features = extract_data_features(df_clean, target_col)
+            _require_current_run(task_id, run_id)
+            spec = context.spec
+            data_features = extract_data_features(context.clean_frame, context.target_col)
             data_features["task_type"] = spec.resolved_type.value
-            scenario = eda_summary.get("user_query", "通用机器学习建模")
+            scenario = context.eda_summary.get("user_query", "通用机器学习建模")
             suggested_config = recommend_automl_config(data_features, scenario)
             optuna_config, suggested_type, agent_corrections = _coordinate_automl_config(
                 suggested_config, spec, n_trials
@@ -708,7 +860,7 @@ async def train_stream(
                     "best_metric": optuna_config["optimization_metric"],
                 }
             )
-            _write_workflow_state(task_id, {"status": "running", **state_metadata})
+            _write_run_state(task_id, run_id, {"status": "running", **state_metadata})
             logger.info(
                 "任务 %s: resolved_type=%s suggested_type=%s metric=%s candidates=%s corrections=%s",
                 task_id,
@@ -719,19 +871,31 @@ async def train_stream(
                 agent_corrections,
             )
 
-            # 只有分类任务编码标签；回归目标保持有限浮点值。
-            X = df_clean.drop(columns=[target_col])
+            # 标签编码只 fit train；holdout 仅 transform。
             if spec.resolved_type == ProblemType.REGRESSION:
                 label_encoder = None
-                y = pd.Series(
-                    pd.to_numeric(df_clean[target_col], errors="raise").astype(float),
-                    name=target_col,
+                y_train = pd.Series(
+                    pd.to_numeric(context.y_train, errors="raise").astype(float),
+                    name=context.target_col,
+                )
+                y_holdout = pd.Series(
+                    pd.to_numeric(context.y_holdout, errors="raise").astype(float),
+                    name=context.target_col,
                 )
             else:
                 from sklearn.preprocessing import LabelEncoder
 
                 label_encoder = LabelEncoder()
-                y = pd.Series(label_encoder.fit_transform(df_clean[target_col]), name=target_col)
+                y_train = pd.Series(
+                    label_encoder.fit_transform(context.y_train),
+                    index=context.y_train.index,
+                    name=context.target_col,
+                )
+                y_holdout = pd.Series(
+                    label_encoder.transform(context.y_holdout),
+                    index=context.y_holdout.index,
+                    name=context.target_col,
+                )
 
             # 4. SSE 回调函数 (适配 AutoMLOptimizer.optimize() 的返回值)
             import optuna
@@ -739,6 +903,7 @@ async def train_stream(
             def sse_callback(study: optuna.Study, trial: optuna.Trial):
                 """Optuna Trial 结束时的回调，推送 SSE"""
                 if trial.state.is_finished():
+                    _require_current_run(task_id, run_id)
                     try:
                         current_best = float(study.best_value)
                     except ValueError:
@@ -754,20 +919,33 @@ async def train_stream(
                         "problem_spec": problem_spec,
                         "suggested_type": suggested_type,
                         "agent_corrections": agent_corrections,
+                        "run_id": run_id,
+                        "cv_folds": cv_folds,
                     }
                     try:
                         asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
                     except Exception as e:
                         logger.error(f"推送 SSE 数据失败：{e}")
 
-            # 5. 启动 Optuna 寻优 (真实训练)
-            # 外层 Trial 顺序执行，模型内部可自行并行，避免 CV × 模型线程嵌套过载。
-            optimizer = AutoMLOptimizer(X, y, optuna_config, cv_splits=max(3, cv_folds), n_jobs=1)
+            feature_transformer = FeatureEngineeringTransformer(
+                strategy=context.execution_strategy,
+                target_col=context.target_col,
+                allow_target_encoding=False,
+            )
+            optimizer = AutoMLOptimizer(
+                context.X_train,
+                y_train,
+                optuna_config,
+                cv_splits=cv_folds,
+                n_jobs=1,
+                feature_transformer=feature_transformer,
+                cancel_event=control.cancel_event,
+            )
 
             # 运行优化并获取最佳模型
             try:
                 # sse_callback 实时推送每个 Trial（不再结束后回放）
-                study, best_model = optimizer.optimize(
+                study, fitted_pipeline = optimizer.optimize(
                     n_trials=n_trials, show_progress=False, callbacks=[sse_callback]
                 )
                 best_value = float(study.best_value)
@@ -778,28 +956,32 @@ async def train_stream(
                 logger.error(f"Optuna 优化失败：{e}")
                 raise
 
-            # 6. 持久化打包 (模型 + 执行器 + 最佳模型)
+            _require_current_run(task_id, run_id)
+            fitted_transformer = fitted_pipeline.named_steps["features"]
+            feature_executor = fitted_transformer.executor_
+            best_model = fitted_pipeline.named_steps["model"]
+
             SAVED_DIR.mkdir(parents=True, exist_ok=True)
             artifact_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
 
             best_metric = optuna_config["optimization_metric"]
             if spec.resolved_type == ProblemType.REGRESSION:
-                metrics = compute_regression_metrics(best_model, X, y)
-                metrics_evaluation = {
-                    "scope": "training_data",
-                    "rows": int(len(y)),
-                }
+                metrics = compute_regression_metrics(fitted_pipeline, context.X_holdout, y_holdout)
             else:
-                metrics = {best_metric: best_value}
-                metrics_evaluation = {
-                    "scope": "cross_validation",
-                    "folds": max(3, cv_folds),
-                }
+                metrics = compute_classification_metrics(fitted_pipeline, context.X_holdout, y_holdout)
+            metrics_evaluation = {
+                "scope": "holdout",
+                "rows": int(len(context.X_holdout)),
+                "train_rows": int(len(context.X_train)),
+                "random_state": WORKFLOW_RANDOM_STATE,
+            }
             artifact = {
                 "artifact_schema_version": 3,
                 "problem_type": spec.resolved_type.value,
                 "problem_spec": problem_spec,
                 "metric_directions": spec.metric_directions,
+                "run_id": run_id,
+                "cv_folds": cv_folds,
                 "feature_executor": feature_executor,
                 "model": best_model,
                 "label_encoder": label_encoder,
@@ -811,11 +993,11 @@ async def train_stream(
                 "selected_algorithm": selected_algorithm,
                 "suggested_type": suggested_type,
                 "agent_corrections": agent_corrections,
-                "feature_columns": list(X.columns),
+                "feature_columns": list(feature_executor.state["feature_columns"]),
             }
-            joblib.dump(artifact, artifact_path)
+            _persist_run_artifact(task_id, run_id, artifact, artifact_path)
 
-            logger.info(f"模型已保存：{artifact_path}")
+            logger.info("模型已保存 task_id=%s run_id=%s", task_id, run_id)
             completed_state = {
                 "status": "completed",
                 **state_metadata,
@@ -824,8 +1006,9 @@ async def train_stream(
                 "metrics": metrics,
                 "metrics_evaluation": metrics_evaluation,
                 "selected_algorithm": selected_algorithm,
+                "cv_folds": cv_folds,
             }
-            _write_workflow_state(task_id, completed_state)
+            _write_run_state(task_id, run_id, completed_state)
             logger.info(
                 "workflow_training_completed task_id=%s resolved_type=%s "
                 "selected_algorithm=%s metric=%s",
@@ -847,38 +1030,66 @@ async def train_stream(
                     "metrics": metrics,
                     "metrics_evaluation": metrics_evaluation,
                     "selected_algorithm": selected_algorithm,
+                    "run_id": run_id,
+                    "cv_folds": cv_folds,
                 }
             )
 
-            # 7. 保存基线数据 (用于 MLOps PSI 漂移检测)
+            # 基线只使用生产模型实际拟合的 train 行；holdout 不进入拟合状态。
             try:
                 from model_code.mlops_monitor import DataDriftMonitor
 
                 monitor = DataDriftMonitor()
-                baseline_data = monitor.extract_baseline(df_clean, features=list(X.columns))
+                transformed_train = feature_executor.transform(context.X_train)
+                baseline_data = monitor.extract_baseline(
+                    transformed_train, features=list(transformed_train.columns)
+                )
 
                 baseline_path = get_saved_path(f"baseline_{validate_task_id(task_id)}.json")
-                monitor.save_baseline(baseline_data, baseline_path)
-                logger.info(f"基线数据已保存：{baseline_path}")
+                temporary_baseline = baseline_path.with_name(f".{baseline_path.name}.{run_id}.tmp")
+                try:
+                    monitor.save_baseline(baseline_data, temporary_baseline)
+                    with workflow_run_lock:
+                        _require_current_run(task_id, run_id)
+                        os.replace(temporary_baseline, baseline_path)
+                finally:
+                    temporary_baseline.unlink(missing_ok=True)
+                logger.info("基线数据已保存 task_id=%s run_id=%s", task_id, run_id)
             except Exception as e:
-                logger.warning(f"保存基线数据失败：{e}，MLOps 监控将无法工作")
+                logger.warning("保存基线数据失败 task_id=%s error_type=%s", task_id, type(e).__name__)
 
-        except Exception as e:
-            canonical_error = str(e)
+        except StaleWorkflowRun:
+            logger.warning("忽略失效工作流运行 task_id=%s run_id=%s", task_id, run_id)
+        except OptimizationCancelled:
+            canonical_error = "训练已取消"
             try:
-                _write_workflow_state(
+                _write_run_state(
                     task_id,
-                    {"status": "failed", **state_metadata, "error": canonical_error},
+                    run_id,
+                    {"status": "cancelled", **state_metadata, "error": canonical_error},
+                    allow_cancelled=True,
                 )
-            except Exception as state_error:
-                logger.error("工作流失败状态持久化失败 task_id=%s error=%s", task_id, state_error)
-            logger.error("训练失败：%s", canonical_error)
-            asyncio.run_coroutine_threadsafe(
-                queue.put({"status": "ERROR", "error": canonical_error}),
-                loop
-            )
+                asyncio.run_coroutine_threadsafe(
+                    queue.put({"status": "CANCELLED", "error": canonical_error, "run_id": run_id}), loop
+                )
+            except StaleWorkflowRun:
+                pass
+        except Exception as e:
+            canonical_error = _safe_workflow_error(e)
+            try:
+                _write_run_state(
+                    task_id,
+                    run_id,
+                    {"status": "failed", **state_metadata, "error": canonical_error},
+                    allow_cancelled=True,
+                )
+                asyncio.run_coroutine_threadsafe(
+                    queue.put({"status": "ERROR", "error": canonical_error, "run_id": run_id}), loop
+                )
+            except StaleWorkflowRun:
+                logger.warning("失效运行未写失败状态 task_id=%s run_id=%s", task_id, run_id)
         finally:
-            # 发送结束信号
+            _release_workflow_run(task_id, run_id)
             asyncio.run_coroutine_threadsafe(queue.put(None), loop)
     
     # 将阻塞的训练任务扔进线程池
@@ -918,6 +1129,17 @@ async def train_stream(
             "X-Accel-Buffering": "no"
         }
     )
+
+
+@router.post("/task/{task_id}/run/{run_id}/cancel")
+async def cancel_workflow_run(task_id: str, run_id: str):
+    validate_task_id(task_id)
+    with workflow_run_lock:
+        control = active_workflow_runs.get(task_id)
+        if control is None or control.run_id != run_id:
+            raise HTTPException(status_code=404, detail="未找到活动训练运行")
+        control.cancel_event.set()
+    return {"task_id": task_id, "run_id": run_id, "status": "cancelling"}
 
 
 # ==================== 步骤 4: 线上预测 ====================

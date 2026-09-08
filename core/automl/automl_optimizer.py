@@ -19,6 +19,10 @@ from core.automl.problem_spec import METRIC_DIRECTION
 logger = logging.getLogger(__name__)
 
 
+class OptimizationCancelled(RuntimeError):
+    """Raised when an owning workflow explicitly cancels optimization."""
+
+
 class AutoMLOptimizer:
     """
     AutoML 优化器
@@ -34,7 +38,8 @@ class AutoMLOptimizer:
     """
     
     def __init__(self, X, y, agent_config: Dict[str, Any],
-                 cv_splits: int = 5, n_jobs: int = -1):
+                 cv_splits: int = 5, n_jobs: int = -1,
+                 feature_transformer=None, cancel_event=None):
         """
         初始化优化器
 
@@ -57,7 +62,7 @@ class AutoMLOptimizer:
         # 保存特征名称 (用于特征重要性输出)
         if hasattr(X, 'columns') and hasattr(X, 'values'):
             self.feature_names = list(X.columns)
-            self.X = X.values
+            self.X = X.copy()
         else:
             self.X = X
             self.feature_names = [f"feature_{i}" for i in range(X.shape[1])]
@@ -66,6 +71,8 @@ class AutoMLOptimizer:
         self.config = agent_config
         self.cv_splits = cv_splits
         self.n_jobs = n_jobs
+        self.feature_transformer = feature_transformer
+        self.cancel_event = cancel_event
 
         # 优化指标
         self.metric = agent_config.get("optimization_metric", "roc_auc")
@@ -139,6 +146,23 @@ class AutoMLOptimizer:
         except ImportError as e:
             logger.error(f"模型 {model_name} 依赖缺失：{e}")
             raise
+
+    def _build_estimator(self, trial, model_name: str):
+        model = self._build_model(trial, model_name)
+        if self.feature_transformer is None:
+            return model
+        from sklearn.base import clone
+        from sklearn.pipeline import Pipeline
+
+        return Pipeline(
+            [
+                ("features", clone(self.feature_transformer)),
+                ("model", model),
+            ]
+        )
+
+    def _is_cancelled(self) -> bool:
+        return bool(self.cancel_event is not None and self.cancel_event.is_set())
     
     def objective(self, trial):
         """
@@ -153,6 +177,8 @@ class AutoMLOptimizer:
         from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
         
         try:
+            if self._is_cancelled():
+                raise OptimizationCancelled("AutoML 优化已取消")
             # 1. 动态选择本次 Trial 要尝试的模型类型
             candidate_models = self.config.get("candidate_models", ["lightgbm"])
             
@@ -163,16 +189,12 @@ class AutoMLOptimizer:
                 model_name = trial.suggest_categorical("model_type", candidate_models)
             
             # 2. 构建该模型及其超参数
-            model = self._build_model(trial, model_name)
+            model = self._build_estimator(trial, model_name)
             
             # 3. 交叉验证 (防止过拟合，保证稳定性)
             if self.task_type in ["binary_classification", "multiclass_classification"]:
-                min_class_count = int(np.min(np.unique(self.y, return_counts=True)[1]))
-                safe_splits = min(self.cv_splits, min_class_count)
-                if safe_splits < 2:
-                    raise ValueError("每个类别至少需要 2 条记录才能执行交叉验证")
                 cv = StratifiedKFold(
-                    n_splits=safe_splits,
+                    n_splits=self.cv_splits,
                     shuffle=True,
                     random_state=42
                 )
@@ -197,9 +219,14 @@ class AutoMLOptimizer:
                 error_score="raise",
             )
 
+            if self._is_cancelled():
+                raise OptimizationCancelled("AutoML 优化已取消")
+
             mean_score = float(np.mean(scores))
             return -mean_score if self.metric in {"rmse", "mae"} else mean_score
             
+        except OptimizationCancelled:
+            raise
         except Exception as e:
             logger.warning(f"Trial 失败：{e}")
             trial.set_user_attr("failure", str(e))
@@ -274,7 +301,11 @@ class AutoMLOptimizer:
             callback = None
 
         # 合并进度条回调与调用方回调（如 SSE 实时推送）
-        optuna_callbacks = ([callback] if callback else []) + list(callbacks or [])
+        def stop_on_cancel(study, trial):
+            if self._is_cancelled():
+                study.stop()
+
+        optuna_callbacks = ([callback] if callback else []) + [stop_on_cancel] + list(callbacks or [])
 
         # 启动寻优
         logger.info(f"开始贝叶斯优化，{n_trials} 次 Trial...")
@@ -286,6 +317,9 @@ class AutoMLOptimizer:
             callbacks=optuna_callbacks,
             show_progress_bar=False
         )
+
+        if self._is_cancelled():
+            raise OptimizationCancelled("AutoML 优化已取消")
 
         successful_trials = [
             trial for trial in self.best_study.trials
@@ -322,7 +356,7 @@ class AutoMLOptimizer:
         if best_model_name:
             logger.info(f"使用最佳参数重新训练 {best_model_name}...")
             try:
-                self.best_model = self._build_model(self.best_study.best_trial, best_model_name)
+                self.best_model = self._build_estimator(self.best_study.best_trial, best_model_name)
                 self.best_model.fit(self.X, self.y)
                 self.best_score = self.best_study.best_value
                 logger.info(f"模型训练完成，最佳得分：{self.best_score:.4f}")

@@ -2,6 +2,8 @@
 import json
 import logging
 import math
+import threading
+import time
 
 import joblib
 import numpy as np
@@ -181,7 +183,13 @@ def test_workflow_regression_corrects_agent_suggestion_and_predicts_float(
     assert set(done["metrics"]) == {"rmse", "mae", "r2"}
     assert all(math.isfinite(value) for value in done["metrics"].values())
     assert done["metrics"]["r2"] >= 0.95
-    assert done["metrics_evaluation"] == {"scope": "training_data", "rows": 80}
+    assert done["metrics_evaluation"] == {
+        "scope": "holdout",
+        "rows": 20,
+        "train_rows": 60,
+        "random_state": 42,
+    }
+    assert done["cv_folds"] == 3
 
     artifact = joblib.load(tmp_path / "saved" / f"model_{task_id}.pkl")
     assert artifact["artifact_schema_version"] == 3
@@ -512,18 +520,76 @@ def test_workflow_explicit_regression_override_precedes_agent_suggestion(tmp_pat
     assert done["metric"] == "rmse"
 
 
+def test_workflow_rejects_invalid_cv_before_opening_sse(tmp_path, monkeypatch):
+    task_id = _prepare_workflow_task(tmp_path)
+    task_dir = tmp_path / "output" / task_id
+    frame = pd.DataFrame(
+        {
+            "age": np.arange(12, dtype=float),
+            "city_code": ["北京", "上海"] * 6,
+            "order_fee": ["normal"] * 8 + ["rare"] * 4,
+        }
+    )
+    frame.to_parquet(task_dir / "raw_data.parquet", index=False)
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+
+    response = TestClient(app).get(
+        "/api/workflow/step3_train_stream",
+        params={"task_id": task_id, "problem_type": "auto", "n_trials": 10, "cv_folds": 4},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["detail"] == {
+        "code": "insufficient_cv_samples",
+        "field": "cv_folds",
+        "message": "当前任务每折至少需要一个样本，可用上限为 3",
+    }
+    assert not (task_dir / "workflow_state.json").exists()
+
+
+def test_workflow_rejects_too_few_regression_cv_rows_before_sse(tmp_path, monkeypatch):
+    task_id = _prepare_workflow_task(tmp_path)
+    task_dir = tmp_path / "output" / task_id
+    pd.DataFrame(
+        {
+            "age": np.arange(5, dtype=float),
+            "city_code": ["a", "b", "c", "d", "e"],
+            "order_fee": [1.1, 2.4, 4.2, 7.9, 13.7],
+        }
+    ).to_parquet(task_dir / "raw_data.parquet", index=False)
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+
+    response = TestClient(app).get(
+        "/api/workflow/step3_train_stream",
+        params={"task_id": task_id, "problem_type": "regression", "n_trials": 10, "cv_folds": 4},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "insufficient_cv_samples"
+    assert response.json()["detail"]["field"] == "cv_folds"
+
+
 def test_workflow_failed_state_and_error_survive_reconnect_without_artifact(tmp_path, monkeypatch):
     """Catches transient-only failures reverting to in_progress after the stream ends."""
     task_id = _prepare_workflow_task(tmp_path)
     task_dir = tmp_path / "output" / task_id
-    (task_dir / "feature_strategy.json").unlink()
     monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    monkeypatch.setattr(
+        AutoMLOptimizer,
+        "optimize",
+        lambda self, **kwargs: (_ for _ in ()).throw(RuntimeError("unsafe /private/server/model.pkl")),
+    )
 
     events = _read_workflow_sse(task_id, problem_type="auto", n_trials=10, cv_folds=3)
 
     assert [event["status"] for event in events] == ["ERROR"]
     assert "msg" not in events[0]
+    assert events[0]["error"] == "模型训练失败，请检查配置后重试"
+    assert "/private/" not in events[0]["error"]
     state_path = task_dir / "workflow_state.json"
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
     assert persisted["status"] == "failed"
@@ -538,3 +604,42 @@ def test_workflow_failed_state_and_error_survive_reconnect_without_artifact(tmp_
     assert restarted_status["status"] == "failed"
     assert restarted_status["error"] == persisted["error"]
     assert "msg" not in restarted_status
+
+
+def test_workflow_rejects_overlapping_run_and_keeps_original_run_id(tmp_path, monkeypatch):
+    task_id = _prepare_workflow_task(tmp_path)
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_optimize(self, **kwargs):
+        entered.set()
+        release.wait(timeout=5)
+        raise RuntimeError("stop test run")
+
+    monkeypatch.setattr(AutoMLOptimizer, "optimize", blocking_optimize)
+    first_events: list[dict] = []
+
+    def consume_first_stream():
+        first_events.extend(_read_workflow_sse(task_id, "auto", 10, 3))
+
+    thread = threading.Thread(target=consume_first_stream)
+    thread.start()
+    assert entered.wait(timeout=5)
+    state_path = tmp_path / "output" / task_id / "workflow_state.json"
+    original_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+    second = TestClient(app).get(
+        "/api/workflow/step3_train_stream",
+        params={"task_id": task_id, "problem_type": "regression", "n_trials": 10, "cv_folds": 3},
+    )
+    state_after_overlap = json.loads(state_path.read_text(encoding="utf-8"))
+    release.set()
+    thread.join(timeout=5)
+
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "workflow_run_active"
+    assert state_after_overlap["run_id"] == original_state["run_id"]
+    assert state_after_overlap["requested_type"] == "auto"
+    assert not thread.is_alive()
