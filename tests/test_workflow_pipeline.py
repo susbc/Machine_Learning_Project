@@ -379,6 +379,32 @@ def test_workflow_discards_search_space_from_mismatched_agent_task():
             },
             "search_spaces.random_forest.max_features",
         ),
+        (
+            "random_forest",
+            {"n_estimators": {"type": "float", "low": 100.0, "high": 200.0}},
+            "search_spaces.random_forest.n_estimators",
+        ),
+        (
+            "random_forest",
+            {
+                "n_estimators": {
+                    "type": "loguniform",
+                    "low": 100.0,
+                    "high": 200.0,
+                }
+            },
+            "search_spaces.random_forest.n_estimators",
+        ),
+        (
+            "random_forest",
+            {
+                "max_depth": {
+                    "type": "categorical",
+                    "choices": [10, 10.5],
+                }
+            },
+            "search_spaces.random_forest.max_depth",
+        ),
     ],
 )
 def test_workflow_drops_algorithm_invalid_search_rules(candidate, space, correction_field):
@@ -418,6 +444,30 @@ def test_workflow_preserves_valid_custom_search_space_within_canonical_domain():
 
     assert config["search_spaces"]["random_forest"] == valid_space
     assert not any(item["field"].startswith("search_spaces.random_forest") for item in corrections)
+
+
+@pytest.mark.parametrize("choices", [[5, 10], [5.0, 10.0]])
+def test_workflow_preserves_integer_categorical_space_as_integer_values(choices):
+    """Catches integral categorical choices reaching integer estimators as floats."""
+    spec = resolve_problem_spec(pd.Series(np.linspace(1.0, 20.0, 40)), "amount", "auto")
+    suggested = {
+        "task_type": "regression",
+        "optimization_metric": "rmse",
+        "candidate_models": ["random_forest"],
+        "search_spaces": {
+            "random_forest": {
+                "max_depth": {"type": "categorical", "choices": choices}
+            }
+        },
+        "rationale": "valid integer categorical search",
+    }
+
+    config, _, corrections = workflow._coordinate_automl_config(suggested, spec, 10)
+
+    rule = config["search_spaces"]["random_forest"]["max_depth"]
+    assert rule == {"type": "categorical", "choices": [5, 10]}
+    assert all(type(value) is int for value in rule["choices"])
+    assert not corrections
 
 
 def test_workflow_explicit_regression_override_precedes_agent_suggestion(tmp_path, monkeypatch):
