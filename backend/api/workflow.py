@@ -276,9 +276,13 @@ def _validate_search_space(
     safe_space: Dict[str, Any] = {}
     for param_name, rule in search_space.items():
         field = f"search_spaces.{model_name}.{param_name}"
+        domain = parameter_domains.get(param_name)
         reason = _search_rule_error(param_name, rule, parameter_domains)
         if reason is None:
-            safe_space[param_name] = rule
+            safe_rule = dict(rule)
+            if safe_rule["type"] == "categorical" and _is_integer_domain(domain):
+                safe_rule["choices"] = [int(value) for value in safe_rule["choices"]]
+            safe_space[param_name] = safe_rule
         else:
             corrections.append(
                 {
@@ -306,6 +310,9 @@ def _search_rule_error(
         if not isinstance(choices, list) or not choices:
             return "categorical 规则必须提供非空 choices，已移除"
         return _categorical_domain_error(choices, parameter_domains[param_name])
+
+    if _is_integer_domain(parameter_domains[param_name]) and rule_type != "int":
+        return "整数 estimator 参数只支持 int 或整数 categorical 规则，已移除"
 
     low = rule.get("low")
     high = rule.get("high")
@@ -352,12 +359,22 @@ def _is_finite_number(value: Any) -> bool:
     )
 
 
+def _is_integer_domain(domain: Any) -> bool:
+    supported = _canonical_domain_values(domain)
+    return bool(supported) and all(
+        _is_finite_number(value) and float(value).is_integer()
+        for value in supported
+    )
+
+
 def _categorical_domain_error(choices: list[Any], domain: Any) -> Optional[str]:
     supported = _canonical_domain_values(domain)
     if supported and all(_is_finite_number(value) for value in supported):
         lower, upper = min(supported), max(supported)
+        integer_domain = _is_integer_domain(domain)
         if all(
             _is_finite_number(choice) and lower <= choice <= upper
+            and (not integer_domain or float(choice).is_integer())
             for choice in choices
         ):
             return None
