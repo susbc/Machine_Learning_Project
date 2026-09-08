@@ -315,9 +315,12 @@ def test_regression_end_to_end_across_manual_automl_and_agent_workflow(
     assert workflow_done["best_value"] == pytest.approx(0.0, abs=1e-10)
     _assert_exact_linear_metrics(workflow_done["metrics"])
     assert workflow_done["metrics_evaluation"] == {
-        "scope": "training_data",
-        "rows": 120,
+        "scope": "holdout",
+        "rows": 30,
+        "train_rows": 90,
+        "random_state": 42,
     }
+    assert workflow_done["cv_folds"] == 3
     assert workflow_done.get("confusion_matrix") is None
     assert workflow_done.get("threshold_calibration") is None
 

@@ -498,10 +498,63 @@ class FeatureEngineeringExecutor:
     def get_state(self) -> Dict[str, Any]:
         """获取状态字典"""
         return self.state.copy()
-    
+
     def is_fitted(self) -> bool:
         """检查是否已 fit"""
         return self.state['fitted']
+
+
+class FeatureEngineeringTransformer:
+    """Cloneable sklearn adapter that fits one executor per CV training fold."""
+
+    def __init__(
+        self,
+        strategy: FeatureStrategy,
+        target_col: Optional[str] = None,
+        allow_target_encoding: bool = False,
+    ):
+        self.strategy = strategy
+        self.target_col = target_col
+        self.allow_target_encoding = allow_target_encoding
+
+    def get_params(self, deep: bool = True) -> Dict[str, Any]:
+        return {
+            "strategy": self.strategy,
+            "target_col": self.target_col,
+            "allow_target_encoding": self.allow_target_encoding,
+        }
+
+    def set_params(self, **params):
+        for name, value in params.items():
+            setattr(self, name, value)
+        return self
+
+    def fit(self, X, y=None):
+        frame = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        target = None if y is None else pd.Series(np.asarray(y), index=frame.index)
+        self.executor_ = FeatureEngineeringExecutor(
+            target_col=self.target_col,
+            allow_target_encoding=self.allow_target_encoding,
+        )
+        transformed = self.executor_.fit_transform(frame, self.strategy, target)
+        self.feature_names_out_ = [str(column) for column in transformed.columns]
+        return self
+
+    def transform(self, X):
+        if not hasattr(self, "executor_"):
+            raise RuntimeError("特征工程转换器尚未拟合")
+        frame = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        transformed = self.executor_.transform(frame)
+        return transformed.apply(pd.to_numeric, errors="coerce").fillna(0)
+
+    def get_feature_names_out(self, input_features=None):
+        if not hasattr(self, "feature_names_out_"):
+            raise RuntimeError("特征工程转换器尚未拟合")
+        return np.asarray(self.feature_names_out_, dtype=object)
+
+    def is_fitted(self) -> bool:
+        """检查是否已 fit"""
+        return hasattr(self, "executor_") and self.executor_.is_fitted()
 
 
 # ==========================================
