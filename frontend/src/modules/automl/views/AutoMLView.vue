@@ -173,6 +173,10 @@
           <span>依据：{{ activeProblemSpec.reason }}</span>
           <span>说明：{{ activeProblemSpec.explanation }}</span>
           <span>目标列 {{ activeProblemSpec.target.column }}（{{ activeProblemSpec.target.dtype }}）</span>
+          <span>有效行 {{ activeProblemSpec.target.valid_rows }}</span>
+          <span>唯一值 {{ activeProblemSpec.target.unique_count }}</span>
+          <span>唯一值比例 {{ percentLabel(activeProblemSpec.target.unique_ratio) }}</span>
+          <span>整数样式 {{ activeProblemSpec.target.integer_like ? '是' : '否' }}</span>
         </div>
 
         <el-alert
@@ -290,6 +294,7 @@ const result = ref<AutoMLResult | null>(null)
 const trialHistory = ref<AutoMLTrialEvent[]>([])
 const creatingJob = ref(false)
 const savingResult = ref(false)
+const cancellingRequest = ref(false)
 const errorMessage = ref('')
 const savedArtifactPath = ref('')
 const capabilities = ref<ProblemCapabilitiesResponse | null>(null)
@@ -306,14 +311,26 @@ const explicitCapabilities = computed<ProblemCapabilities | null>(() => {
   if (problemType.value === 'auto') return null
   return capabilities.value?.problem_types?.[problemType.value] ?? null
 })
-const compatibleModels = computed<AutoMLModel[]>(() => explicitCapabilities.value?.algorithms.filter(isAutoMLModel) ?? [])
-const compatibleMetrics = computed<Exclude<AutoMLMetric, 'auto'>[]>(() => explicitCapabilities.value?.metrics.filter(isExplicitAutoMLMetric) ?? [])
-const explicitCapabilitiesReady = computed(() => problemType.value === 'auto' || (compatibleModels.value.length > 0 && compatibleMetrics.value.length > 0))
+const explicitCapabilitiesValidation = computed(() => validateProblemCapabilities(explicitCapabilities.value))
+const compatibleModels = computed<AutoMLModel[]>(() => explicitCapabilitiesValidation.value.valid
+  ? explicitCapabilities.value?.algorithms.filter(isAutoMLModel) ?? []
+  : [])
+const compatibleMetrics = computed<Exclude<AutoMLMetric, 'auto'>[]>(() => explicitCapabilitiesValidation.value.valid
+  ? explicitCapabilities.value?.metrics.filter(isExplicitAutoMLMetric) ?? []
+  : [])
+const explicitSelectionsValid = computed(() => problemType.value === 'auto' || (
+  candidateModels.value.length > 0
+  && candidateModels.value.every((model) => compatibleModels.value.includes(model))
+  && compatibleMetrics.value.includes(optimizationMetric.value as Exclude<AutoMLMetric, 'auto'>)
+))
+const explicitCapabilitiesReady = computed(() => problemType.value === 'auto' || (
+  explicitCapabilitiesValidation.value.valid && explicitSelectionsValid.value
+))
 const explicitActionsBlocked = computed(() => problemType.value !== 'auto' && (capabilitiesLoading.value || !explicitCapabilitiesReady.value))
 const capabilityStatusMessage = computed(() => {
   if (capabilitiesUnavailable.value && capabilitiesError.value) return capabilitiesError.value
   if (problemType.value !== 'auto' && !capabilitiesLoading.value && !explicitCapabilitiesReady.value) {
-    return `无法验证显式任务能力：${problemTypeLabel(problemType.value)}没有可用模型或指标。请重试加载能力。`
+    return `无法验证显式任务能力：${problemTypeLabel(problemType.value)}${explicitCapabilitiesValidation.value.message}。请重试加载能力。`
   }
   return ''
 })
@@ -333,7 +350,7 @@ const resolvedMetricDirection = computed<MetricDirection | null>(() => {
 })
 const chartMetricLabel = computed(() => metricOptionLabel(resolvedMetric.value, resolvedMetricDirection.value))
 const canStart = computed(() => Boolean(datasetFile.value) && !creatingJob.value && !isRunningStatus(job.value?.status) && !explicitActionsBlocked.value)
-const canCancel = computed(() => Boolean(job.value && isRunningStatus(job.value.status)))
+const canCancel = computed(() => Boolean(job.value && (job.value.status === 'queued' || job.value.status === 'running') && !cancellingRequest.value))
 const statusLabel = computed(() => statusText(job.value?.status))
 const statusTagType = computed(() => {
   if (job.value?.status === 'completed') return 'success'
@@ -414,6 +431,10 @@ function isExplicitAutoMLMetric(value: string): value is Exclude<AutoMLMetric, '
   return value !== 'auto' && isAutoMLMetric(value)
 }
 
+function isMetricDirection(value: unknown): value is MetricDirection {
+  return value === 'minimize' || value === 'maximize'
+}
+
 function problemTypeLabel(value: ProblemType): string {
   const labels: Record<ProblemType, string> = {
     auto: '自动推断',
@@ -433,11 +454,25 @@ function problemSourceLabel(source: ProblemSpec['source']): string {
   return labels[source]
 }
 
+function validateProblemCapabilities(capability: ProblemCapabilities | null | undefined): { valid: boolean; message: string } {
+  if (!capability) return { valid: false, message: '未返回该任务类型的能力' }
+  if (!Array.isArray(capability.algorithms) || capability.algorithms.length === 0 || !capability.algorithms.every(isAutoMLModel)) {
+    return { valid: false, message: '未返回可用候选模型' }
+  }
+  if (!Array.isArray(capability.metrics) || capability.metrics.length === 0 || !capability.metrics.every(isExplicitAutoMLMetric)) {
+    return { valid: false, message: '未返回可用优化指标' }
+  }
+  if (!isExplicitAutoMLMetric(capability.default_metric) || !capability.metrics.includes(capability.default_metric)) {
+    return { valid: false, message: '默认优化指标不在可用指标中' }
+  }
+  if (!capability.metric_directions || capability.metrics.some((metric) => !isMetricDirection(capability.metric_directions[metric]))) {
+    return { valid: false, message: '优化指标方向不完整或无效' }
+  }
+  return { valid: true, message: '' }
+}
+
 function hasUsableCapabilities(response: ProblemCapabilitiesResponse | undefined | null): response is ProblemCapabilitiesResponse {
-  return Boolean(response && Object.values(response.problem_types ?? {}).some((capability) =>
-    Array.isArray(capability.algorithms) && capability.algorithms.some(isAutoMLModel)
-      && Array.isArray(capability.metrics) && capability.metrics.some(isExplicitAutoMLMetric),
-  ))
+  return Boolean(response && Object.values(response.problem_types ?? {}).some((capability) => validateProblemCapabilities(capability).valid))
 }
 
 function applyProblemType() {
@@ -450,9 +485,9 @@ function applyProblemType() {
     return
   }
 
+  if (!explicitCapabilitiesValidation.value.valid) return
   const models = compatibleModels.value
   const metrics = compatibleMetrics.value
-  if (!models.length || !metrics.length) return
   const retainedModels = candidateModels.value.filter((model) => models.includes(model))
   const nextModels = retainedModels.length ? retainedModels : [models[0]]
   const nextMetric = metrics.includes(optimizationMetric.value as Exclude<AutoMLMetric, 'auto'>)
@@ -460,12 +495,28 @@ function applyProblemType() {
     : metrics.includes(explicitCapabilities.value?.default_metric as Exclude<AutoMLMetric, 'auto'>)
       ? explicitCapabilities.value?.default_metric as Exclude<AutoMLMetric, 'auto'>
       : metrics[0]
+  const removedModels = candidateModels.value.filter((model) => !nextModels.includes(model))
   const modelsChanged = nextModels.length !== candidateModels.value.length
     || nextModels.some((model, index) => model !== candidateModels.value[index])
   const metricChanged = nextMetric !== optimizationMetric.value
+  const messages: string[] = []
+  if (modelsChanged) {
+    if (removedModels.length) {
+      messages.push(`候选模型已移除不兼容项：${removedModels.map(modelLabel).join('、')}`)
+    } else if (candidateModels.value.length) {
+      messages.push(`候选模型已重置为${nextModels.map(modelLabel).join('、')}`)
+    } else {
+      messages.push(`候选模型已选择${nextModels.map(modelLabel).join('、')}`)
+    }
+  }
+  if (metricChanged) {
+    messages.push(optimizationMetric.value === 'auto'
+      ? `优化指标已选择${metricOptionLabel(nextMetric)}`
+      : `优化指标已从${metricOptionLabel(optimizationMetric.value)}重置为${metricOptionLabel(nextMetric)}`)
+  }
   candidateModels.value = nextModels
   optimizationMetric.value = nextMetric
-  if (modelsChanged || metricChanged) selectionResetMessage.value = '任务类型切换后，候选模型和优化指标已重置为兼容的后端能力。'
+  selectionResetMessage.value = messages.join('；')
 }
 
 async function loadCapabilities() {
@@ -549,6 +600,8 @@ async function refreshJob() {
     }
     if (isRunningStatus(job.value.status) && !streamController.value) {
       connectStream(jobId)
+    } else if (!isRunningStatus(job.value.status)) {
+      closeStream()
     }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '刷新 AutoML 状态失败'
@@ -556,13 +609,22 @@ async function refreshJob() {
 }
 
 async function cancelJob() {
-  if (!job.value) return
+  if (!job.value || !canCancel.value) return
+  cancellingRequest.value = true
   try {
     job.value = await automlApi.cancelJob(job.value.job_id)
-    closeStream()
     ElMessage.info('已发送取消请求')
+    if (isRunningStatus(job.value.status) && !streamController.value) {
+      connectStream(job.value.job_id)
+    }
+    if (!isRunningStatus(job.value.status)) {
+      closeStream()
+      await refreshJob()
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '取消任务失败'
+  } finally {
+    cancellingRequest.value = false
   }
 }
 
@@ -607,7 +669,11 @@ function connectStream(jobId: string) {
       errorMessage.value = event.message ?? 'AutoML 训练失败'
       await refreshJob()
     }
-  }, controller.signal).catch((error: unknown) => {
+  }, controller.signal).then(() => {
+    if (controller.signal.aborted || streamController.value !== controller) return
+    streamController.value = null
+    if (job.value && isRunningStatus(job.value.status)) void refreshJob()
+  }).catch((error: unknown) => {
     if (controller.signal.aborted) return
     if (streamController.value === controller) streamController.value = null
     errorMessage.value = error instanceof Error ? error.message : 'AutoML 训练流连接中断'
@@ -647,7 +713,7 @@ function updateChart() {
     backgroundColor: 'transparent',
     tooltip: {
       trigger: 'axis',
-      valueFormatter: (value: number | string) => `${value}（${resolvedMetricDirection.value === 'minimize' ? '越小越好' : '越大越好'}）`,
+      valueFormatter: (value: number | string) => `${value}${metricDirectionHint(resolvedMetricDirection.value)}`,
     },
     legend: { top: 8, right: 12, data: ['Trial 分数', '历史最佳'] },
     grid: { left: 44, right: 24, top: 56, bottom: 36, containLabel: true },
@@ -658,6 +724,16 @@ function updateChart() {
       { name: '历史最佳', type: 'line', data: bestData, step: 'start', lineStyle: { color: '#dc2626', width: 3 } },
     ],
   })
+}
+
+function metricDirectionHint(direction: MetricDirection | null): string {
+  if (direction === 'minimize') return '（越小越好）'
+  if (direction === 'maximize') return '（越大越好）'
+  return '（优化方向未验证）'
+}
+
+function percentLabel(value: number): string {
+  return `${(value * 100).toFixed(2)}%`
 }
 
 watch([trialHistory, chartMetricLabel], updateChart, { deep: true })
