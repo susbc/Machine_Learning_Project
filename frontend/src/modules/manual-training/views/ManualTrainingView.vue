@@ -56,6 +56,15 @@
           <span>列数 {{ dataset.columns }}</span>
           <span>目标列 {{ dataset.target_col }}</span>
         </div>
+        <div v-if="activeProblemSpec" class="problem-spec-card" aria-live="polite">
+          <strong>已解析任务：{{ problemTypeLabel(activeProblemSpec.resolved_type) }}</strong>
+          <span>来源：{{ problemSourceLabel(activeProblemSpec.source) }}</span>
+          <span>依据：{{ activeProblemSpec.reason }}</span>
+          <span>说明：{{ activeProblemSpec.explanation }}</span>
+          <span>目标列 {{ activeProblemSpec.target.column }}（{{ activeProblemSpec.target.dtype }}）</span>
+          <span>有效行 {{ activeProblemSpec.target.valid_rows }}</span>
+          <span>唯一值 {{ activeProblemSpec.target.unique_count }}</span>
+        </div>
       </section>
 
       <section class="panel">
@@ -88,13 +97,23 @@
         </div>
         <div class="form-grid">
           <label>
+            <span>问题类型</span>
+            <el-select v-model="problemType" aria-label="问题类型" :loading="capabilitiesLoading" @change="applyProblemType">
+              <el-option label="自动推断" value="auto" />
+              <el-option label="二分类" value="binary_classification" />
+              <el-option label="多分类" value="multiclass_classification" />
+              <el-option label="回归" value="regression" />
+            </el-select>
+          </label>
+          <label>
             <span>算法</span>
             <el-select v-model="algorithm" @change="applyAlgorithmPreset">
-              <el-option label="LightGBM" value="lightgbm" />
-              <el-option label="XGBoost" value="xgboost" />
-              <el-option label="CatBoost" value="catboost" />
-              <el-option label="随机森林" value="random_forest" />
-              <el-option label="逻辑回归" value="logistic_regression" />
+              <el-option
+                v-for="candidate in compatibleAlgorithms"
+                :key="candidate"
+                :label="algorithmLabel(candidate)"
+                :value="candidate"
+              />
             </el-select>
           </label>
           <label>
@@ -134,24 +153,40 @@
           <el-button type="success" plain :disabled="!result" :loading="saving" @click="saveResult">保存模型</el-button>
         </div>
         <div class="metric-grid">
-          <div class="metric">
-            <span>ROC-AUC</span>
-            <strong>{{ metricLabel('roc_auc') }}</strong>
-          </div>
-          <div class="metric">
-            <span>Accuracy</span>
-            <strong>{{ metricLabel('accuracy') }}</strong>
-          </div>
-          <div class="metric">
-            <span>F1</span>
-            <strong>{{ metricLabel('f1') }}</strong>
-          </div>
-          <div class="metric">
-            <span>阈值</span>
-            <strong>{{ metricLabel('best_threshold') }}</strong>
-          </div>
+          <template v-if="isRegressionResult">
+            <div class="metric">
+              <span>RMSE</span>
+              <strong>{{ metricLabel('rmse') }}</strong>
+            </div>
+            <div class="metric">
+              <span>MAE</span>
+              <strong>{{ metricLabel('mae') }}</strong>
+            </div>
+            <div class="metric">
+              <span>R²</span>
+              <strong>{{ metricLabel('r2') }}</strong>
+            </div>
+          </template>
+          <template v-else>
+            <div class="metric">
+              <span>ROC-AUC</span>
+              <strong>{{ metricLabel('roc_auc') }}</strong>
+            </div>
+            <div class="metric">
+              <span>Accuracy</span>
+              <strong>{{ metricLabel('accuracy') }}</strong>
+            </div>
+            <div class="metric">
+              <span>F1</span>
+              <strong>{{ metricLabel('f1') }}</strong>
+            </div>
+            <div class="metric">
+              <span>最佳阈值</span>
+              <strong>{{ metricLabel('best_threshold') }}</strong>
+            </div>
+          </template>
         </div>
-        <p v-if="result?.threshold_calibration" class="calibration-note">
+        <p v-if="!isRegressionResult && result?.threshold_calibration" class="calibration-note">
           阈值来源：{{ result.threshold_calibration.source === 'training_calibration_split' ? '训练集内部校准' : '默认阈值' }}
           <template v-if="result.threshold_calibration.calibration_size">
             （{{ result.threshold_calibration.calibration_size }} 条校准样本）
@@ -177,7 +212,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { UploadFile } from 'element-plus'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 
@@ -191,6 +226,7 @@ import {
   type TrainingResult,
   type TrainingStatus,
 } from '@/api/training'
+import type { ProblemCapabilitiesResponse, ProblemSpec, ProblemType } from '@/api/problem'
 
 const datasetFile = ref<File | null>(null)
 const targetCol = ref('')
@@ -206,12 +242,24 @@ const uploading = ref(false)
 const edaLoading = ref(false)
 const creatingJob = ref(false)
 const saving = ref(false)
+const capabilitiesLoading = ref(false)
 
+const problemType = ref<ProblemType>('auto')
 const algorithm = ref<TrainingAlgorithm>('logistic_regression')
 const testSize = ref(0.3)
 const randomState = ref(42)
 const paramsJson = ref(JSON.stringify({ C: 1.0, solver: 'liblinear', max_iter: 1000 }, null, 2))
 let pollGeneration = 0
+
+const ALL_ALGORITHMS: TrainingAlgorithm[] = [
+  'lightgbm',
+  'xgboost',
+  'catboost',
+  'random_forest',
+  'logistic_regression',
+  'linear_regression',
+]
+const capabilities = ref<ProblemCapabilitiesResponse | null>(null)
 
 const PARAM_PRESETS: Record<TrainingAlgorithm, Record<string, unknown>> = {
   lightgbm: { n_estimators: 200, learning_rate: 0.05, num_leaves: 31 },
@@ -229,6 +277,15 @@ const activeStep = computed(() => {
   if (dataset.value) return 1
   return 0
 })
+const activeProblemSpec = computed<ProblemSpec | null>(() => result.value?.problem_spec ?? job.value?.problem_spec ?? dataset.value?.problem_spec ?? null)
+const compatibleAlgorithms = computed<TrainingAlgorithm[]>(() => {
+  const selectedCapabilities = problemType.value === 'auto'
+    ? activeProblemSpec.value?.capabilities
+    : capabilities.value?.problem_types[problemType.value]
+  const allowed = selectedCapabilities?.algorithms.filter(isTrainingAlgorithm)
+  return allowed?.length ? allowed : ALL_ALGORITHMS
+})
+const isRegressionResult = computed(() => result.value?.problem_spec.resolved_type === 'regression')
 const isRunning = computed(() => ['queued', 'running', 'cancelling'].includes(job.value?.status ?? ''))
 const visibleError = computed(() => errorMessage.value || (job.value?.status === 'failed' ? job.value.error || '训练任务失败' : ''))
 const paramsError = computed(() => {
@@ -242,6 +299,10 @@ const paramsError = computed(() => {
 
 onBeforeUnmount(() => {
   pollGeneration += 1
+})
+
+onMounted(() => {
+  void loadCapabilities()
 })
 
 function handleFileChange(uploadFile: UploadFile) {
@@ -271,12 +332,35 @@ function applyAlgorithmPreset() {
   paramsJson.value = JSON.stringify(PARAM_PRESETS[algorithm.value], null, 2)
 }
 
+function applyProblemType() {
+  if (!compatibleAlgorithms.value.includes(algorithm.value)) {
+    algorithm.value = compatibleAlgorithms.value[0]
+    applyAlgorithmPreset()
+  }
+}
+
+async function loadCapabilities() {
+  capabilitiesLoading.value = true
+  try {
+    capabilities.value = await trainingApi.getCapabilities()
+    applyProblemType()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '加载任务能力失败'
+  } finally {
+    capabilitiesLoading.value = false
+  }
+}
+
 async function uploadDataset() {
   if (!datasetFile.value) return
   uploading.value = true
   errorMessage.value = ''
   try {
-    dataset.value = await trainingApi.uploadDataset({ file: datasetFile.value, targetCol: targetCol.value })
+    dataset.value = await trainingApi.uploadDataset({
+      file: datasetFile.value,
+      targetCol: targetCol.value,
+      problemType: problemType.value,
+    })
     const config = await trainingApi.getFieldConfig(dataset.value.dataset_id)
     fields.value = config.fields
     result.value = null
@@ -284,6 +368,7 @@ async function uploadDataset() {
     eda.value = null
     pollGeneration += 1
     savedArtifactPath.value = ''
+    applyProblemType()
     ElMessage.success('数据上传完成')
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '数据上传失败'
@@ -320,6 +405,7 @@ async function createJob() {
       params,
       test_size: testSize.value,
       random_state: randomState.value,
+      problemType: problemType.value,
     })
     ElMessage.success('训练任务已创建')
     void pollJob(job.value.job_id)
@@ -403,6 +489,29 @@ async function saveResult() {
 function metricLabel(name: string): string {
   const value = result.value?.metrics?.[name]
   return typeof value === 'number' ? value.toFixed(5) : '-'
+}
+
+function isTrainingAlgorithm(value: string): value is TrainingAlgorithm {
+  return ALL_ALGORITHMS.includes(value as TrainingAlgorithm)
+}
+
+function problemTypeLabel(value: ProblemType): string {
+  const labels: Record<ProblemType, string> = {
+    auto: '自动推断',
+    binary_classification: '二分类',
+    multiclass_classification: '多分类',
+    regression: '回归',
+  }
+  return labels[value]
+}
+
+function problemSourceLabel(source: ProblemSpec['source']): string {
+  const labels: Record<ProblemSpec['source'], string> = {
+    auto_inferred: '自动推断',
+    user_override: '用户指定',
+    legacy_compatibility: '旧模型兼容',
+  }
+  return labels[source]
 }
 
 function percentLabel(value: unknown): string {
@@ -515,6 +624,23 @@ function algorithmLabel(value: TrainingAlgorithm): string {
   margin: 14px 0;
 }
 
+.problem-spec-card {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  padding: 12px;
+  color: #1e3a5f;
+  background: #eff6ff;
+  font-size: 12px;
+}
+
+.problem-spec-card strong {
+  grid-column: 1 / -1;
+}
+
 .eda-summary {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
@@ -586,7 +712,8 @@ label,
   .form-grid,
   .dataset-summary,
   .eda-summary,
-  .metric-grid {
+  .metric-grid,
+  .problem-spec-card {
     grid-template-columns: 1fr;
   }
 
