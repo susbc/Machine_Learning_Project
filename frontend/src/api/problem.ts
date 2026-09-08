@@ -2,6 +2,8 @@
 export type ProblemType = 'auto' | 'binary_classification' | 'multiclass_classification' | 'regression'
 export type ResolvedProblemType = Exclude<ProblemType, 'auto'>
 export type MetricDirection = 'minimize' | 'maximize'
+export type CanonicalProblemSpecSource = 'auto_inferred' | 'user_override'
+export type PersistedProblemSpecSource = CanonicalProblemSpecSource | 'legacy_compatibility'
 
 export interface ProblemCapabilities {
   algorithms: string[]
@@ -14,7 +16,7 @@ export interface ProblemSpec {
   schema_version: 1
   requested_type: ProblemType
   resolved_type: ResolvedProblemType
-  source: 'auto_inferred' | 'user_override'
+  source: PersistedProblemSpecSource
   reason: string
   explanation: string
   target: {
