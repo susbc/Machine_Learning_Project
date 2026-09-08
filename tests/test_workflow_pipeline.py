@@ -1,5 +1,6 @@
 """Workflow optimizer, task reconciliation, persistence, and inference tests."""
 import json
+import logging
 
 import joblib
 import numpy as np
@@ -140,7 +141,9 @@ def _read_workflow_sse(
     return events
 
 
-def test_workflow_regression_corrects_agent_suggestion_and_predicts_float(tmp_path, monkeypatch):
+def test_workflow_regression_corrects_agent_suggestion_and_predicts_float(
+    tmp_path, monkeypatch, caplog
+):
     """Catches an Agent suggestion overriding the canonical target-derived task."""
     task_id = _prepare_workflow_task(tmp_path)
     monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
@@ -158,15 +161,21 @@ def test_workflow_regression_corrects_agent_suggestion_and_predicts_float(tmp_pa
         },
     )
 
-    events = _read_workflow_sse(task_id, problem_type="auto", n_trials=10, cv_folds=3)
+    with caplog.at_level(logging.INFO, logger="backend.api.workflow"):
+        events = _read_workflow_sse(task_id, problem_type="auto", n_trials=10, cv_folds=3)
 
     assert all(event["status"] != "ERROR" for event in events)
+    running = [event for event in events if event["status"] == "RUNNING"]
+    assert running
+    assert all(event["metric"] == "rmse" and event["value"] >= 0 for event in running)
     done = events[-1]
     assert done["status"] == "DONE"
     assert done["problem_spec"]["resolved_type"] == "regression"
     assert done["suggested_type"] == "binary_classification"
     assert done["best_metric"] == "rmse"
     assert done["best_value"] >= 0
+    assert done["metric"] == "rmse"
+    assert done["value"] == done["best_value"]
     assert done["agent_corrections"]
 
     artifact = joblib.load(tmp_path / "saved" / f"model_{task_id}.pkl")
@@ -176,6 +185,17 @@ def test_workflow_regression_corrects_agent_suggestion_and_predicts_float(tmp_pa
     assert artifact["label_encoder"] is None
     assert artifact["best_metric"] == "rmse"
     assert artifact["best_value"] == done["best_value"]
+    assert artifact["selected_algorithm"] == "linear_regression"
+
+    completion_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "workflow_training_completed" in record.getMessage()
+    ]
+    assert completion_logs == [
+        "workflow_training_completed task_id=task_ab12cd34 "
+        "resolved_type=regression selected_algorithm=linear_regression metric=rmse"
+    ]
 
     with TestClient(app) as client:
         status = client.get(f"/api/workflow/task/{task_id}/status").json()
@@ -329,3 +349,96 @@ def test_workflow_discards_search_space_from_mismatched_agent_task():
     assert config["candidate_models"] == ["random_forest"]
     assert config["search_spaces"]["random_forest"] == {}
     assert any(item["field"] == "search_spaces" for item in corrections)
+
+
+@pytest.mark.parametrize(
+    ("candidate", "space", "correction_field"),
+    [
+        (
+            "linear_regression",
+            {"n_estimators": {"type": "int", "low": 10, "high": 20}},
+            "search_spaces.linear_regression.n_estimators",
+        ),
+        (
+            "random_forest",
+            {"n_estimators": {"type": "int", "low": "many", "high": 20}},
+            "search_spaces.random_forest.n_estimators",
+        ),
+    ],
+)
+def test_workflow_drops_algorithm_invalid_search_rules(candidate, space, correction_field):
+    """Catches same-task unknown parameters and malformed Optuna rules reaching trials."""
+    spec = resolve_problem_spec(pd.Series(np.linspace(1.0, 20.0, 40)), "amount", "auto")
+    suggested = {
+        "task_type": "regression",
+        "optimization_metric": "rmse",
+        "candidate_models": [candidate],
+        "search_spaces": {candidate: space},
+        "rationale": "invalid search rule",
+    }
+
+    config, _, corrections = workflow._coordinate_automl_config(suggested, spec, 10)
+
+    assert config["search_spaces"][candidate] == {}
+    assert any(item["field"] == correction_field for item in corrections)
+
+
+def test_workflow_explicit_regression_override_precedes_agent_suggestion(tmp_path, monkeypatch):
+    """Catches an Agent classification suggestion overriding an explicit user request."""
+    task_id = _prepare_workflow_task(tmp_path)
+    task_dir = tmp_path / "output" / task_id
+    frame = pd.read_parquet(task_dir / "raw_data.parquet")
+    frame["order_fee"] = np.tile([1, 2, 3, 4], 20)
+    frame.to_parquet(task_dir / "raw_data.parquet", index=False)
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    monkeypatch.setattr(
+        workflow,
+        "recommend_automl_config",
+        lambda data_features, scenario: {
+            "task_type": "multiclass_classification",
+            "optimization_metric": "accuracy",
+            "candidate_models": ["logistic_regression"],
+            "n_trials": 10,
+            "search_spaces": {},
+            "rationale": "override mismatch",
+        },
+    )
+
+    events = _read_workflow_sse(task_id, problem_type="regression", n_trials=10, cv_folds=3)
+
+    done = events[-1]
+    assert done["status"] == "DONE"
+    assert done["problem_spec"]["requested_type"] == "regression"
+    assert done["problem_spec"]["resolved_type"] == "regression"
+    assert done["problem_spec"]["source"] == "user_override"
+    assert done["suggested_type"] == "multiclass_classification"
+    assert done["metric"] == "rmse"
+
+
+def test_workflow_failed_state_and_error_survive_reconnect_without_artifact(tmp_path, monkeypatch):
+    """Catches transient-only failures reverting to in_progress after the stream ends."""
+    task_id = _prepare_workflow_task(tmp_path)
+    task_dir = tmp_path / "output" / task_id
+    (task_dir / "feature_strategy.json").unlink()
+    monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+
+    events = _read_workflow_sse(task_id, problem_type="auto", n_trials=10, cv_folds=3)
+
+    assert [event["status"] for event in events] == ["ERROR"]
+    assert "msg" not in events[0]
+    state_path = task_dir / "workflow_state.json"
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["status"] == "failed"
+    assert persisted["error"] == events[0]["error"]
+    assert not (tmp_path / "saved" / f"model_{task_id}.pkl").exists()
+    assert list(task_dir.glob(".workflow_state.*.tmp")) == []
+
+    # A new client has no access to the stream-local queue/completion payload.
+    with TestClient(app) as client:
+        restarted_status = client.get(f"/api/workflow/task/{task_id}/status").json()
+
+    assert restarted_status["status"] == "failed"
+    assert restarted_status["error"] == persisted["error"]
+    assert "msg" not in restarted_status
