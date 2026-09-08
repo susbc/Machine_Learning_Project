@@ -57,6 +57,18 @@ from core.automl.automl_optimizer import AutoMLOptimizer, OptimizationCancelled
 from core.llm.agent_schemas import FeatureAction, FeatureStrategy
 
 from ._dataset import compute_classification_metrics, compute_regression_metrics, predict_with_artifact
+from ._workflow_artifacts import (
+    artifact_transaction_lock,
+    begin_artifact_transaction,
+    cleanup_artifact_transaction,
+    iter_visible_workflow_artifact_paths,
+    publish_staged_artifact,
+    reconcile_workflow_artifact_paths,
+    stage_workflow_artifact,
+    update_transaction_stage,
+    workflow_transaction_paths,
+    write_json_atomic,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +98,7 @@ class StaleWorkflowRun(RuntimeError):
 class WorkflowRunControl:
     run_id: str
     cancel_event: threading.Event
+    previous_completed_state: Optional[Dict[str, Any]] = None
 
 
 workflow_run_lock = threading.RLock()
@@ -94,6 +107,7 @@ active_workflow_runs: Dict[str, WorkflowRunControl] = {}
 
 def _claim_workflow_run(task_id: str) -> WorkflowRunControl:
     with workflow_run_lock:
+        _reconcile_task_artifact(task_id)
         if task_id in active_workflow_runs:
             raise HTTPException(
                 status_code=409,
@@ -103,7 +117,17 @@ def _claim_workflow_run(task_id: str) -> WorkflowRunControl:
                     "message": "该任务已有训练运行，请等待其结束",
                 },
             )
-        control = WorkflowRunControl(uuid.uuid4().hex, threading.Event())
+        persisted = _read_workflow_state(task_id)
+        previous_completed_state = (
+            dict(persisted)
+            if persisted is not None and persisted.get("status") == "completed"
+            else None
+        )
+        control = WorkflowRunControl(
+            uuid.uuid4().hex,
+            threading.Event(),
+            previous_completed_state,
+        )
         active_workflow_runs[task_id] = control
         return control
 
@@ -133,51 +157,49 @@ def _commit_completed_run(
     artifact_path: Path,
     completed_state: Dict[str, Any],
 ) -> None:
-    """Publish artifact/state and release the run as one cancellation-guarded transition."""
-    temporary = artifact_path.with_name(f".{artifact_path.name}.{run_id}.tmp")
-    backup = artifact_path.with_name(f".{artifact_path.name}.{run_id}.backup")
-    published = False
-    previous_backed_up = False
+    """Publish artifact/state with a restart-recoverable terminal transaction."""
+    state_path = _safe_child_path(get_task_dir(task_id), WORKFLOW_STATE_FILENAME)
+    paths = workflow_transaction_paths(artifact_path, state_path, task_id, run_id)
     try:
-        joblib.dump(artifact, temporary)
-        with workflow_run_lock:
+        stage_workflow_artifact(paths, artifact)
+    except Exception:
+        paths.staged.unlink(missing_ok=True)
+        raise
+    try:
+        with workflow_run_lock, artifact_transaction_lock:
             control = _require_current_run(task_id, run_id)
-            if artifact_path.exists():
-                os.replace(artifact_path, backup)
-                previous_backed_up = True
-            try:
-                os.replace(temporary, artifact_path)
-                published = True
-                if control.cancel_event.is_set():
-                    raise OptimizationCancelled("工作流运行已取消")
-                _write_workflow_state(task_id, {"run_id": run_id, **completed_state})
-            except Exception:
-                if published and artifact_path.exists():
-                    artifact_path.unlink()
-                if previous_backed_up and backup.exists():
-                    os.replace(backup, artifact_path)
-                raise
+            current_state = _read_workflow_state(task_id)
+            previous_completed_state = control.previous_completed_state
+            if (
+                previous_completed_state is None
+                and current_state is not None
+                and current_state.get("status") == "completed"
+            ):
+                previous_completed_state = dict(current_state)
+            journal = begin_artifact_transaction(
+                paths,
+                run_id,
+                previous_completed_state,
+            )
+            _require_current_run(task_id, run_id)
+            journal = publish_staged_artifact(paths, journal)
+            _require_current_run(task_id, run_id)
+            _write_workflow_state(task_id, {"run_id": run_id, **completed_state})
             active_workflow_runs.pop(task_id, None)
-            if backup.exists():
-                try:
-                    backup.unlink()
-                except OSError:
-                    logger.warning(
-                        "清理工作流 artifact 备份失败 task_id=%s run_id=%s",
-                        task_id,
-                        run_id,
-                    )
-    finally:
-        temporary.unlink(missing_ok=True)
-        if backup.exists() and artifact_path.exists():
             try:
-                backup.unlink()
-            except OSError:
+                update_transaction_stage(paths, journal, "state_committed")
+                cleanup_artifact_transaction(paths)
+            except Exception:
                 logger.warning(
-                    "清理工作流 artifact 备份失败 task_id=%s run_id=%s",
+                    "延迟清理工作流 artifact 事务 task_id=%s run_id=%s",
                     task_id,
                     run_id,
+                    exc_info=True,
                 )
+    except Exception:
+        with artifact_transaction_lock:
+            _reconcile_task_artifact(task_id)
+        raise
 
 
 def _artifact_belongs_to_run(path: Path, run_id: str) -> bool:
@@ -265,21 +287,8 @@ def _write_workflow_state(task_id: str, payload: Dict[str, Any]) -> None:
     task_dir = get_task_dir(task_id)
     task_dir.mkdir(parents=True, exist_ok=True)
     state_path = _safe_child_path(task_dir, WORKFLOW_STATE_FILENAME)
-    temporary = _safe_child_path(
-        task_dir, f".workflow_state.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    )
     state = {"task_id": validate_task_id(task_id), **payload}
-    serialized = json.dumps(
-        state, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-    )
-    try:
-        with open(temporary, "w", encoding="utf-8") as handle:
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, state_path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    write_json_atomic(state_path, state)
 
 
 def _read_workflow_state(task_id: str) -> Optional[Dict[str, Any]]:
@@ -294,6 +303,12 @@ def _read_workflow_state(task_id: str) -> Optional[Dict[str, Any]]:
         logger.warning("读取工作流状态失败 task_id=%s error=%s", task_id, exc)
         return None
     return state if isinstance(state, dict) else None
+
+
+def _reconcile_task_artifact(task_id: str) -> bool:
+    artifact_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
+    state_path = _safe_child_path(get_task_dir(task_id), WORKFLOW_STATE_FILENAME)
+    return reconcile_workflow_artifact_paths(artifact_path, state_path, task_id)
 
 
 def _write_workflow_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -1622,6 +1637,7 @@ async def train_stream(
 @router.post("/task/{task_id}/run/{run_id}/cancel")
 async def cancel_workflow_run(task_id: str, run_id: str):
     validate_task_id(task_id)
+    _reconcile_task_artifact(task_id)
     with workflow_run_lock:
         control = active_workflow_runs.get(task_id)
         if control is not None and control.run_id == run_id:
@@ -1659,13 +1675,13 @@ async def predict_online(req: PredictRequest):
         # 1. 加载持久化的神器包
         model_version = validate_task_id(req.model_version)
         artifact_path = get_saved_path(f"model_{model_version}.pkl")
-        if not os.path.exists(artifact_path):
-            raise HTTPException(
-                status_code=404,
-                detail=f"模型未找到：{model_version}，请先训练模型"
-            )
-
-        artifact = joblib.load(artifact_path)
+        with artifact_transaction_lock:
+            if not _reconcile_task_artifact(model_version) or not os.path.exists(artifact_path):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"模型未找到：{model_version}，请先训练模型"
+                )
+            artifact = joblib.load(artifact_path)
         model = artifact.get("model")  # mock 模式下为 None
 
         logger.info(f"加载模型：{model_version}")
@@ -1714,61 +1730,62 @@ async def get_task_status(task_id: str):
     if not os.path.exists(task_dir):
         return {"status": "not_found", "task_id": task_id}
 
-    files = os.listdir(task_dir)
+    with artifact_transaction_lock:
+        artifact_visible = _reconcile_task_artifact(task_id)
+        files = os.listdir(task_dir)
 
-    status = {
-        "task_id": task_id,
-        "status": "in_progress",
-        "files": files
-    }
-    persisted_state = _read_workflow_state(task_id)
-    if persisted_state:
-        status.update(
-            {
-                key: value
-                for key, value in persisted_state.items()
-                if key not in {"task_id", "files"}
-            }
-        )
-
-    if "raw_data.parquet" in files:
-        status["step1"] = "done"
-    if "feature_strategy.json" in files:
-        status["step2"] = "done"
-    if status["status"] == "completed":
-        status["step3"] = "done"
-
-    model_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
-    can_restore_from_artifact = persisted_state is None or status["status"] == "completed"
-    if model_path.exists() and can_restore_from_artifact:
-        status["step3"] = "done"
-        status["status"] = "completed"
-
-        # 加载模型获取通用指标和持久化任务语义。
-        try:
-            import joblib
-            artifact = joblib.load(model_path)
-            status["best_metric"] = artifact.get("best_metric") or artifact.get("config", {}).get(
-                "optimization_metric", "roc_auc"
+        status = {
+            "task_id": task_id,
+            "status": "in_progress",
+            "files": files
+        }
+        persisted_state = _read_workflow_state(task_id)
+        if persisted_state:
+            status.update(
+                {
+                    key: value
+                    for key, value in persisted_state.items()
+                    if key not in {"task_id", "files"}
+                }
             )
-            status["best_value"] = artifact.get("best_value", 0)
-            status["feature_columns"] = artifact.get("feature_columns", [])
-            for field in (
-                "problem_spec",
-                "suggested_type",
-                "agent_corrections",
-                "metrics",
-                "metrics_evaluation",
-            ):
-                if field in artifact:
-                    status[field] = artifact[field]
 
-            # 只有没有 schema-v3 任务元数据的旧分类产物保留 best_auc。
-            schema_version = artifact.get("artifact_schema_version", 0)
-            if int(schema_version) < 3 and artifact.get("problem_type") != "regression":
-                status["best_auc"] = artifact.get("best_value", 0)
-        except Exception as e:
-            logger.warning(f"读取模型状态失败：{e}")
+        if "raw_data.parquet" in files:
+            status["step1"] = "done"
+        if "feature_strategy.json" in files:
+            status["step2"] = "done"
+        if status["status"] == "completed":
+            status["step3"] = "done"
+
+        model_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
+        can_restore_from_artifact = persisted_state is None or status["status"] == "completed"
+        if artifact_visible and model_path.exists() and can_restore_from_artifact:
+            status["step3"] = "done"
+            status["status"] = "completed"
+
+            # 加载模型获取通用指标和持久化任务语义。
+            try:
+                artifact = joblib.load(model_path)
+                status["best_metric"] = artifact.get("best_metric") or artifact.get("config", {}).get(
+                    "optimization_metric", "roc_auc"
+                )
+                status["best_value"] = artifact.get("best_value", 0)
+                status["feature_columns"] = artifact.get("feature_columns", [])
+                for field in (
+                    "problem_spec",
+                    "suggested_type",
+                    "agent_corrections",
+                    "metrics",
+                    "metrics_evaluation",
+                ):
+                    if field in artifact:
+                        status[field] = artifact[field]
+
+                # 只有没有 schema-v3 任务元数据的旧分类产物保留 best_auc。
+                schema_version = artifact.get("artifact_schema_version", 0)
+                if int(schema_version) < 3 and artifact.get("problem_type") != "regression":
+                    status["best_auc"] = artifact.get("best_value", 0)
+            except Exception as e:
+                logger.warning("读取模型状态失败：%s", e)
 
     return status
 
@@ -1786,12 +1803,11 @@ async def get_feature_importance(task_id: str):
     """
     model_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
 
-    if not os.path.exists(model_path):
-        return []
-
     try:
-        import joblib
-        artifact = joblib.load(model_path)
+        with artifact_transaction_lock:
+            if not _reconcile_task_artifact(task_id) or not os.path.exists(model_path):
+                return []
+            artifact = joblib.load(model_path)
         model = artifact.get("model")
         feature_columns = artifact.get("feature_columns", [])
 
@@ -1829,16 +1845,15 @@ async def list_models():
         return {"models": []}
 
     models = []
-    for f in os.listdir(SAVED_DIR):
-        if f.startswith("model_task_") and f.endswith(".pkl"):
-            task_id = f.replace("model_", "").replace(".pkl", "")
-            try:
-                validate_task_id(task_id)
-                models.append({
-                    "task_id": task_id,
-                    "model_path": str(get_saved_path(f))
-                })
-            except HTTPException:
-                logger.warning(f"跳过无效模型文件名：{f}")
+    for path in iter_visible_workflow_artifact_paths(SAVED_DIR, OUTPUT_DIR):
+        task_id = path.name.replace("model_", "").replace(".pkl", "")
+        try:
+            validate_task_id(task_id)
+            models.append({
+                "task_id": task_id,
+                "model_path": str(path),
+            })
+        except HTTPException:
+            logger.warning("跳过无效模型文件名：%s", path.name)
 
     return {"models": models}

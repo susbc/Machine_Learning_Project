@@ -15,6 +15,11 @@ from core.automl.problem_spec import ProblemType
 
 from ._common import validate_entity_id
 from ._dataset import parse_artifact_problem_metadata, predict_with_artifact, resolve_artifact_problem_type
+from ._workflow_artifacts import (
+    artifact_transaction_lock,
+    iter_visible_workflow_artifacts,
+    reconcile_workflow_artifact,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/models", tags=["Model Registry"])
@@ -140,15 +145,20 @@ def _iter_existing(patterns: Iterable[tuple[Path, str, str, str]]) -> List[Dict[
 
 
 def list_model_records() -> List[Dict[str, Any]]:
-    return _iter_existing(
+    records = _iter_existing(
         [
             (PROJECT_ROOT / "saved" / "automl", "*.joblib", "automl", "automl"),
             (PROJECT_ROOT / "saved" / "manual_training", "*.joblib", "manual_training", "manual"),
-            (PROJECT_ROOT / "saved", "model_task_*.pkl", "agent_workflow", "workflow"),
             (PROJECT_ROOT / "model_code" / "saved", "model_*.joblib", "legacy", "legacy"),
             (PROJECT_ROOT / "model_code" / "saved", "*_model_*.joblib", "legacy", "legacy"),
         ]
     )
+    for path in iter_visible_workflow_artifacts(PROJECT_ROOT):
+        task_id = path.stem.removeprefix("model_")
+        with artifact_transaction_lock:
+            if reconcile_workflow_artifact(PROJECT_ROOT, task_id) and path.is_file():
+                records.append(_record(path, "agent_workflow", "workflow"))
+    return sorted(records, key=lambda item: item["updated_at"], reverse=True)
 
 
 def _find_record(model_id: str) -> Dict[str, Any]:
@@ -165,7 +175,16 @@ def _load_artifact(record: Dict[str, Any]) -> Dict[str, Any]:
     if root not in path.parents and path != root:
         raise HTTPException(status_code=400, detail="模型路径不在项目目录内")
     try:
-        artifact = joblib.load(path)
+        if record.get("source") == "agent_workflow":
+            task_id = path.stem.removeprefix("model_")
+            with artifact_transaction_lock:
+                if not reconcile_workflow_artifact(PROJECT_ROOT, task_id) or not path.is_file():
+                    raise HTTPException(status_code=404, detail="未找到模型")
+                artifact = joblib.load(path)
+        else:
+            artifact = joblib.load(path)
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("模型产物读取失败 model_id=%s", record.get("model_id"))
         raise HTTPException(status_code=400, detail="模型产物无法读取") from exc
