@@ -20,6 +20,8 @@ export interface ModelRegistryRecord {
   name: string
   artifact_path: string
   metrics: Record<string, unknown>
+  optimization_metric: string | null
+  best_metric: string | null
   problem_type: ResolvedProblemType | null
   problem_spec: ProblemSpec | null
   legacy: boolean

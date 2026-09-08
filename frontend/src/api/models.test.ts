@@ -5,6 +5,7 @@ import {
   type ModelBatchPredictionRow,
   type ModelMetadataError,
   type ModelPredictionResponse,
+  type ModelRegistryRecord,
 } from './models'
 import type { ProblemSpec } from './problem'
 
@@ -17,6 +18,8 @@ describe('models api', () => {
     expectTypeOf<ModelBatchPredictionRow['encoded_prediction']>().toEqualTypeOf<number | null>()
     expectTypeOf<ModelBatchPredictionRow['probability']>().toEqualTypeOf<number | null>()
     expectTypeOf<ModelMetadataError>().toMatchTypeOf<{ code: string; field: string; message: string }>()
+    expectTypeOf<ModelRegistryRecord['optimization_metric']>().toEqualTypeOf<string | null>()
+    expectTypeOf<ModelRegistryRecord['best_metric']>().toEqualTypeOf<string | null>()
     expectTypeOf<ProblemSpec['source']>().toEqualTypeOf<
       'auto_inferred' | 'user_override' | 'legacy_compatibility'
     >()
@@ -33,6 +36,20 @@ describe('models api', () => {
                 source: 'automl',
                 artifact_path: 'saved/automl/automl_1.joblib',
                 metrics: {},
+                optimization_metric: 'mae',
+                best_metric: null,
+                problem_type: 'regression',
+                problem_spec: null,
+                legacy: false,
+                metadata_error: null,
+              },
+              {
+                model_id: 'manual:broken',
+                source: 'manual_training',
+                artifact_path: 'saved/manual_training/broken.joblib',
+                metrics: {},
+                optimization_metric: null,
+                best_metric: null,
                 problem_type: null,
                 problem_spec: null,
                 legacy: false,
@@ -54,14 +71,12 @@ describe('models api', () => {
             source: 'automl',
             artifact_path: 'saved/automl/automl_1.joblib',
             metrics: {},
-            problem_type: null,
+            optimization_metric: 'mae',
+            best_metric: null,
+            problem_type: 'regression',
             problem_spec: null,
             legacy: false,
-            metadata_error: {
-              code: 'invalid_artifact_problem_type',
-              field: 'problem_type',
-              message: 'schema-v3 模型产物必须保存已解析的任务类型，不能使用 auto',
-            },
+            metadata_error: null,
           }),
           { status: 200 },
         )
@@ -119,14 +134,18 @@ describe('models api', () => {
     const batch = await api.batchPredict('automl:automl_1', { rows: [{ age: 30 }, { age: 70 }] })
 
     expect(list.models[0].model_id).toBe('automl:automl_1')
-    expect(list.models[0].problem_type).toBeNull()
+    expect(list.models[0].optimization_metric).toBe('mae')
+    expect(list.models[0].problem_type).toBe('regression')
     expect(list.models[0].legacy).toBe(false)
-    expect(list.models[0].metadata_error).toEqual({
+    expect(list.models[0].metadata_error).toBeNull()
+    expect(list.models[1].optimization_metric).toBeNull()
+    expect(list.models[1].metadata_error).toEqual({
       code: 'invalid_artifact_problem_type',
       field: 'problem_type',
       message: 'schema-v3 模型产物必须保存已解析的任务类型，不能使用 auto',
     })
     expect(model.source).toBe('automl')
+    expect(model.optimization_metric).toBe('mae')
     expect(prediction.prediction).toBe('高风险')
     expect(prediction.diagnostics.unknown_input_keys).toEqual(['aeg'])
     expect(batch.rows[0].probability).toBeNull()

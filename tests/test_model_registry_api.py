@@ -22,8 +22,70 @@ def test_model_registry_lists_saved_models_with_sources():
     assert "models" in payload
     assert isinstance(payload["models"], list)
     assert payload["models"]
-    assert {"model_id", "source", "artifact_path", "metrics"}.issubset(payload["models"][0])
+    assert {
+        "model_id",
+        "source",
+        "artifact_path",
+        "metrics",
+        "optimization_metric",
+        "best_metric",
+    }.issubset(payload["models"][0])
     assert any(item["source"] in {"automl", "manual_training", "agent_workflow", "legacy"} for item in payload["models"])
+
+
+def test_registry_exposes_only_persisted_metric_identity(tmp_path, monkeypatch):
+    """Catches the registry inventing a default instead of reporting artifact truth."""
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    spec = resolve_problem_spec(
+        pd.Series([1.5, 3.5, 5.5]), "target", "regression"
+    ).to_dict()
+    model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+
+    automl_dir = tmp_path / "saved" / "automl"
+    automl_dir.mkdir(parents=True)
+    joblib.dump(
+        {
+            "artifact_schema_version": 3,
+            "problem_type": "regression",
+            "problem_spec": spec,
+            "model": model,
+            "metrics": {"rmse": 0.2, "mae": 0.1, "r2": 0.9},
+            "decision_summary": {"optimization_metric": "mae"},
+        },
+        automl_dir / "automl_mae.joblib",
+    )
+
+    workflow_dir = tmp_path / "saved"
+    joblib.dump(
+        {
+            "artifact_schema_version": 3,
+            "problem_type": "regression",
+            "problem_spec": spec,
+            "model": model,
+            "metrics": {"rmse": 0.2},
+            "best_metric": "rmse",
+        },
+        workflow_dir / "model_task_metric.pkl",
+    )
+
+    legacy_dir = tmp_path / "model_code" / "saved"
+    legacy_dir.mkdir(parents=True)
+    joblib.dump(
+        {"model": model, "metrics": {"accuracy": 0.8}},
+        legacy_dir / "model_old.joblib",
+    )
+
+    records = {
+        record["model_id"]: record
+        for record in TestClient(app).get("/api/models").json()["models"]
+    }
+
+    assert records["automl:automl_mae"]["optimization_metric"] == "mae"
+    assert records["automl:automl_mae"]["best_metric"] is None
+    assert records["workflow:model_task_metric"]["optimization_metric"] is None
+    assert records["workflow:model_task_metric"]["best_metric"] == "rmse"
+    assert records["legacy:model_old"]["optimization_metric"] is None
+    assert records["legacy:model_old"]["best_metric"] is None
 
 
 def test_model_registry_rejects_path_traversal_ids():

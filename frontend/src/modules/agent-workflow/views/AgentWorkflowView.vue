@@ -11,7 +11,7 @@
           data-testid="workflow-refresh-status-button"
           :icon="Refresh"
           :loading="refreshingStatus"
-          @click="refreshTask"
+          @click="refreshTask()"
         >
           刷新状态
         </el-button>
@@ -130,7 +130,7 @@
         <div class="train-controls">
           <label class="train-field">
             <span>问题类型</span>
-            <el-select v-model="problemType" aria-label="工作流问题类型">
+          <el-select v-model="problemType" aria-label="工作流问题类型" @change="handleProblemTypeChange">
               <el-option label="自动识别" value="auto" />
               <el-option label="二分类" value="binary_classification" />
               <el-option label="多分类" value="multiclass_classification" />
@@ -146,7 +146,7 @@
           <el-table-column prop="status" label="状态" width="120" />
           <el-table-column prop="trial" label="Trial" width="90" />
           <el-table-column label="最佳指标" width="160">
-            <template #default="{ row }">{{ metricLabel(row.best_metric ?? row.metric) }} {{ formatMetric(row.best_value) }}</template>
+            <template #default="{ row }">{{ metricLabel(row.metric ?? row.best_metric) }} {{ formatMetric(row.value ?? row.best_value) }}</template>
           </el-table-column>
           <el-table-column prop="msg" label="消息" />
         </el-table>
@@ -157,7 +157,7 @@
           <h3>4. 在线预测</h3>
           <span>{{ modelRecords.length }} 个模型</span>
         </div>
-        <el-select v-model="predictForm.model_version" placeholder="选择模型版本">
+        <el-select v-model="predictForm.model_version" aria-label="工作流预测模型" placeholder="选择模型版本">
           <el-option v-for="model in modelRecords" :key="model.task_id" :label="model.task_id" :value="model.task_id" />
         </el-select>
         <el-input v-model="predictFeatureJson" class="predict-json" type="textarea" :rows="7" />
@@ -165,11 +165,11 @@
         <div v-if="predictionResult" class="prediction-result" aria-live="polite">
           <span>预测值</span>
           <strong>{{ predictionResult.prediction }}</strong>
-          <template v-if="!isRegressionWorkflow && predictionResult.encoded_prediction != null">
+          <template v-if="predictionResult.encoded_prediction != null">
             <span>类别编码</span>
             <strong>{{ predictionResult.encoded_prediction }}</strong>
           </template>
-          <template v-if="!isRegressionWorkflow && predictionResult.probability != null">
+          <template v-if="predictionResult.probability != null">
             <span>预测概率</span>
             <strong>{{ formatMetric(predictionResult.probability) }}</strong>
           </template>
@@ -234,6 +234,7 @@ const taskId = ref('')
 const retrieveResult = ref<WorkflowRetrieveResponse | null>(null)
 const featureResult = ref<WorkflowFeatureResponse | null>(null)
 const taskStatus = ref<WorkflowTaskStatus | null>(null)
+const liveMetric = ref<{ name?: string; value?: number | null } | null>(null)
 const predictionResult = ref<WorkflowPredictResponse | null>(null)
 const modelRecords = ref<WorkflowModelRecord[]>([])
 const trainEvents = ref<WorkflowTrainEvent[]>([])
@@ -247,6 +248,8 @@ const errorMessage = ref('')
 const infoMessage = ref('')
 const modelListVisible = ref(false)
 let streamController: AbortController | null = null
+let contextGeneration = 0
+let streamGeneration = 0
 
 const stepState = computed(() => ({
   retrieve: taskId.value ? '完成' : '待执行',
@@ -256,9 +259,8 @@ const canGenerateFeatures = computed(() => Boolean(taskId.value) && !generatingF
 const canTrain = computed(() => Boolean(taskId.value && featureResult.value) && !training.value)
 const canPredict = computed(() => Boolean(predictForm.model_version && predictFeatureJson.value.trim()))
 const featureActions = computed<WorkflowFeatureAction[]>(() => featureResult.value?.strategy?.actions ?? [])
-const taskMetricName = computed(() => taskStatus.value?.best_metric ?? (typeof taskStatus.value?.best_auc === 'number' ? 'roc_auc' : undefined))
-const taskMetricValue = computed(() => taskStatus.value?.best_value ?? taskStatus.value?.best_auc)
-const isRegressionWorkflow = computed(() => taskStatus.value?.problem_spec?.resolved_type === 'regression')
+const taskMetricName = computed(() => liveMetric.value?.name ?? taskStatus.value?.best_metric ?? (typeof taskStatus.value?.best_auc === 'number' ? 'roc_auc' : undefined))
+const taskMetricValue = computed(() => liveMetric.value?.value ?? taskStatus.value?.best_value ?? taskStatus.value?.best_auc)
 const hasPredictionDiagnostics = computed(() => Boolean(
   predictionResult.value?.diagnostics?.unknown_input_keys.length
   || predictionResult.value?.diagnostics?.missing_columns_imputed.length,
@@ -280,14 +282,18 @@ async function runRetrieve() {
     if (result.status !== 'success' || !result.task_id) {
       throw new Error(result.msg ?? 'Step 1 未成功返回 task_id')
     }
+    contextGeneration += 1
+    invalidateTrainingStream()
+    const generation = contextGeneration
     retrieveResult.value = result
     taskId.value = result.task_id
     featureResult.value = null
     taskStatus.value = null
+    liveMetric.value = null
     trainEvents.value = []
     predictionResult.value = null
     ElMessage.success('数据提取完成')
-    await refreshTask()
+    await refreshTask(result.task_id, generation)
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '自然语言取数失败'
   } finally {
@@ -297,16 +303,20 @@ async function runRetrieve() {
 
 async function runFeatureGeneration() {
   if (!taskId.value) return
+  const expectedTaskId = taskId.value
+  const generation = contextGeneration
   generatingFeatures.value = true
   errorMessage.value = ''
   infoMessage.value = ''
   try {
-    featureResult.value = await workflowApi.generateFeatures({
-      task_id: taskId.value,
+    const result = await workflowApi.generateFeatures({
+      task_id: expectedTaskId,
       eda_report_text: featureMemo.value,
     })
+    if (!isCurrentContext(expectedTaskId, generation)) return
+    featureResult.value = result
     ElMessage.success('特征策略已生成')
-    await refreshTask()
+    await refreshTask(expectedTaskId, generation)
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '特征策略生成失败'
   } finally {
@@ -317,26 +327,33 @@ async function runFeatureGeneration() {
 function startTraining() {
   if (!taskId.value) return
   closeTrainingStream()
+  const expectedTaskId = taskId.value
+  const generation = contextGeneration
+  const activeStreamGeneration = ++streamGeneration
   trainEvents.value = []
+  liveMetric.value = null
   training.value = true
   errorMessage.value = ''
   infoMessage.value = ''
   const controller = new AbortController()
   streamController = controller
-  void workflowApi.streamTraining(taskId.value, trainConfig.nTrials, trainConfig.cvFolds, problemType.value, async (payload: WorkflowTrainEvent) => {
+  void workflowApi.streamTraining(expectedTaskId, trainConfig.nTrials, trainConfig.cvFolds, problemType.value, async (payload: WorkflowTrainEvent) => {
+    if (!isCurrentStream(expectedTaskId, generation, activeStreamGeneration)) return
     trainEvents.value.unshift(payload)
     applyTrainingMetadata(payload)
     if (payload.status === 'DONE') {
       training.value = false
-      closeTrainingStream()
-      await refreshTask()
-      await loadModels()
-      if (taskId.value) predictForm.model_version = taskId.value
+      closeTrainingStream(controller)
+      await refreshTask(expectedTaskId, generation)
+      if (!isCurrentStream(expectedTaskId, generation, activeStreamGeneration)) return
+      await loadModels(generation)
+      if (!isCurrentStream(expectedTaskId, generation, activeStreamGeneration)) return
+      predictForm.model_version = expectedTaskId
     }
     if (payload.status === 'ERROR') {
       training.value = false
       errorMessage.value = payload.msg ?? '训练失败'
-      closeTrainingStream()
+      closeTrainingStream(controller)
     }
   }, controller.signal).catch((error: unknown) => {
     if (controller.signal.aborted) return
@@ -346,18 +363,21 @@ function startTraining() {
   })
 }
 
-async function refreshTask() {
+async function refreshTask(expectedTaskId = taskId.value, generation = contextGeneration) {
   errorMessage.value = ''
-  if (!taskId.value) {
+  if (!expectedTaskId) {
     taskStatus.value = null
     infoMessage.value = '暂无任务可刷新，请先完成自然语言取数'
     return
   }
   refreshingStatus.value = true
   try {
-    taskStatus.value = await workflowApi.getTaskStatus(taskId.value)
+    const status = await workflowApi.getTaskStatus(expectedTaskId)
+    if (!isCurrentContext(expectedTaskId, generation)) return
+    taskStatus.value = status
     infoMessage.value = '任务状态已刷新'
   } catch (error) {
+    if (!isCurrentContext(expectedTaskId, generation)) return
     errorMessage.value = error instanceof Error ? error.message : '任务状态刷新失败'
   } finally {
     refreshingStatus.value = false
@@ -369,11 +389,13 @@ async function openModelList() {
   await loadModels()
 }
 
-async function loadModels() {
+async function loadModels(generation = contextGeneration) {
   loadingModels.value = true
   errorMessage.value = ''
   try {
-    modelRecords.value = (await workflowApi.listModels()).models
+    const models = (await workflowApi.listModels()).models
+    if (generation !== contextGeneration) return
+    modelRecords.value = models
     if (!predictForm.model_version && modelRecords.value[0]) {
       predictForm.model_version = modelRecords.value[0].task_id
     }
@@ -411,6 +433,11 @@ function formatMetric(value: number | null | undefined) {
 }
 
 function applyTrainingMetadata(payload: WorkflowTrainEvent) {
+  if (payload.metric !== undefined || payload.value !== undefined) {
+    liveMetric.value = { name: payload.metric, value: payload.value }
+  } else if (payload.best_metric !== undefined || payload.best_value !== undefined) {
+    liveMetric.value = { name: payload.best_metric, value: payload.best_value }
+  }
   if (!payload.problem_spec && !payload.best_metric && payload.best_value == null) return
   const current = taskStatus.value ?? { task_id: taskId.value, status: 'running' }
   taskStatus.value = {
@@ -461,11 +488,37 @@ function formatCorrectionValue(value: AgentCorrectionValue) {
   return JSON.stringify(value)
 }
 
-function closeTrainingStream() {
-  if (streamController) {
+function isCurrentContext(expectedTaskId: string, generation: number) {
+  return taskId.value === expectedTaskId && contextGeneration === generation
+}
+
+function isCurrentStream(expectedTaskId: string, generation: number, expectedStreamGeneration: number) {
+  return isCurrentContext(expectedTaskId, generation) && streamGeneration === expectedStreamGeneration
+}
+
+function closeTrainingStream(expectedController?: AbortController) {
+  if (streamController && (!expectedController || streamController === expectedController)) {
     streamController.abort()
     streamController = null
   }
+}
+
+function invalidateTrainingStream() {
+  streamGeneration += 1
+  closeTrainingStream()
+  training.value = false
+}
+
+function handleProblemTypeChange() {
+  contextGeneration += 1
+  invalidateTrainingStream()
+  taskStatus.value = null
+  liveMetric.value = null
+  trainEvents.value = []
+  predictForm.model_version = ''
+  predictionResult.value = null
+  errorMessage.value = ''
+  infoMessage.value = ''
 }
 
 onMounted(loadModels)

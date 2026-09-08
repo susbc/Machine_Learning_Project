@@ -158,11 +158,11 @@ const compareRows = computed(() =>
       name: model.name,
       source: sourceLabel(model.source),
       primaryMetric: metricText(model),
-      rocAuc: formatMetric(model.metrics.roc_auc ?? model.metrics.val_auc),
-      accuracy: formatMetric(model.metrics.accuracy),
-      r2: model.problem_type === 'regression' ? formatMetric(model.metrics.r2) : '-',
-      rmse: model.problem_type === 'regression' ? formatMetric(model.metrics.rmse) : '-',
-      mae: model.problem_type === 'regression' ? formatMetric(model.metrics.mae) : '-',
+      rocAuc: formatFirstMetricWithDirection(model, ['roc_auc', 'val_auc']),
+      accuracy: formatMetricWithDirection(model, 'accuracy', model.metrics.accuracy),
+      r2: model.problem_type === 'regression' ? formatMetricWithDirection(model, 'r2', model.metrics.r2) : '-',
+      rmse: model.problem_type === 'regression' ? formatMetricWithDirection(model, 'rmse', model.metrics.rmse) : '-',
+      mae: model.problem_type === 'regression' ? formatMetricWithDirection(model, 'mae', model.metrics.mae) : '-',
       updatedAt: new Date(model.updated_at * 1000).toLocaleString(),
     })),
 )
@@ -211,23 +211,17 @@ function sourceTagType(source: string) {
 
 function primaryMetricName(record: ModelRegistryRecord): string | null {
   if (record.metadata_error) return null
-  if (record.problem_type === 'regression') {
-    const configuredMetric = typeof record.metrics.optimization_metric === 'string'
-      ? record.metrics.optimization_metric
-      : typeof record.metrics.best_metric === 'string'
-        ? record.metrics.best_metric
-        : record.problem_spec?.capabilities.default_metric
-    const candidates = [configuredMetric, 'r2', 'rmse', 'mae']
-    return candidates.find((metric): metric is string => Boolean(metric && typeof record.metrics[metric] === 'number')) ?? null
-  }
-  const candidates = ['roc_auc', 'val_auc', ...(record.legacy ? ['best_auc'] : []), 'accuracy', 'best_value']
-  return candidates.find((metric) => typeof record.metrics[metric] === 'number') ?? null
+  const persistedMetric = record.optimization_metric ?? record.best_metric
+  if (persistedMetric && typeof record.metrics[persistedMetric] === 'number') return persistedMetric
+  if (!record.legacy) return null
+  return ['best_auc', 'roc_auc', 'val_auc', 'accuracy', 'best_value']
+    .find((metric) => typeof record.metrics[metric] === 'number') ?? null
 }
 
 function metricText(record: ModelRegistryRecord) {
   if (record.metadata_error) return '元数据错误'
   const metric = primaryMetricName(record)
-  return metric ? `${metricLabel(metric)} ${formatMetric(record.metrics[metric])}` : '-'
+  return metric ? `${metricLabel(metric)} ${formatMetricWithDirection(record, metric, record.metrics[metric])}` : '-'
 }
 
 function metricLabel(metric: string) {
@@ -257,6 +251,20 @@ function registryProblemTypeLabel(record: ModelRegistryRecord) {
 
 function formatMetric(value: unknown) {
   return typeof value === 'number' ? value.toFixed(4) : '-'
+}
+
+function formatMetricWithDirection(record: ModelRegistryRecord, metric: string, value: unknown) {
+  const formatted = formatMetric(value)
+  if (formatted === '-') return formatted
+  const direction = record.problem_spec?.capabilities.metric_directions[metric]
+  if (direction === 'minimize') return `${formatted}（越小越好）`
+  if (direction === 'maximize') return `${formatted}（越大越好）`
+  return formatted
+}
+
+function formatFirstMetricWithDirection(record: ModelRegistryRecord, metrics: string[]) {
+  const metric = metrics.find((candidate) => typeof record.metrics[candidate] === 'number')
+  return metric ? formatMetricWithDirection(record, metric, record.metrics[metric]) : '-'
 }
 
 onMounted(loadModels)

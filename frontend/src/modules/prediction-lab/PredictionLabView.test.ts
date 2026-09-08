@@ -36,6 +36,8 @@ const regressionRecord = {
   name: 'reg',
   artifact_path: 'saved/manual_training/reg.joblib',
   metrics: { rmse: 0.1, mae: 0.08, r2: 0.99 },
+  optimization_metric: 'rmse',
+  best_metric: null,
   problem_type: 'regression',
   problem_spec: regressionSpec,
   legacy: false,
@@ -49,6 +51,8 @@ const classificationRecord = {
   name: 'classifier',
   artifact_path: 'saved/manual_training/classifier.joblib',
   metrics: { roc_auc: 0.91 },
+  optimization_metric: 'roc_auc',
+  best_metric: null,
   problem_type: 'binary_classification',
   problem_spec: null,
   legacy: false,
@@ -62,6 +66,8 @@ const legacyRecord = {
   name: 'old',
   artifact_path: 'model_code/saved/old.joblib',
   metrics: { accuracy: 0.8 },
+  optimization_metric: null,
+  best_metric: null,
   problem_type: null,
   problem_spec: null,
   legacy: true,
@@ -75,6 +81,8 @@ const invalidMetadataRecord = {
   name: 'broken',
   artifact_path: 'saved/manual_training/broken.joblib',
   metrics: {},
+  optimization_metric: null,
+  best_metric: null,
   problem_type: null,
   problem_spec: null,
   legacy: false,
@@ -166,6 +174,13 @@ async function chooseCsv(wrapper: VueWrapper, text: string) {
   const input = wrapper.get('[data-testid="prediction-csv-input"]')
   const file = new File([text], 'rows.csv', { type: 'text/csv' })
   Object.defineProperty(file, 'text', { configurable: true, value: async () => text })
+  Object.defineProperty(input.element, 'files', { configurable: true, value: [file] })
+  await input.trigger('change')
+  await flushPromises()
+}
+
+async function selectCsvFile(wrapper: VueWrapper, file: File) {
+  const input = wrapper.get('[data-testid="prediction-csv-input"]')
   Object.defineProperty(input.element, 'files', { configurable: true, value: [file] })
   await input.trigger('change')
   await flushPromises()
@@ -307,7 +322,7 @@ describe('PredictionLabView', () => {
     wrapper.unmount()
   })
 
-  it('recovers model loading and excludes legacy or malformed models from prediction choices', async () => {
+  it('keeps valid legacy models classification-compatible while excluding malformed metadata', async () => {
     modelMocks.listModels.mockRejectedValueOnce(new Error('模型列表暂不可用')).mockResolvedValue({
       models: [regressionRecord, classificationRecord, legacyRecord, invalidMetadataRecord],
     })
@@ -319,7 +334,61 @@ describe('PredictionLabView', () => {
     await flushPromises()
 
     expect(wrapper.text()).not.toContain('模型列表暂不可用')
-    expect(await optionLabels(wrapper)).toEqual(['manual:reg', 'manual:classifier'])
+    expect(await optionLabels(wrapper)).toEqual(['manual:reg', 'manual:classifier', 'legacy:old'])
+
+    modelMocks.predict.mockResolvedValue({ ...classificationPrediction, model_id: 'legacy:old', source: 'legacy' })
+    await selectOption(wrapper, 'legacy:old')
+    await actionButton(wrapper, '执行预测').trigger('click')
+    await flushPromises()
+
+    expect(modelMocks.predict).toHaveBeenLastCalledWith('legacy:old', expect.any(Object))
+    expect(wrapper.text()).toContain('类别编码')
+    expect(wrapper.text()).toContain('预测概率')
+    wrapper.unmount()
+  })
+
+  it('discards an older CSV read when a newer file finishes first', async () => {
+    let resolveFirst!: (text: string) => void
+    let resolveSecond!: (text: string) => void
+    const first = new File([], 'first.csv', { type: 'text/csv' })
+    const second = new File([], 'second.csv', { type: 'text/csv' })
+    Object.defineProperty(first, 'text', { value: () => new Promise<string>((resolve) => { resolveFirst = resolve }) })
+    Object.defineProperty(second, 'text', { value: () => new Promise<string>((resolve) => { resolveSecond = resolve }) })
+    const wrapper = mount(PredictionLabView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await selectCsvFile(wrapper, first)
+    await selectCsvFile(wrapper, second)
+    resolveSecond('x\n9')
+    await flushPromises()
+    resolveFirst('x\n1')
+    await flushPromises()
+    await actionButton(wrapper, '执行批量预测').trigger('click')
+    await flushPromises()
+
+    expect(modelMocks.batchPredict).toHaveBeenCalledWith('manual:reg', { rows: [{ x: 9 }] })
+    wrapper.unmount()
+  })
+
+  it('invalidates batch state and rejects a late response as soon as CSV input changes', async () => {
+    let resolveRead!: (text: string) => void
+    let resolveBatch!: (value: typeof regressionBatch) => void
+    modelMocks.batchPredict.mockReturnValueOnce(new Promise((resolve) => { resolveBatch = resolve }))
+    const replacement = new File([], 'replacement.csv', { type: 'text/csv' })
+    Object.defineProperty(replacement, 'text', { value: () => new Promise<string>((resolve) => { resolveRead = resolve }) })
+    const wrapper = mount(PredictionLabView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await chooseCsv(wrapper, 'x\n3\n4')
+    await actionButton(wrapper, '执行批量预测').trigger('click')
+
+    await selectCsvFile(wrapper, replacement)
+    resolveBatch(regressionBatch)
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('批量结果')
+    expect(actionButton(wrapper, '执行批量预测').attributes('disabled')).toBeDefined()
+    resolveRead('x\n8')
+    await flushPromises()
     wrapper.unmount()
   })
 })

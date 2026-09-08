@@ -201,6 +201,26 @@ describe('AgentWorkflowView', () => {
     wrapper.unmount()
   })
 
+  it('renders metric/value-only RUNNING and DONE events as the canonical live metric', async () => {
+    workflowMocks.getTaskStatus.mockResolvedValue({ task_id: 'task_ab12cd34', status: 'running' })
+    workflowMocks.streamTraining.mockImplementation(async (...args: unknown[]) => {
+      const onEvent = args[4] as (event: Record<string, unknown>) => Promise<void>
+      await onEvent({ status: 'RUNNING', trial: 1, metric: 'mae', value: 0.31 })
+      await onEvent({ status: 'DONE', trial: 10, metric: 'mae', value: 0.19 })
+    })
+    const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await createWorkflow(wrapper)
+
+    await actionButton(wrapper, '开始训练').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('MAE')
+    expect(wrapper.text()).toContain('0.1900')
+    expect(wrapper.text()).toContain('0.3100')
+    wrapper.unmount()
+  })
+
   it('recovers a failed status refresh and renders final metadata, structured corrections, metrics, and regression diagnostics', async () => {
     workflowMocks.getTaskStatus.mockRejectedValueOnce(new Error('状态服务暂不可用')).mockResolvedValue(regressionWorkflowStatus)
     const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
@@ -266,6 +286,112 @@ describe('AgentWorkflowView', () => {
     expect(wrapper.text()).toContain('类别编码')
     expect(wrapper.text()).toContain('预测概率')
     expect(wrapper.text()).toContain('0.8400')
+    wrapper.unmount()
+  })
+
+  it('shows classification response fields after selecting a classification model from a regression workflow', async () => {
+    workflowMocks.listModels.mockResolvedValue({
+      models: [
+        { task_id: 'task_ab12cd34', model_path: 'saved/model_task_ab12cd34.pkl' },
+        { task_id: 'class_ef56gh78', model_path: 'saved/model_class_ef56gh78.pkl' },
+      ],
+    })
+    workflowMocks.predict.mockResolvedValue({
+      status: 'success',
+      model_version: 'class_ef56gh78',
+      prediction: '违约',
+      encoded_prediction: 1,
+      probability: 0.84,
+      diagnostics: { unknown_input_keys: [], missing_columns_imputed: [] },
+    })
+    const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await actionButton(wrapper, '生成 SQL 并提取数据').trigger('click')
+    await flushPromises()
+
+    await selectOption(wrapper, '工作流预测模型', 'class_ef56gh78')
+    await actionButton(wrapper, '执行预测').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('类别编码')
+    expect(wrapper.text()).toContain('预测概率')
+    expect(wrapper.text()).toContain('0.8400')
+    wrapper.unmount()
+  })
+
+  it('aborts training and clears task-dependent state when the task type selector changes', async () => {
+    let streamSignal: AbortSignal | undefined
+    workflowMocks.streamTraining.mockImplementation((...args: unknown[]) => {
+      streamSignal = args[5] as AbortSignal
+      const onEvent = args[4] as (event: Record<string, unknown>) => Promise<void>
+      void onEvent({ status: 'RUNNING', trial: 1, metric: 'rmse', value: 0.27, problem_spec: regressionSpec })
+      return new Promise<void>(() => undefined)
+    })
+    const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await createWorkflow(wrapper)
+    await actionButton(wrapper, '执行预测').trigger('click')
+    await actionButton(wrapper, '开始训练').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('0.2700')
+    expect(wrapper.text()).toContain('123.45')
+    expect(streamSignal?.aborted).toBe(false)
+
+    await selectOption(wrapper, '工作流问题类型', '回归')
+
+    expect(streamSignal?.aborted).toBe(true)
+    expect(wrapper.text()).not.toContain('0.2700')
+    expect(wrapper.text()).not.toContain('任务类型解析')
+    expect(wrapper.text()).not.toContain('123.45')
+    expect(actionButton(wrapper, '执行预测').attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+
+  it('ignores late callbacks from an aborted stream after replacing the workflow task', async () => {
+    let lateEvent: ((event: Record<string, unknown>) => Promise<void>) | undefined
+    let oldSignal: AbortSignal | undefined
+    workflowMocks.retrieveData
+      .mockResolvedValueOnce({ status: 'success', task_id: 'task_old', data_shape: [80, 3] })
+      .mockResolvedValueOnce({ status: 'success', task_id: 'task_new', data_shape: [42, 3] })
+    workflowMocks.generateFeatures.mockResolvedValue({
+      status: 'success', task_id: 'task_old', strategy: { actions: [] }, actions_count: 0,
+    })
+    workflowMocks.getTaskStatus
+      .mockResolvedValueOnce({ task_id: 'task_old', status: 'running' })
+      .mockResolvedValueOnce({ task_id: 'task_old', status: 'running' })
+      .mockResolvedValueOnce({ task_id: 'task_new', status: 'created' })
+    workflowMocks.streamTraining.mockImplementation((...args: unknown[]) => {
+      lateEvent = args[4] as (event: Record<string, unknown>) => Promise<void>
+      oldSignal = args[5] as AbortSignal
+      return new Promise<void>(() => undefined)
+    })
+    const wrapper = mount(AgentWorkflowView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await createWorkflow(wrapper)
+    await actionButton(wrapper, '开始训练').trigger('click')
+    await flushPromises()
+    const statusCallsBeforeReplacement = workflowMocks.getTaskStatus.mock.calls.length
+    const modelCallsBeforeReplacement = workflowMocks.listModels.mock.calls.length
+
+    await actionButton(wrapper, '生成 SQL 并提取数据').trigger('click')
+    await flushPromises()
+
+    expect(oldSignal?.aborted).toBe(true)
+    expect(wrapper.text()).toContain('task_new')
+    expect(workflowMocks.getTaskStatus).toHaveBeenCalledTimes(statusCallsBeforeReplacement + 1)
+    expect(workflowMocks.listModels).toHaveBeenCalledTimes(modelCallsBeforeReplacement)
+
+    await lateEvent?.({
+      status: 'DONE', trial: 10, metric: 'mae', value: 0.01, problem_spec: regressionSpec,
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('task_new')
+    expect(wrapper.text()).not.toContain('0.0100')
+    expect(wrapper.text()).not.toContain('任务类型解析')
+    expect(workflowMocks.getTaskStatus).toHaveBeenCalledTimes(statusCallsBeforeReplacement + 1)
+    expect(workflowMocks.listModels).toHaveBeenCalledTimes(modelCallsBeforeReplacement)
     wrapper.unmount()
   })
 
