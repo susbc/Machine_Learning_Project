@@ -171,6 +171,15 @@ def test_prepare_regression_pipeline_rejects_non_finite_target_with_saved_spec()
         prepare_train_pipeline(df, "price", [], problem_spec=spec)
 
 
+def test_compute_regression_metrics_rejects_non_finite_r2_diagnostic():
+    from sklearn.linear_model import LinearRegression
+
+    model = LinearRegression().fit([[0.0], [1.0]], [2.0, 2.0])
+
+    with pytest.raises(ValueError, match="R² 无法计算：测试集目标值没有方差，无法生成有限分数"):
+        compute_regression_metrics(model, [[2.0], [3.0]], [2.0, 2.0])
+
+
 # ---------- compute_classification_metrics ----------
 
 

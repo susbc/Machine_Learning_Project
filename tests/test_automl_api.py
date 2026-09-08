@@ -8,6 +8,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import pytest
 from fastapi.testclient import TestClient
 
 import backend.api.automl as automl_api
@@ -153,6 +154,37 @@ def test_automl_rejects_infeasible_cv_before_creating_job():
     assert {item["job_id"] for item in automl_api.runtime_state.list(automl_api.JOB_NAMESPACE)} == existing_ids
 
 
+def test_automl_rejects_rare_class_with_stable_detail_before_creating_job():
+    client = TestClient(app, raise_server_exceptions=False)
+    frame = pd.DataFrame({"x": range(20), "label": [0] * 19 + [1]})
+    existing_persisted = {item["job_id"] for item in automl_api.runtime_state.list(automl_api.JOB_NAMESPACE)}
+    existing_memory = set(automl_jobs)
+    input_blob_dir = automl_api.runtime_state.blob_dir / automl_api.INPUT_BLOB_NAMESPACE
+    existing_input_blobs = {path.name for path in input_blob_dir.glob("*.joblib")}
+
+    response = client.post(
+        "/api/automl/jobs",
+        files={"file": ("rare.csv", io.BytesIO(frame.to_csv(index=False).encode()), "text/csv")},
+        data={
+            "target_col": "label",
+            "problem_type": "binary_classification",
+            "optimization_metric": "accuracy",
+            "candidate_models": '["logistic_regression"]',
+            "cv_folds": 2,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "insufficient_classification_split",
+        "field": "test_size",
+        "message": "训练集和测试集必须覆盖全部类别",
+    }
+    assert {item["job_id"] for item in automl_api.runtime_state.list(automl_api.JOB_NAMESPACE)} == existing_persisted
+    assert set(automl_jobs) == existing_memory
+    assert {path.name for path in input_blob_dir.glob("*.joblib")} == existing_input_blobs
+
+
 def test_automl_regression_completes_with_raw_rmse():
     client = TestClient(app)
     job_id = _create_regression_automl_job(client, metric="rmse")
@@ -166,6 +198,69 @@ def test_automl_regression_completes_with_raw_rmse():
     assert result["threshold_calibration"] is None
     assert result["problem_spec"]["capabilities"]["metric_directions"]["rmse"] == "minimize"
     assert all(event["value"] >= 0 for event in result["trial_history"])
+
+
+@pytest.mark.parametrize(
+    ("metric", "direction", "expected_value"),
+    [("mae", "minimize", 0.0), ("r2", "maximize", 1.0)],
+)
+def test_automl_regression_uses_raw_metric_direction(metric, direction, expected_value):
+    client = TestClient(app)
+    job_id = _create_regression_automl_job(client, metric=metric)
+
+    final = _wait_for_completion(client, job_id)
+
+    assert final["status"] == "completed"
+    result = client.get(f"/api/automl/jobs/{job_id}/result").json()
+    restored_spec = automl_api.ProblemSpec.from_dict(result["problem_spec"])
+    assert automl_api._optimization_direction(restored_spec, metric) == direction
+    assert result["best_value"] >= 0
+    assert result["best_value"] == pytest.approx(expected_value, abs=1e-12)
+    assert all(event["value"] >= 0 for event in result["trial_history"])
+    assert all(event["value"] == pytest.approx(expected_value, abs=1e-12) for event in result["trial_history"])
+
+
+@pytest.mark.parametrize(
+    ("resolved_type", "expected_test_indices"),
+    [
+        ("regression", [[0, 1], [2, 5], [3, 4]]),
+        ("binary_classification", [[0, 5], [1, 3], [2, 4]]),
+    ],
+)
+def test_automl_cross_validator_is_task_aware_and_deterministic(resolved_type, expected_test_indices):
+    X = np.arange(6).reshape(-1, 1)
+    y = np.array([0, 0, 0, 1, 1, 1])
+
+    splitter = automl_api._cross_validator(resolved_type, cv_folds=3)
+    actual_test_indices = [test_indices.tolist() for _, test_indices in splitter.split(X, y)]
+
+    assert actual_test_indices == expected_test_indices
+
+
+def test_automl_reports_non_finite_regression_metric_as_failed_job():
+    client = TestClient(app)
+    frame = pd.DataFrame({"x": range(8), "price": [1.0] * 7 + [2.0]})
+    response = client.post(
+        "/api/automl/jobs",
+        files={"file": ("constant-test-target.csv", io.BytesIO(frame.to_csv(index=False).encode()), "text/csv")},
+        data={
+            "target_col": "price",
+            "problem_type": "regression",
+            "optimization_metric": "mae",
+            "candidate_models": '["linear_regression"]',
+            "n_trials": 1,
+            "cv_folds": 2,
+        },
+    )
+    assert response.status_code == 201
+
+    final = _wait_for_completion(client, response.json()["job_id"])
+
+    assert final["status"] == "failed"
+    assert final["error"] == "R² 无法计算：测试集目标值没有方差，无法生成有限分数"
+    result = client.get(f"/api/automl/jobs/{final['job_id']}/result")
+    assert result.status_code == 400
+    assert result.json()["detail"] == "任务尚未完成，当前状态：failed"
 
 
 def test_automl_regression_snapshot_events_and_schema_v3_artifact_survive_reload():
