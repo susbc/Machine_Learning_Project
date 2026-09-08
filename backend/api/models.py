@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -15,6 +16,7 @@ from core.automl.problem_spec import ProblemType
 from ._common import validate_entity_id
 from ._dataset import parse_artifact_problem_metadata, predict_with_artifact, resolve_artifact_problem_type
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/models", tags=["Model Registry"])
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -165,7 +167,8 @@ def _load_artifact(record: Dict[str, Any]) -> Dict[str, Any]:
     try:
         artifact = joblib.load(path)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"模型产物读取失败：{exc}") from exc
+        logger.exception("模型产物读取失败 model_id=%s", record.get("model_id"))
+        raise HTTPException(status_code=400, detail="模型产物无法读取") from exc
     if not isinstance(artifact, dict):
         raise HTTPException(status_code=400, detail="暂不支持该 legacy 模型产物格式")
     return artifact

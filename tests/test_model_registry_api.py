@@ -100,6 +100,27 @@ def test_model_registry_rejects_path_traversal_ids():
     assert response.status_code == 400
 
 
+def test_model_registry_does_not_expose_artifact_load_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    artifact_dir = tmp_path / "saved" / "manual_training"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "manual_training_broken.joblib").write_bytes(b"broken")
+    monkeypatch.setattr(
+        model_registry.joblib,
+        "load",
+        lambda path: (_ for _ in ()).throw(RuntimeError("unsafe /private/server/secret.joblib")),
+    )
+
+    response = TestClient(app).post(
+        "/api/models/manual%3Amanual_training_broken/predict",
+        json={"features": {"age": 70}},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "模型产物无法读取"
+    assert "/private/" not in response.text
+
+
 def test_model_registry_predicts_with_supported_artifact(tmp_path, monkeypatch):
     monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
     artifact_dir = tmp_path / "saved" / "manual_training"
