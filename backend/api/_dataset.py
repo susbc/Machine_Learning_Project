@@ -382,10 +382,14 @@ def compute_regression_metrics(model, X_test, y_test) -> Dict[str, float]:
         rmse = math.sqrt(mean_squared_error(y_test, y_pred))
     else:
         rmse = root_mean_squared_error(y_test, y_pred)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r2 = float(r2_score(y_test, y_pred, force_finite=False))
+    if not np.isfinite(r2):
+        raise ValueError("R² 无法计算：测试集目标值没有方差，无法生成有限分数")
     return {
         "rmse": float(rmse),
         "mae": float(mean_absolute_error(y_test, y_pred)),
-        "r2": float(r2_score(y_test, y_pred)),
+        "r2": r2,
     }
 
 

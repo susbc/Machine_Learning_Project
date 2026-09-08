@@ -46,6 +46,7 @@ from core.automl.problem_spec import (
     resolve_problem_spec,
     validate_algorithm,
     validate_cv,
+    validate_train_test_split,
 )
 
 logger = logging.getLogger(__name__)
@@ -353,6 +354,18 @@ def _readable_cv_value(metric: str, scores: np.ndarray) -> float:
     return -mean if metric in {"rmse", "mae"} else mean
 
 
+def _optimization_direction(spec: ProblemSpec, metric: str) -> str:
+    return spec.metric_directions[metric]
+
+
+def _cross_validator(resolved_type: str, cv_folds: int):
+    from sklearn.model_selection import KFold, StratifiedKFold
+
+    if resolved_type == ProblemType.REGRESSION.value:
+        return KFold(n_splits=cv_folds, shuffle=True, random_state=42)
+    return StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+
+
 def _run_job(
     job_id: str,
     df: Optional[pd.DataFrame] = None,
@@ -360,7 +373,7 @@ def _run_job(
 ) -> None:
     import optuna
     from sklearn.base import clone
-    from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
+    from sklearn.model_selection import cross_val_score
     from sklearn.pipeline import Pipeline
     from model_code.model_factory import ModelFactory
 
@@ -382,11 +395,8 @@ def _run_job(
             job.problem_spec = spec.to_dict()
         bundle = prepare_train_pipeline(df, job.target_col, key_cols, problem_spec=spec)
         task_type = spec.resolved_type.value
-        if spec.resolved_type == ProblemType.REGRESSION:
-            cv = KFold(n_splits=job.cv_folds, shuffle=True, random_state=42)
-        else:
-            cv = StratifiedKFold(n_splits=job.cv_folds, shuffle=True, random_state=42)
-        direction = spec.metric_directions[job.optimization_metric]
+        cv = _cross_validator(task_type, job.cv_folds)
+        direction = _optimization_direction(spec, job.optimization_metric)
         study = optuna.create_study(direction=direction, sampler=optuna.samplers.TPESampler(seed=42))
         trial_history: List[Dict[str, Any]] = []
 
@@ -544,7 +554,10 @@ async def create_automl_job(
     try:
         for model_name in requested_models or []:
             validate_algorithm(spec, model_name)
-        bundle = prepare_train_pipeline(df, target, key_cols, problem_spec=spec)
+        valid_target_rows = int(df[target].notna().sum())
+        test_size = 0.25 if valid_target_rows >= 20 else 0.3
+        validate_train_test_split(spec, df[target], test_size)
+        bundle = prepare_train_pipeline(df, target, key_cols, test_size=test_size, problem_spec=spec)
         validate_cv(spec, bundle.y_train, cv_folds)
     except ProblemSpecError as exc:
         raise HTTPException(status_code=422, detail=exc.as_detail()) from exc
