@@ -33,7 +33,9 @@ const regressionRecord = {
   source: 'manual_training',
   name: 'reg',
   artifact_path: 'saved/manual_training/reg.joblib',
-  metrics: { optimization_metric: 'mae', rmse: 0.1, mae: 0.08, r2: 0.99 },
+  metrics: { rmse: 0.1, mae: 0.08, r2: 0.99 },
+  optimization_metric: 'mae',
+  best_metric: null,
   problem_type: 'regression',
   problem_spec: regressionSpec,
   legacy: false,
@@ -46,9 +48,22 @@ const classificationRecord = {
   source: 'automl',
   name: 'classifier',
   artifact_path: 'saved/automl/classifier.joblib',
-  metrics: { roc_auc: 0.72, val_auc: 0.7, accuracy: 0.8 },
+  metrics: { val_auc: 0.7, accuracy: 0.8 },
+  optimization_metric: 'val_auc',
+  best_metric: null,
   problem_type: 'binary_classification',
-  problem_spec: null,
+  problem_spec: {
+    ...regressionSpec,
+    resolved_type: 'binary_classification',
+    reason: 'binary_target',
+    explanation: '目标列具有两个类别，识别为二分类任务',
+    capabilities: {
+      algorithms: ['logistic_regression'],
+      metrics: ['val_auc', 'accuracy', 'f1'],
+      default_metric: 'val_auc',
+      metric_directions: { val_auc: 'maximize', accuracy: 'maximize', f1: 'maximize' },
+    },
+  },
   legacy: false,
   metadata_error: null,
   updated_at: 3,
@@ -60,6 +75,8 @@ const legacyRecord = {
   name: 'old',
   artifact_path: 'model_code/saved/old.joblib',
   metrics: { best_auc: 0.77, accuracy: 0.75 },
+  optimization_metric: null,
+  best_metric: null,
   problem_type: 'binary_classification',
   problem_spec: null,
   legacy: true,
@@ -73,6 +90,8 @@ const invalidMetadataRecord = {
   name: 'broken',
   artifact_path: 'saved/manual_training/broken.joblib',
   metrics: {},
+  optimization_metric: null,
+  best_metric: null,
   problem_type: null,
   problem_spec: null,
   legacy: false,
@@ -90,6 +109,12 @@ function refreshButton(wrapper: VueWrapper) {
   return wrapper.get('[data-testid="registry-refresh-button"]')
 }
 
+function tableRows(wrapper: VueWrapper, tableIndex: number) {
+  const body = wrapper.findAll('.el-table__body-wrapper tbody')[tableIndex]
+  if (!body) throw new Error(`Expected table body ${tableIndex}`)
+  return body.findAll('tr').map((row) => row.findAll('td .cell').map((cell) => cell.text().trim()))
+}
+
 describe('ModelRegistryView', () => {
   beforeEach(() => {
     registryMocks.listModels.mockReset()
@@ -100,15 +125,35 @@ describe('ModelRegistryView', () => {
     const wrapper = mount(ModelRegistryView, { global: { plugins: [ElementPlus] } })
     await flushPromises()
 
-    expect(wrapper.text()).toContain('模型管理')
-    expect(wrapper.text()).toContain('MAE 0.0800')
-    expect(wrapper.text()).toContain('ROC-AUC 0.7200')
-    expect(wrapper.text()).toContain('R²')
-    expect(wrapper.text()).toContain('0.9900')
-    expect(wrapper.text()).toContain('MAE')
-    expect(wrapper.text()).toContain('0.0800')
-    expect(wrapper.text()).toContain('RMSE')
-    expect(wrapper.text()).toContain('0.1000')
+    const mainRows = tableRows(wrapper, 0)
+    const compareRows = tableRows(wrapper, 1)
+
+    expect(mainRows[0]?.[2]).toBe('MAE 0.0800（越小越好）')
+    expect(mainRows[1]?.[2]).toBe('ROC-AUC 0.7000（越大越好）')
+    expect(compareRows[0]?.slice(2, 8)).toEqual([
+      'MAE 0.0800（越小越好）',
+      '-',
+      '-',
+      '0.9900（越大越好）',
+      '0.1000（越小越好）',
+      '0.0800（越小越好）',
+    ])
+    expect(compareRows[1]?.slice(2, 5)).toEqual([
+      'ROC-AUC 0.7000（越大越好）',
+      '0.7000（越大越好）',
+      '0.8000（越大越好）',
+    ])
+    wrapper.unmount()
+  })
+
+  it('does not invent a primary metric when persisted metric identity is unavailable', async () => {
+    registryMocks.listModels.mockResolvedValue({
+      models: [{ ...regressionRecord, optimization_metric: null, best_metric: null }],
+    })
+    const wrapper = mount(ModelRegistryView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    expect(tableRows(wrapper, 0)[0]?.[2]).toBe('-')
     wrapper.unmount()
   })
 
@@ -116,13 +161,13 @@ describe('ModelRegistryView', () => {
     const wrapper = mount(ModelRegistryView, { global: { plugins: [ElementPlus] } })
     await flushPromises()
 
-    expect(wrapper.text()).toContain('old')
-    expect(wrapper.text()).toContain('Legacy')
-    expect(wrapper.text()).toContain('ROC-AUC 0.7700')
-    expect(wrapper.text()).toContain('broken')
-    expect(wrapper.text()).toContain('元数据错误')
-    expect(wrapper.text()).toContain('problem_type')
-    expect(wrapper.text()).toContain('schema-v3 模型缺少有效的问题类型')
+    const mainRows = tableRows(wrapper, 0)
+    expect(mainRows[2]).toEqual(expect.arrayContaining(['ROC-AUC 0.7700', 'Legacy 分类', '旧模型兼容模式']))
+    expect(mainRows[3]).toEqual(expect.arrayContaining([
+      '元数据错误',
+      '不可用',
+      'problem_type：schema-v3 模型缺少有效的问题类型',
+    ]))
     wrapper.unmount()
   })
 

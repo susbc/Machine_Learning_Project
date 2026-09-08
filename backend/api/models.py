@@ -50,6 +50,8 @@ def _try_load_registry_metadata(path: Path) -> Dict[str, Any]:
     """
     metadata: Dict[str, Any] = {
         "metrics": {},
+        "optimization_metric": None,
+        "best_metric": None,
         "problem_type": None,
         "problem_spec": None,
         "legacy": True,
@@ -84,6 +86,19 @@ def _try_load_registry_metadata(path: Path) -> Dict[str, Any]:
     metadata["legacy"] = problem_type is None
     if problem_type is None:
         return metadata
+
+    decision_summary = artifact.get("decision_summary")
+    persisted_optimization_metric = artifact.get("optimization_metric")
+    if not isinstance(persisted_optimization_metric, str) and isinstance(decision_summary, dict):
+        persisted_optimization_metric = decision_summary.get("optimization_metric")
+    if isinstance(persisted_optimization_metric, str) and persisted_optimization_metric.strip():
+        metadata["optimization_metric"] = persisted_optimization_metric.strip()
+
+    persisted_best_metric = artifact.get("best_metric")
+    if not isinstance(persisted_best_metric, str):
+        persisted_best_metric = artifact.get("metric")
+    if isinstance(persisted_best_metric, str) and persisted_best_metric.strip():
+        metadata["best_metric"] = persisted_best_metric.strip()
 
     problem_spec = artifact.get("problem_spec")
     if isinstance(problem_spec, ProblemSpec):

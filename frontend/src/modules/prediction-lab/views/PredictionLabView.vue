@@ -153,6 +153,7 @@ const batchPredicting = ref(false)
 const errorMessage = ref('')
 let predictionRequestGeneration = 0
 let batchRequestGeneration = 0
+let csvReadGeneration = 0
 
 const canPredict = computed(() => Boolean(selectedModelId.value && featureJson.value.trim()))
 const canBatchPredict = computed(() => Boolean(selectedModelId.value && batchRows.value.length > 0))
@@ -164,7 +165,7 @@ async function loadModels() {
   errorMessage.value = ''
   try {
     const records = (await modelsApi.listModels()).models
-      .filter((model) => !model.legacy && !model.metadata_error)
+      .filter((model) => !model.metadata_error)
     models.value = records
     selectedModelId.value = records.some((model) => model.model_id === selectedModelId.value)
       ? selectedModelId.value
@@ -259,14 +260,21 @@ function parseCsvText(text: string) {
 }
 
 async function onCsvSelected(event: Event) {
+  const readGeneration = ++csvReadGeneration
+  batchRows.value = []
+  invalidateBatchResult()
+  errorMessage.value = ''
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
-  if (!file) {
-    batchRows.value = []
-    invalidateBatchResult()
-    return
+  if (!file) return
+  try {
+    const text = await file.text()
+    if (readGeneration !== csvReadGeneration) return
+    parseCsvText(text)
+  } catch (error) {
+    if (readGeneration !== csvReadGeneration) return
+    errorMessage.value = error instanceof Error ? error.message : 'CSV 文件读取失败'
   }
-  parseCsvText(await file.text())
 }
 
 async function runBatchPrediction() {
