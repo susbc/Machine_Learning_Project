@@ -424,7 +424,7 @@ def feature_importance_rows(model: Any, feature_names: List[str], top_n: int = 3
     return sorted(rows, key=lambda item: item["importance"], reverse=True)[:top_n]
 
 
-def _artifact_problem_type(artifact: Dict[str, Any]) -> Optional[ProblemType]:
+def resolve_artifact_problem_type(artifact: Dict[str, Any]) -> Optional[ProblemType]:
     """校验 schema-v3 的持久化任务语义；旧产物返回 None。"""
     if "artifact_schema_version" not in artifact:
         return None
@@ -490,7 +490,7 @@ def predict_with_artifact(artifact: Dict[str, Any], features_list: List[Dict[str
     label_encoder = artifact.get("label_encoder")
     preprocessor = artifact.get("preprocessor")
     executor = artifact.get("feature_executor")
-    artifact_problem_type = _artifact_problem_type(artifact)
+    artifact_problem_type = resolve_artifact_problem_type(artifact)
     is_regression = artifact_problem_type == ProblemType.REGRESSION
 
     frame = pd.DataFrame(features_list)

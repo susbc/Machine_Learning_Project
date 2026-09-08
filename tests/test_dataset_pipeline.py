@@ -20,8 +20,9 @@ from backend.api._dataset import (
     feature_importance_rows,
     prepare_train_pipeline,
     predict_with_artifact,
+    resolve_artifact_problem_type,
 )
-from core.automl.problem_spec import resolve_problem_spec
+from core.automl.problem_spec import ProblemType, resolve_problem_spec
 
 
 def _sample_df(n: int = 80) -> pd.DataFrame:
@@ -429,6 +430,19 @@ def test_schema_v3_regression_prediction_uses_nested_persisted_problem_spec():
         "probability": None,
         "diagnostics": {"unknown_input_keys": [], "missing_columns_imputed": []},
     }
+
+
+def test_resolve_artifact_problem_type_uses_persisted_schema_semantics():
+    spec = resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "price", "regression")
+
+    assert resolve_artifact_problem_type({}) is None
+    assert resolve_artifact_problem_type({"artifact_schema_version": np.int64(2)}) is None
+    assert resolve_artifact_problem_type(
+        {"artifact_schema_version": 3, "problem_type": "REGRESSION"}
+    ) == ProblemType.REGRESSION
+    assert resolve_artifact_problem_type(
+        {"artifact_schema_version": 3, "problem_spec": spec}
+    ) == ProblemType.REGRESSION
 
 
 @pytest.mark.parametrize(
