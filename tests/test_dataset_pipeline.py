@@ -6,6 +6,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+from fastapi import HTTPException
 
 from backend.api._dataset import (
     TrainBundle,
@@ -222,6 +223,37 @@ def test_compute_regression_metrics_returns_only_regression_metrics():
     }
 
 
+class _FixedPredictionRegressor:
+    def __init__(self, predictions):
+        self.predictions = np.asarray(predictions, dtype=float)
+
+    def predict(self, X):
+        assert len(X) == len(self.predictions)
+        return self.predictions
+
+
+def test_regression_metrics_preserve_each_optimization_direction():
+    X_test = [[0], [1], [2]]
+    y_test = [1.0, 3.0, 5.0]
+
+    better = compute_regression_metrics(_FixedPredictionRegressor([1.0, 2.0, 5.0]), X_test, y_test)
+    worse = compute_regression_metrics(_FixedPredictionRegressor([0.0, 1.0, 7.0]), X_test, y_test)
+
+    assert better == {
+        "rmse": pytest.approx(np.sqrt(1.0 / 3.0)),
+        "mae": pytest.approx(1.0 / 3.0),
+        "r2": pytest.approx(0.875),
+    }
+    assert worse == {
+        "rmse": pytest.approx(np.sqrt(3.0)),
+        "mae": pytest.approx(5.0 / 3.0),
+        "r2": pytest.approx(-0.125),
+    }
+    assert better["rmse"] < worse["rmse"]
+    assert better["mae"] < worse["mae"]
+    assert better["r2"] > worse["r2"]
+
+
 # ---------- feature_importance_rows ----------
 
 
@@ -329,6 +361,42 @@ def test_schema_v3_regression_prediction_has_no_class_fields():
     assert result["probability"] is None
 
 
+class _ClassificationPoisonedRegressor:
+    classes_ = np.array([0, 1])
+
+    def predict(self, X):
+        return np.full(len(X), 7.25, dtype=float)
+
+    def predict_proba(self, X):
+        raise AssertionError("regression inference called predict_proba")
+
+
+class _ClassificationPoisonedLabelEncoder:
+    def inverse_transform(self, values):
+        raise AssertionError("regression inference called label decoding")
+
+
+def test_schema_v3_regression_bypasses_all_classification_only_mechanisms():
+    result = predict_with_artifact(
+        {
+            "artifact_schema_version": 3,
+            "problem_type": "regression",
+            "model": _ClassificationPoisonedRegressor(),
+            "label_encoder": _ClassificationPoisonedLabelEncoder(),
+            "decision_threshold": 0.99,
+            "feature_columns": ["x"],
+        },
+        [{"x": 4}],
+    )[0]
+
+    assert result == {
+        "prediction": pytest.approx(7.25),
+        "encoded_prediction": None,
+        "probability": None,
+        "diagnostics": {"unknown_input_keys": [], "missing_columns_imputed": []},
+    }
+
+
 def test_schema_v3_regression_prediction_uses_nested_persisted_problem_spec():
     from sklearn.linear_model import LinearRegression
 
@@ -352,6 +420,54 @@ def test_schema_v3_regression_prediction_uses_nested_persisted_problem_spec():
         "probability": None,
         "diagnostics": {"unknown_input_keys": [], "missing_columns_imputed": []},
     }
+
+
+@pytest.mark.parametrize(
+    "task_metadata",
+    [
+        {},
+        {"problem_type": "clustering"},
+        {"problem_type": "auto"},
+        {"problem_spec": {"resolved_type": 17}},
+    ],
+)
+def test_schema_v3_prediction_rejects_missing_or_invalid_persisted_problem_type(task_metadata):
+    from sklearn.linear_model import LinearRegression
+
+    model = LinearRegression().fit([[0], [1]], [1.0, 3.0])
+    artifact = {
+        "artifact_schema_version": 3,
+        "model": model,
+        "feature_columns": ["x"],
+        **task_metadata,
+    }
+
+    with pytest.raises(HTTPException) as error:
+        predict_with_artifact(artifact, [{"x": 2}])
+
+    assert error.value.status_code == 400
+    assert error.value.detail["code"] == "invalid_artifact_problem_type"
+    assert error.value.detail["field"] == "problem_type"
+
+
+def test_schema_v3_classification_prediction_accepts_canonical_persisted_type():
+    from sklearn.linear_model import LogisticRegression
+
+    model = LogisticRegression().fit([[0], [1], [2], [3]], [0, 0, 1, 1])
+
+    result = predict_with_artifact(
+        {
+            "artifact_schema_version": 3,
+            "problem_type": "binary_classification",
+            "model": model,
+            "feature_columns": ["x"],
+        },
+        [{"x": 3}],
+    )[0]
+
+    assert result["prediction"] == 1.0
+    assert result["encoded_prediction"] == 1.0
+    assert 0.5 < result["probability"] <= 1.0
 
 
 def test_predict_v2_diagnostics_for_unknown_missing_and_typo_keys():
