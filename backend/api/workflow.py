@@ -61,6 +61,7 @@ from ._workflow_artifacts import (
     artifact_transaction_lock,
     begin_artifact_transaction,
     cleanup_artifact_transaction,
+    committed_completed_state,
     iter_visible_workflow_artifact_paths,
     publish_staged_artifact,
     reconcile_workflow_artifact_paths,
@@ -118,11 +119,8 @@ def _claim_workflow_run(task_id: str) -> WorkflowRunControl:
                 },
             )
         persisted = _read_workflow_state(task_id)
-        previous_completed_state = (
-            dict(persisted)
-            if persisted is not None and persisted.get("status") == "completed"
-            else None
-        )
+        committed_state = committed_completed_state(persisted)
+        previous_completed_state = dict(committed_state) if committed_state else None
         control = WorkflowRunControl(
             uuid.uuid4().hex,
             threading.Event(),
@@ -146,8 +144,11 @@ def _write_run_state(
     task_id: str, run_id: str, payload: Dict[str, Any], *, allow_cancelled: bool = False
 ) -> None:
     with workflow_run_lock:
-        _require_current_run(task_id, run_id, allow_cancelled=allow_cancelled)
-        _write_workflow_state(task_id, {"run_id": run_id, **payload})
+        control = _require_current_run(task_id, run_id, allow_cancelled=allow_cancelled)
+        state = {"run_id": run_id, **payload}
+        if control.previous_completed_state is not None and state.get("status") != "completed":
+            state["committed_artifact_state"] = control.previous_completed_state
+        _write_workflow_state(task_id, state)
 
 
 def _commit_completed_run(
@@ -217,11 +218,14 @@ def _finalize_unsuccessful_run(
 ) -> None:
     """Persist a failed/cancelled terminal state and remove only this run's artifact."""
     with workflow_run_lock:
-        _require_current_run(task_id, run_id, allow_cancelled=True)
+        control = _require_current_run(task_id, run_id, allow_cancelled=True)
         artifact_path = get_saved_path(f"model_{validate_task_id(task_id)}.pkl")
         if _artifact_belongs_to_run(artifact_path, run_id):
             artifact_path.unlink()
-        _write_workflow_state(task_id, {"run_id": run_id, **payload})
+        state = {"run_id": run_id, **payload}
+        if control.previous_completed_state is not None:
+            state["committed_artifact_state"] = control.previous_completed_state
+        _write_workflow_state(task_id, state)
         active_workflow_runs.pop(task_id, None)
 
 
@@ -1745,7 +1749,7 @@ async def get_task_status(task_id: str):
                 {
                     key: value
                     for key, value in persisted_state.items()
-                    if key not in {"task_id", "files"}
+                    if key not in {"task_id", "files", "committed_artifact_state"}
                 }
             )
 

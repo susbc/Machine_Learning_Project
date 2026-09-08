@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 TRANSACTION_SCHEMA_VERSION = 1
 WORKFLOW_STATE_FILENAME = "workflow_state.json"
+COMMITTED_ARTIFACT_STATE_KEY = "committed_artifact_state"
 artifact_transaction_lock = threading.RLock()
 
 
@@ -110,6 +111,21 @@ def artifact_run_id(path: Path) -> Optional[str]:
         return None
     run_id = artifact.get("run_id")
     return run_id if isinstance(run_id, str) and run_id else None
+
+
+def committed_completed_state(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not state:
+        return None
+    if state.get("status") == "completed" and isinstance(state.get("run_id"), str):
+        return state
+    previous = state.get(COMMITTED_ARTIFACT_STATE_KEY)
+    if (
+        isinstance(previous, dict)
+        and previous.get("status") == "completed"
+        and isinstance(previous.get("run_id"), str)
+    ):
+        return previous
+    return None
 
 
 def _journal_payload(
@@ -276,13 +292,10 @@ def reconcile_workflow_artifact_paths(artifact: Path, state_path: Path, task_id:
         if canonical_run_id is None:
             return True
         state = _read_json(state_path)
-        if not state:
+        completed_state = committed_completed_state(state)
+        if completed_state is None:
             return False
-        if state.get("status") == "completed":
-            return state.get("run_id") == canonical_run_id
-        # While a newer run is active/failed, the different canonical run is the
-        # last-known-good model.  A same-run non-completed artifact is unpublished.
-        return state.get("run_id") != canonical_run_id
+        return completed_state.get("run_id") == canonical_run_id
 
 
 def reconcile_workflow_artifact(project_root: Path, task_id: str) -> bool:
