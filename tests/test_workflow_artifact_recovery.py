@@ -112,6 +112,193 @@ def _transaction_residue(artifact_path: Path, run_id: str) -> list[Path]:
     return sorted(residue)
 
 
+def _write_v1_transaction(
+    task_id: str,
+    artifact_path: Path,
+    *,
+    old_run_id: str,
+    new_run_id: str,
+    stage: str,
+    previous_completed_state: dict,
+) -> workflow_artifacts.WorkflowArtifactPaths:
+    state_path = workflow_artifacts.workflow_state_path(artifact_path.parents[1], task_id)
+    paths = workflow_artifacts.workflow_transaction_paths(
+        artifact_path,
+        state_path,
+        task_id,
+        new_run_id,
+    )
+    # Literal shape written by b8bfeab, before v2 identity/checksum fields existed.
+    paths.journal.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_id": task_id,
+                "new_run_id": new_run_id,
+                "old_run_id": old_run_id,
+                "artifact_name": artifact_path.name,
+                "staged_name": paths.staged.name,
+                "backup_name": paths.backup.name,
+                "stage": stage,
+                "previous_completed_state": previous_completed_state,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return paths
+
+
+def _write_running_state_with_old_evidence(task_id: str, new_run_id: str, old_run_id: str) -> None:
+    workflow._write_workflow_state(
+        task_id,
+        {
+            "run_id": new_run_id,
+            "status": "running",
+            "committed_artifact_state": _state(old_run_id),
+        },
+    )
+
+
+@pytest.mark.parametrize("stage", ["prepared", "backed_up"])
+def test_v1_prepublication_journal_keeps_committed_old_canonical(
+    recovery_paths, stage
+):
+    task_id, artifact_path = recovery_paths
+    old_run_id = "old-run"
+    new_run_id = "new-run"
+    joblib.dump(_artifact(old_run_id, 10.0), artifact_path)
+    original_bytes = artifact_path.read_bytes()
+    _write_running_state_with_old_evidence(task_id, new_run_id, old_run_id)
+    paths = _write_v1_transaction(
+        task_id,
+        artifact_path,
+        old_run_id=old_run_id,
+        new_run_id=new_run_id,
+        stage=stage,
+        previous_completed_state=_state(old_run_id),
+    )
+    joblib.dump(_artifact(new_run_id, 20.0), paths.staged)
+    if stage == "prepared":
+        paths.backup.write_bytes(b"partial-backup")
+    else:
+        joblib.dump(_artifact(old_run_id, 10.0), paths.backup)
+
+    assert len(_registry_workflow_records(task_id)) == 1
+    assert artifact_path.read_bytes() == original_bytes
+    assert joblib.load(artifact_path)["run_id"] == old_run_id
+    _assert_prediction_uses_run(task_id, 20.0)
+    assert _transaction_residue(artifact_path, new_run_id) == []
+
+
+@pytest.mark.parametrize("stage", ["backed_up", "published"])
+def test_v1_postbackup_journal_restores_old_backup_before_state_commit(
+    recovery_paths, stage
+):
+    task_id, artifact_path = recovery_paths
+    old_run_id = "old-run"
+    new_run_id = "new-run"
+    joblib.dump(_artifact(new_run_id, 20.0), artifact_path)
+    _write_running_state_with_old_evidence(task_id, new_run_id, old_run_id)
+    paths = _write_v1_transaction(
+        task_id,
+        artifact_path,
+        old_run_id=old_run_id,
+        new_run_id=new_run_id,
+        stage=stage,
+        previous_completed_state=_state(old_run_id),
+    )
+    joblib.dump(_artifact(old_run_id, 10.0), paths.backup)
+
+    assert len(_registry_workflow_records(task_id)) == 1
+    assert joblib.load(artifact_path)["run_id"] == old_run_id
+    state = json.loads(paths.state.read_text(encoding="utf-8"))
+    assert state["status"] == "completed"
+    assert state["run_id"] == old_run_id
+    _assert_prediction_uses_run(task_id, 20.0)
+    assert _transaction_residue(artifact_path, new_run_id) == []
+
+
+def test_v1_published_journal_keeps_new_canonical_after_completed_state(recovery_paths):
+    task_id, artifact_path = recovery_paths
+    old_run_id = "old-run"
+    new_run_id = "new-run"
+    joblib.dump(_artifact(new_run_id, 20.0), artifact_path)
+    workflow._write_workflow_state(task_id, _state(new_run_id))
+    paths = _write_v1_transaction(
+        task_id,
+        artifact_path,
+        old_run_id=old_run_id,
+        new_run_id=new_run_id,
+        stage="published",
+        previous_completed_state=_state(old_run_id),
+    )
+    joblib.dump(_artifact(old_run_id, 10.0), paths.backup)
+
+    assert len(_registry_workflow_records(task_id)) == 1
+    assert joblib.load(artifact_path)["run_id"] == new_run_id
+    _assert_prediction_uses_run(task_id, 30.0)
+    assert _transaction_residue(artifact_path, new_run_id) == []
+
+
+@pytest.mark.parametrize("backup_kind", ["unreadable", "wrong_run"])
+def test_v1_published_journal_preserves_recovery_material_when_backup_is_unsafe(
+    recovery_paths, backup_kind
+):
+    task_id, artifact_path = recovery_paths
+    old_run_id = "old-run"
+    new_run_id = "new-run"
+    joblib.dump(_artifact(new_run_id, 20.0), artifact_path)
+    _write_running_state_with_old_evidence(task_id, new_run_id, old_run_id)
+    paths = _write_v1_transaction(
+        task_id,
+        artifact_path,
+        old_run_id=old_run_id,
+        new_run_id=new_run_id,
+        stage="published",
+        previous_completed_state=_state(old_run_id),
+    )
+    if backup_kind == "unreadable":
+        paths.backup.write_bytes(b"not-a-joblib-artifact")
+    else:
+        joblib.dump(_artifact("unrelated-run", 99.0), paths.backup)
+
+    assert not workflow_artifacts.reconcile_workflow_artifact_paths(
+        artifact_path,
+        paths.state,
+        task_id,
+    )
+    assert joblib.load(artifact_path)["run_id"] == new_run_id
+    assert paths.backup.exists()
+    assert paths.journal.exists()
+
+
+def test_new_transactions_persist_schema_v2(recovery_paths, monkeypatch):
+    task_id, artifact_path = recovery_paths
+    old_run_id = "old-run"
+    new_run_id = "new-run"
+    joblib.dump(_artifact(old_run_id, 10.0), artifact_path)
+    workflow._write_workflow_state(task_id, _state(old_run_id))
+    _start_commit(task_id, new_run_id)
+
+    def stop_before_publish(paths, payload):
+        raise SimulatedProcessStop("inspect durable journal")
+
+    monkeypatch.setattr(workflow, "publish_staged_artifact", stop_before_publish)
+    with pytest.raises(SimulatedProcessStop):
+        workflow._commit_completed_run(
+            task_id,
+            new_run_id,
+            _artifact(new_run_id, 20.0),
+            artifact_path,
+            _state(new_run_id),
+        )
+
+    journal = json.loads(
+        workflow_artifacts.workflow_journal_path(artifact_path).read_text(encoding="utf-8")
+    )
+    assert journal["schema_version"] == 2
+
+
 def test_recovery_keeps_old_canonical_if_process_stops_after_backup_before_replace(
     recovery_paths, monkeypatch
 ):

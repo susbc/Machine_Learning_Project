@@ -22,7 +22,8 @@ import joblib
 
 logger = logging.getLogger(__name__)
 
-TRANSACTION_SCHEMA_VERSION = 1
+LEGACY_TRANSACTION_SCHEMA_VERSION = 1
+TRANSACTION_SCHEMA_VERSION = 2
 WORKFLOW_STATE_FILENAME = "workflow_state.json"
 COMMITTED_ARTIFACT_STATE_KEY = "committed_artifact_state"
 artifact_transaction_lock = threading.RLock()
@@ -207,6 +208,23 @@ def committed_completed_state(state: Optional[Dict[str, Any]]) -> Optional[Dict[
     return None
 
 
+def _v1_old_completed_evidence(
+    journal: Dict[str, Any],
+    state: Optional[Dict[str, Any]],
+    old_run_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return unambiguous v1 evidence that ``old_run_id`` was committed."""
+    candidates = [journal.get("previous_completed_state"), committed_completed_state(state)]
+    completed = [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("status") == "completed"
+    ]
+    if not completed or any(candidate.get("run_id") != old_run_id for candidate in completed):
+        return None
+    return dict(completed[0])
+
+
 def _journal_payload(
     paths: WorkflowArtifactPaths,
     run_id: str,
@@ -302,7 +320,8 @@ def _paths_from_journal(
     journal: Dict[str, Any],
 ) -> Optional[WorkflowArtifactPaths]:
     if (
-        journal.get("schema_version") != TRANSACTION_SCHEMA_VERSION
+        journal.get("schema_version")
+        not in {LEGACY_TRANSACTION_SCHEMA_VERSION, TRANSACTION_SCHEMA_VERSION}
         or journal.get("task_id") != task_id
         or not isinstance(journal.get("new_run_id"), str)
     ):
@@ -342,6 +361,59 @@ def _mark_interrupted_first_run(paths: WorkflowArtifactPaths, journal: Dict[str,
         )
 
 
+def _reconcile_v1_transaction(
+    paths: WorkflowArtifactPaths,
+    journal: Dict[str, Any],
+    state: Optional[Dict[str, Any]],
+    canonical_identity: ArtifactIdentity,
+) -> bool:
+    """Conservatively reconcile the checksum-less journal written by b8bfeab."""
+    stage = journal.get("stage")
+    if stage not in {"prepared", "backed_up", "published"}:
+        return False
+
+    old_run_id = journal.get("old_run_id")
+    old_completed_state = (
+        _v1_old_completed_evidence(journal, state, old_run_id)
+        if isinstance(old_run_id, str) and old_run_id
+        else None
+    )
+    canonical_is_old_run = (
+        old_completed_state is not None
+        and canonical_identity.kind == "run_owned"
+        and canonical_identity.run_id == old_run_id
+    )
+    canonical_is_legacy_old = old_run_id is None and canonical_identity.kind == "legacy"
+    if canonical_is_old_run or canonical_is_legacy_old:
+        if old_completed_state is not None:
+            write_json_atomic(paths.state, old_completed_state)
+        cleanup_artifact_transaction(paths)
+        return True
+
+    # A v1 prepared backup may be partial: it is never recovery evidence.
+    if stage == "prepared":
+        return False
+
+    backup_identity = inspect_artifact_identity(paths.backup)
+    backup_is_old_run = (
+        old_completed_state is not None
+        and backup_identity.kind == "run_owned"
+        and backup_identity.run_id == old_run_id
+    )
+    backup_is_legacy_old = old_run_id is None and backup_identity.kind == "legacy"
+    if not (backup_is_old_run or backup_is_legacy_old):
+        # v1 has no digest. Keep every recovery file when identity/evidence is
+        # ambiguous instead of destructively "cleaning" the only possible LKG.
+        return False
+
+    os.replace(paths.backup, paths.artifact)
+    _fsync_directory(paths.artifact.parent)
+    if old_completed_state is not None:
+        write_json_atomic(paths.state, old_completed_state)
+    cleanup_artifact_transaction(paths)
+    return True
+
+
 def reconcile_workflow_artifact_paths(artifact: Path, state_path: Path, task_id: str) -> bool:
     """Recover one interrupted publication and report canonical visibility."""
     journal_path = workflow_journal_path(artifact)
@@ -365,26 +437,39 @@ def reconcile_workflow_artifact_paths(artifact: Path, state_path: Path, task_id:
                 cleanup_artifact_transaction(paths)
                 return True
 
-            canonical_is_old = _matches_recorded_old_artifact(paths.artifact, journal)
-            backup_is_ready = (
-                journal.get("stage") == "backup_ready"
-                and _matches_recorded_old_artifact(paths.backup, journal)
-            )
-            if canonical_is_old:
-                _restore_previous_state(paths, journal)
-            elif backup_is_ready:
-                os.replace(paths.backup, paths.artifact)
-                _fsync_directory(paths.artifact.parent)
-                _restore_previous_state(paths, journal)
-            else:
-                if (
-                    canonical_identity.kind == "run_owned"
-                    and canonical_identity.run_id == journal.get("new_run_id")
+            if journal.get("schema_version") == LEGACY_TRANSACTION_SCHEMA_VERSION:
+                if not _reconcile_v1_transaction(
+                    paths,
+                    journal,
+                    state,
+                    canonical_identity,
                 ):
-                    paths.artifact.unlink(missing_ok=True)
+                    logger.error(
+                        "旧版工作流 artifact 事务证据不足，保留恢复材料 task_id=%s",
+                        task_id,
+                    )
+                    return False
+            else:
+                canonical_is_old = _matches_recorded_old_artifact(paths.artifact, journal)
+                backup_is_ready = (
+                    journal.get("stage") == "backup_ready"
+                    and _matches_recorded_old_artifact(paths.backup, journal)
+                )
+                if canonical_is_old:
+                    _restore_previous_state(paths, journal)
+                elif backup_is_ready:
+                    os.replace(paths.backup, paths.artifact)
                     _fsync_directory(paths.artifact.parent)
-                _mark_interrupted_first_run(paths, journal)
-            cleanup_artifact_transaction(paths)
+                    _restore_previous_state(paths, journal)
+                else:
+                    if (
+                        canonical_identity.kind == "run_owned"
+                        and canonical_identity.run_id == journal.get("new_run_id")
+                    ):
+                        paths.artifact.unlink(missing_ok=True)
+                        _fsync_directory(paths.artifact.parent)
+                    _mark_interrupted_first_run(paths, journal)
+                cleanup_artifact_transaction(paths)
 
         canonical_identity = inspect_artifact_identity(artifact)
         if canonical_identity.kind in {"absent", "invalid"}:
