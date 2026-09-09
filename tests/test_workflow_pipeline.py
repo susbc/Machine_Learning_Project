@@ -142,8 +142,10 @@ def test_workflow_public_endpoints_do_not_expose_internal_exception_paths(tmp_pa
     assert retrieve.json()["detail"] == "数据提取失败，请检查查询配置后重试"
     assert features.status_code == 500
     assert features.json()["detail"] == "特征策略生成失败，请检查任务配置后重试"
-    assert prediction.status_code == 500
-    assert prediction.json()["detail"] == "模型预测失败，请检查输入后重试"
+    # Unreadable workflow artifacts fail closed during reconciliation rather
+    # than being exposed as loadable legacy models.
+    assert prediction.status_code == 404
+    assert prediction.json()["detail"] == f"模型未找到：{task_id}，请先训练模型"
     assert all("/private/" not in response.text for response in (retrieve, features, prediction))
 
 

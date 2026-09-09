@@ -30,6 +30,12 @@ def _artifact(run_id: str, offset: float) -> dict:
     }
 
 
+def _legacy_artifact(offset: float) -> dict:
+    artifact = _artifact("legacy-placeholder", offset)
+    artifact.pop("run_id")
+    return artifact
+
+
 def _state(run_id: str, status: str = "completed") -> dict:
     return {
         "run_id": run_id,
@@ -142,6 +148,123 @@ def test_recovery_keeps_old_canonical_if_process_stops_after_backup_before_repla
     _assert_workflow_prediction_uses_run(task_id, 20.0)
     _assert_prediction_uses_run(task_id, 20.0)
     assert _transaction_residue(artifact_path, new_run_id) == []
+
+
+def test_recovery_keeps_legacy_canonical_when_copy_stops_with_partial_prepared_backup(
+    recovery_paths, monkeypatch
+):
+    task_id, artifact_path = recovery_paths
+    new_run_id = "new-run"
+    joblib.dump(_legacy_artifact(10.0), artifact_path)
+    original_bytes = artifact_path.read_bytes()
+    _start_commit(task_id, new_run_id)
+    original_copy = workflow_artifacts.shutil.copy2
+
+    def stop_mid_copy(source, destination, *args, **kwargs):
+        with open(source, "rb") as source_handle, open(destination, "wb") as destination_handle:
+            destination_handle.write(source_handle.read(max(1, len(original_bytes) // 4)))
+            destination_handle.flush()
+            os.fsync(destination_handle.fileno())
+        raise SimulatedProcessStop("partial backup while journal is prepared")
+
+    monkeypatch.setattr(workflow_artifacts.shutil, "copy2", stop_mid_copy)
+    with pytest.raises(SimulatedProcessStop):
+        workflow._commit_completed_run(
+            task_id,
+            new_run_id,
+            _artifact(new_run_id, 20.0),
+            artifact_path,
+            _state(new_run_id),
+        )
+
+    workflow.active_workflow_runs.clear()
+    monkeypatch.setattr(workflow_artifacts.shutil, "copy2", original_copy)
+    assert len(_registry_workflow_records(task_id)) == 1
+    assert artifact_path.read_bytes() == original_bytes
+    assert "run_id" not in joblib.load(artifact_path)
+    _assert_prediction_uses_run(task_id, 20.0)
+    assert _transaction_residue(artifact_path, new_run_id) == []
+
+
+@pytest.mark.parametrize("backup_mutation", ["unreadable", "checksum_mismatch"])
+def test_recovery_never_restores_invalid_or_checksum_mismatched_legacy_backup(
+    recovery_paths, monkeypatch, backup_mutation
+):
+    task_id, artifact_path = recovery_paths
+    new_run_id = "new-run"
+    joblib.dump(_legacy_artifact(10.0), artifact_path)
+    original_bytes = artifact_path.read_bytes()
+    _start_commit(task_id, new_run_id)
+
+    def stop_before_publish(paths, payload):
+        raise SimulatedProcessStop("backup complete, before artifact publication")
+
+    monkeypatch.setattr(workflow, "publish_staged_artifact", stop_before_publish)
+    with pytest.raises(SimulatedProcessStop):
+        workflow._commit_completed_run(
+            task_id,
+            new_run_id,
+            _artifact(new_run_id, 20.0),
+            artifact_path,
+            _state(new_run_id),
+        )
+
+    backup_path = artifact_path.with_name(f".{artifact_path.name}.{new_run_id}.backup")
+    if backup_mutation == "unreadable":
+        backup_path.write_bytes(b"not-a-joblib-artifact")
+    else:
+        joblib.dump(_legacy_artifact(99.0), backup_path)
+
+    workflow.active_workflow_runs.clear()
+    assert len(_registry_workflow_records(task_id)) == 1
+    assert artifact_path.read_bytes() == original_bytes
+    _assert_prediction_uses_run(task_id, 20.0)
+    assert _transaction_residue(artifact_path, new_run_id) == []
+
+
+def test_recovery_restores_verified_legacy_backup_after_new_artifact_was_published(
+    recovery_paths, monkeypatch
+):
+    task_id, artifact_path = recovery_paths
+    new_run_id = "new-run"
+    joblib.dump(_legacy_artifact(10.0), artifact_path)
+    original_bytes = artifact_path.read_bytes()
+    _start_commit(task_id, new_run_id)
+    original_replace = os.replace
+
+    def stop_after_publish(source, destination):
+        original_replace(source, destination)
+        if Path(destination) == artifact_path:
+            raise SimulatedProcessStop("new canonical published before state commit")
+
+    monkeypatch.setattr(workflow.os, "replace", stop_after_publish)
+    with pytest.raises(SimulatedProcessStop):
+        workflow._commit_completed_run(
+            task_id,
+            new_run_id,
+            _artifact(new_run_id, 20.0),
+            artifact_path,
+            _state(new_run_id),
+        )
+
+    workflow.active_workflow_runs.clear()
+    monkeypatch.setattr(workflow.os, "replace", original_replace)
+    assert len(_registry_workflow_records(task_id)) == 1
+    assert artifact_path.read_bytes() == original_bytes
+    _assert_prediction_uses_run(task_id, 20.0)
+    assert _transaction_residue(artifact_path, new_run_id) == []
+
+
+def test_registry_does_not_treat_unreadable_artifact_as_legacy(recovery_paths):
+    task_id, artifact_path = recovery_paths
+    artifact_path.write_bytes(b"not-a-joblib-artifact")
+
+    assert _registry_workflow_records(task_id) == []
+    prediction = TestClient(app).post(
+        f"/api/models/workflow%3Amodel_{task_id}/predict",
+        json={"features": {"feature": 10.0}},
+    )
+    assert prediction.status_code == 404
 
 
 def test_recovery_restores_old_if_process_stops_after_replace_before_state_commit(
