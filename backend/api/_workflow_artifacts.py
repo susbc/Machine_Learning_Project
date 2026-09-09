@@ -7,6 +7,7 @@ publication visibility rules without introducing a router import cycle.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -35,6 +36,19 @@ class WorkflowArtifactPaths:
     journal: Path
     staged: Path
     backup: Path
+
+
+@dataclass(frozen=True)
+class ArtifactIdentity:
+    """A load-validated artifact identity; invalid is distinct from legacy."""
+
+    kind: str
+    run_id: Optional[str] = None
+
+
+ABSENT_ARTIFACT = ArtifactIdentity("absent")
+INVALID_ARTIFACT = ArtifactIdentity("invalid")
+LEGACY_ARTIFACT = ArtifactIdentity("legacy")
 
 
 def workflow_artifact_path(project_root: Path, task_id: str) -> Path:
@@ -100,17 +114,82 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     return value if isinstance(value, dict) else None
 
 
-def artifact_run_id(path: Path) -> Optional[str]:
+def inspect_artifact_identity(path: Path) -> ArtifactIdentity:
     if not path.is_file():
-        return None
+        return ABSENT_ARTIFACT
     try:
         artifact = joblib.load(path)
     except Exception:
-        return None
+        return INVALID_ARTIFACT
     if not isinstance(artifact, dict):
-        return None
+        return INVALID_ARTIFACT
+    if "run_id" not in artifact:
+        return LEGACY_ARTIFACT
     run_id = artifact.get("run_id")
-    return run_id if isinstance(run_id, str) and run_id else None
+    if isinstance(run_id, str) and run_id:
+        return ArtifactIdentity("run_owned", run_id)
+    return INVALID_ARTIFACT
+
+
+def artifact_run_id(path: Path) -> Optional[str]:
+    """Return a run id for run-owned artifacts (legacy compatibility helper)."""
+    identity = inspect_artifact_identity(path)
+    return identity.run_id if identity.kind == "run_owned" else None
+
+
+def _artifact_integrity(path: Path) -> Optional[tuple[int, str]]:
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with open(path, "rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                size += len(chunk)
+                digest.update(chunk)
+    except OSError:
+        return None
+    return size, digest.hexdigest()
+
+
+def _identity_payload(identity: ArtifactIdentity) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"kind": identity.kind}
+    if identity.kind == "run_owned":
+        payload["run_id"] = identity.run_id
+    return payload
+
+
+def _identity_from_payload(payload: Any) -> Optional[ArtifactIdentity]:
+    if not isinstance(payload, dict):
+        return None
+    kind = payload.get("kind")
+    if kind in {"absent", "invalid", "legacy"}:
+        return ArtifactIdentity(kind)
+    run_id = payload.get("run_id")
+    if kind == "run_owned" and isinstance(run_id, str) and run_id:
+        return ArtifactIdentity(kind, run_id)
+    return None
+
+
+def _matches_recorded_old_artifact(
+    path: Path,
+    journal: Dict[str, Any],
+) -> bool:
+    expected_identity = _identity_from_payload(journal.get("old_artifact_identity"))
+    expected_size = journal.get("old_artifact_size")
+    expected_sha256 = journal.get("old_artifact_sha256")
+    if (
+        expected_identity is None
+        or expected_identity.kind not in {"legacy", "run_owned"}
+        or not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size < 0
+        or not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+    ):
+        return False
+    integrity = _artifact_integrity(path)
+    if integrity != (expected_size, expected_sha256):
+        return False
+    return inspect_artifact_identity(path) == expected_identity
 
 
 def committed_completed_state(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -132,14 +211,19 @@ def _journal_payload(
     paths: WorkflowArtifactPaths,
     run_id: str,
     previous_completed_state: Optional[Dict[str, Any]],
-    old_run_id: Optional[str],
+    old_identity: ArtifactIdentity,
+    old_integrity: Optional[tuple[int, str]],
     stage: str,
 ) -> Dict[str, Any]:
+    old_size, old_sha256 = old_integrity if old_integrity is not None else (None, None)
     return {
         "schema_version": TRANSACTION_SCHEMA_VERSION,
         "task_id": paths.task_id,
         "new_run_id": run_id,
-        "old_run_id": old_run_id,
+        "old_run_id": old_identity.run_id,
+        "old_artifact_identity": _identity_payload(old_identity),
+        "old_artifact_size": old_size,
+        "old_artifact_sha256": old_sha256,
         "artifact_name": paths.artifact.name,
         "staged_name": paths.staged.name,
         "backup_name": paths.backup.name,
@@ -160,20 +244,30 @@ def begin_artifact_transaction(
     previous_completed_state: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Journal the transaction and take a durable copy of the old canonical."""
-    old_run_id = artifact_run_id(paths.artifact)
+    old_identity = inspect_artifact_identity(paths.artifact)
+    old_integrity = (
+        _artifact_integrity(paths.artifact)
+        if old_identity.kind in {"legacy", "run_owned"}
+        else None
+    )
+    if old_integrity is None and old_identity.kind in {"legacy", "run_owned"}:
+        old_identity = INVALID_ARTIFACT
     payload = _journal_payload(
         paths,
         run_id,
         previous_completed_state,
-        old_run_id,
+        old_identity,
+        old_integrity,
         "prepared",
     )
     write_json_atomic(paths.journal, payload)
-    if paths.artifact.is_file():
+    if old_identity.kind in {"legacy", "run_owned"}:
         shutil.copy2(paths.artifact, paths.backup)
         _fsync_file(paths.backup)
         _fsync_directory(paths.backup.parent)
-    return update_transaction_stage(paths, payload, "backed_up")
+        if not _matches_recorded_old_artifact(paths.backup, payload):
+            raise OSError("工作流 artifact 备份完整性验证失败")
+    return update_transaction_stage(paths, payload, "backup_ready")
 
 
 def stage_workflow_artifact(paths: WorkflowArtifactPaths, artifact: Dict[str, Any]) -> None:
@@ -258,44 +352,51 @@ def reconcile_workflow_artifact_paths(artifact: Path, state_path: Path, task_id:
             if paths is None:
                 logger.error("拒绝损坏的工作流 artifact 事务 task_id=%s", task_id)
                 return False
-            canonical_run_id = artifact_run_id(paths.artifact)
+            canonical_identity = inspect_artifact_identity(paths.artifact)
             state = _read_json(paths.state)
             state_run_id = state.get("run_id") if state else None
             committed = (
-                canonical_run_id is not None
+                canonical_identity.kind == "run_owned"
                 and state is not None
                 and state.get("status") == "completed"
-                and state_run_id == canonical_run_id
+                and state_run_id == canonical_identity.run_id
             )
             if committed:
                 cleanup_artifact_transaction(paths)
                 return True
 
-            old_run_id = journal.get("old_run_id")
-            if paths.backup.is_file() and artifact_run_id(paths.backup) == old_run_id:
+            canonical_is_old = _matches_recorded_old_artifact(paths.artifact, journal)
+            backup_is_ready = (
+                journal.get("stage") == "backup_ready"
+                and _matches_recorded_old_artifact(paths.backup, journal)
+            )
+            if canonical_is_old:
+                _restore_previous_state(paths, journal)
+            elif backup_is_ready:
                 os.replace(paths.backup, paths.artifact)
                 _fsync_directory(paths.artifact.parent)
                 _restore_previous_state(paths, journal)
-            elif old_run_id is not None and canonical_run_id == old_run_id:
-                _restore_previous_state(paths, journal)
             else:
-                if canonical_run_id == journal.get("new_run_id"):
+                if (
+                    canonical_identity.kind == "run_owned"
+                    and canonical_identity.run_id == journal.get("new_run_id")
+                ):
                     paths.artifact.unlink(missing_ok=True)
                     _fsync_directory(paths.artifact.parent)
                 _mark_interrupted_first_run(paths, journal)
             cleanup_artifact_transaction(paths)
 
-        canonical_run_id = artifact_run_id(artifact)
-        if not artifact.is_file():
+        canonical_identity = inspect_artifact_identity(artifact)
+        if canonical_identity.kind in {"absent", "invalid"}:
             return False
         # Artifacts without a run id predate transactional workflow publication.
-        if canonical_run_id is None:
+        if canonical_identity.kind == "legacy":
             return True
         state = _read_json(state_path)
         completed_state = committed_completed_state(state)
         if completed_state is None:
             return False
-        return completed_state.get("run_id") == canonical_run_id
+        return completed_state.get("run_id") == canonical_identity.run_id
 
 
 def reconcile_workflow_artifact(project_root: Path, task_id: str) -> bool:
