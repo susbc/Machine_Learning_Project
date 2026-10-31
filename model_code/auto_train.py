@@ -20,7 +20,12 @@ from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import roc_auc_score, f1_score
 from sklearn.feature_selection import SelectFromModel
 from model_code.model_factory import ModelFactory
-from model_code.utils import ConfigDrivenPreprocessor, smart_sampling
+from model_code.utils import (
+    ConfigDrivenPreprocessor,
+    auto_generate_field_config,
+    read_file_from_path,
+    smart_sampling,
+)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -427,8 +432,6 @@ class AutoTrainer:
         Returns:
             AutoTrainer 实例
         """
-        from web_app.utils.file_handler import read_file_from_path
-
         df = read_file_from_path(file_path)
         if df is None:
             raise ValueError(f"无法读取文件：{file_path}")
@@ -612,57 +615,6 @@ class AutoTrainer:
         )
         
         return fig
-
-
-def auto_generate_field_config(
-    df: pd.DataFrame,
-    label_col: str,
-    key_col: Optional[str] = None
-) -> pd.DataFrame:
-    """
-    根据 DataFrame 自动生成字段配置
-
-    使用 infer_field_type 自动推断字段类型，并设置合理的默认处理规则。
-
-    Args:
-        df: 输入 DataFrame
-        label_col: 目标变量列名
-        key_col: 可选，ID/键列名
-
-    Returns:
-        配置 DataFrame，包含 field_name, field_type, outlier_value,
-        missing_value, ecode_type, standardize_type 列
-    """
-    from web_app.utils.file_handler import infer_field_type
-
-    config_data = []
-
-    for col in df.columns:
-        if col == label_col:
-            field_type = "label"
-        elif col == key_col:
-            field_type = "key"
-        else:
-            field_type = infer_field_type(df[col])
-
-        # 缺失值处理默认规则
-        missing_value = np.nan
-        if df[col].isna().sum() > 0:
-            if field_type == 'num':
-                missing_value = 'mean'
-            else:
-                missing_value = 'mode'
-
-        config_data.append({
-            "field_name": col,
-            "field_type": field_type,
-            "outlier_value": np.nan,
-            "missing_value": missing_value,
-            "ecode_type": "one-hot" if field_type == "str" else np.nan,
-            "standardize_type": "z-score" if field_type == "num" else np.nan,
-        })
-
-    return pd.DataFrame(config_data)
 
 
 def run_auto_training(

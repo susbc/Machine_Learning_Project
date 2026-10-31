@@ -13,6 +13,14 @@ import io
 import csv
 import chardet
 
+# 以下三个函数的实现已下沉到 model_code.utils（不依赖 streamlit），此处再导出
+# 以保持 Streamlit 侧既有导入路径不变。
+from model_code.utils import (
+    auto_generate_field_config,
+    infer_field_type,
+    read_file_from_path,
+)
+
 
 # ============================================================================
 # 智能文件识别
@@ -320,40 +328,6 @@ def read_uploaded_file(uploaded_file, return_info: bool = False) -> Optional[pd.
         return None if not return_info else (None, {})
 
 
-def read_file_from_path(file_path: str) -> Optional[pd.DataFrame]:
-    """
-    从路径读取文件
-    
-    Args:
-        file_path: 文件路径
-    
-    Returns:
-        DataFrame 或 None
-    """
-    path = Path(file_path)
-    
-    if not path.exists():
-        return None
-    
-    try:
-        file_extension = path.suffix.lower()
-        
-        if file_extension == '.csv':
-            for encoding in ['utf-8', 'gbk', 'gb2312', 'utf-8-sig']:
-                try:
-                    return pd.read_csv(path, encoding=encoding)
-                except UnicodeDecodeError:
-                    continue
-        elif file_extension in ['.xlsx', '.xls']:
-            return pd.read_excel(path, engine='openpyxl')
-        else:
-            return None
-    
-    except Exception as e:
-        st.error(f"读取文件失败：{str(e)}")
-        return None
-
-
 # ============================================================================
 # 文件保存
 # ============================================================================
@@ -538,91 +512,6 @@ def load_config_from_file(file_path: str) -> Optional[pd.DataFrame]:
         配置 DataFrame 或 None
     """
     return read_file_from_path(file_path)
-
-
-def infer_field_type(series: pd.Series) -> str:
-    """
-    根据数据内容推断字段类型
-    
-    Args:
-        series: 数据列
-    
-    Returns:
-        推断的类型 ('num', 'str', 'key', 'label')
-    """
-    # 字段名和唯一率优先识别 ID；纯数字 ID 不能先被误判成普通数值特征。
-    name = str(series.name or '').strip().lower()
-    unique_ratio = series.nunique(dropna=True) / max(int(series.notna().sum()), 1)
-    if unique_ratio > 0.9 and any(token in name for token in ('id', 'uuid', 'key', '编号', '序号')):
-        return "key"
-
-    # 检查是否全为数值
-    if pd.api.types.is_numeric_dtype(series):
-        return "num"
-    
-    # 尝试转换为数值
-    try:
-        converted = pd.to_numeric(series, errors='coerce')
-        if converted.notna().mean() > 0.9:  # 90% 以上能转换
-            return "num"
-    except:
-        pass
-    
-    # 检查是否为 ID 类（唯一值比例高）
-    if unique_ratio > 0.9:
-        return "key"
-    
-    # 默认为字符串
-    return "str"
-
-
-def auto_generate_field_config(
-    df: pd.DataFrame,
-    label_col: str,
-    key_col: Optional[str] = None
-) -> pd.DataFrame:
-    """
-    根据 DataFrame 自动生成字段配置
-
-    使用 infer_field_type 自动推断字段类型，并设置合理的默认处理规则。
-
-    Args:
-        df: 输入 DataFrame
-        label_col: 目标变量列名
-        key_col: 可选，ID/键列名
-
-    Returns:
-        配置 DataFrame，包含 field_name, field_type, outlier_value,
-        missing_value, ecode_type, standardize_type 列
-    """
-    config_data = []
-
-    for col in df.columns:
-        if col == label_col:
-            field_type = "label"
-        elif col == key_col:
-            field_type = "key"
-        else:
-            field_type = infer_field_type(df[col])
-
-        # 缺失值处理默认规则
-        missing_value = np.nan
-        if df[col].isna().sum() > 0:
-            if field_type == 'num':
-                missing_value = 'mean'
-            else:
-                missing_value = 'mode'
-
-        config_data.append({
-            "field_name": col,
-            "field_type": field_type,
-            "outlier_value": np.nan,
-            "missing_value": missing_value,
-            "ecode_type": "one-hot" if field_type == "str" else np.nan,
-            "standardize_type": "z-score" if field_type == "num" else np.nan,
-        })
-
-    return pd.DataFrame(config_data)
 
 
 # ============================================================================
