@@ -1,8 +1,18 @@
 # Machine Learning Project - 向 Agentic Workflow 驱动的 AutoML 平台升级
 
-**版本**: v2.3.2 → v3.0.0  
-**制定时间**: 2026-03-23  
-**状态**: 🟡 规划中  
+**版本**: v2.3.2 → v3.0.0
+**制定时间**: 2026-03-23
+**状态**: 🟡 规划中
+
+> **历史快照说明（2026-10-30 补注）**
+>
+> 本文是 v3.0.0 升级的规划文档，v3.0.0 已发布，此处内容不再反映现状。
+> 当前架构、模块职责与启动方式请以 [README.md](README.md) 为准。
+>
+> 文中列出的知识图谱构建组件（`KnowledgeGraphBuilder`、`BaseMetadataExtractor`、
+> `MySQLExtractor`、`OracleExtractor`、`HiveExtractor`、`ExtractorFactory`，均位于
+> `core/knowledge/graph_builder.py`）从未接入 `core.knowledge` 的导出，也无调用方与测试，
+> 已于 2026-10-29 在提交 `71ffcf4` 中删除。下表中指向该文件的行仅作历史记录保留。
 
 ---
 

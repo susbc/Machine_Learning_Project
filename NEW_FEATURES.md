@@ -2,6 +2,17 @@
 
 本文档说明 Machine_Learning_Project 的最新增强功能。
 
+> **历史快照说明（2026-10-30 补注）**
+>
+> 尽管标题写作「最新」，本文实际定格于 2026-03-09，早已不代表现状。当前功能清单、
+> 前端形态与启动方式请以 [README.md](README.md) 为准（主线入口已是 Vue + FastAPI，
+> Streamlit 仅作回退）。
+>
+> 下文「4. UI/UX 优化」整节介绍的 `web_app/components/ui_enhancements.py`
+> （`set_page_theme` / `show_toast` / `render_progress_bar` / `render_quick_actions`）
+> 从未被任何模块导入，属于未接线代码，已于 2026-10-29 在提交 `71ffcf4` 中删除；
+> 该节的使用示例已不可运行，仅作历史记录保留。
+
 ## 📋 目录
 
 1. [数据库连接支持](#1-数据库连接支持)
