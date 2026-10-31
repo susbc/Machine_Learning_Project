@@ -612,6 +612,18 @@ def _read_workflow_sse(
     return events
 
 
+def _linear_regression_agent_config(_data_features: dict, _scenario: str) -> dict:
+    """Keeps step3 offline: without this stub the AutoML agent calls a real LLM provider."""
+    return {
+        "task_type": "regression",
+        "optimization_metric": "rmse",
+        "candidate_models": ["linear_regression"],
+        "n_trials": 10,
+        "search_spaces": {},
+        "rationale": "deterministic offline sentinel",
+    }
+
+
 def test_workflow_regression_corrects_agent_suggestion_and_predicts_float(
     tmp_path, monkeypatch, caplog
 ):
@@ -1088,6 +1100,7 @@ def test_workflow_failed_state_and_error_survive_reconnect_without_artifact(tmp_
     task_dir = tmp_path / "output" / task_id
     monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    monkeypatch.setattr(workflow, "recommend_automl_config", _linear_regression_agent_config)
     monkeypatch.setattr(
         AutoMLOptimizer,
         "optimize",
@@ -1114,18 +1127,6 @@ def test_workflow_failed_state_and_error_survive_reconnect_without_artifact(tmp_
     assert restarted_status["status"] == "failed"
     assert restarted_status["error"] == persisted["error"]
     assert "msg" not in restarted_status
-
-
-def _linear_regression_agent_config(_data_features: dict, _scenario: str) -> dict:
-    """Keeps step3 offline: without this stub the AutoML agent calls a real LLM provider."""
-    return {
-        "task_type": "regression",
-        "optimization_metric": "rmse",
-        "candidate_models": ["linear_regression"],
-        "n_trials": 10,
-        "search_spaces": {},
-        "rationale": "deterministic offline sentinel",
-    }
 
 
 def test_workflow_rejects_overlapping_run_and_keeps_original_run_id(tmp_path, monkeypatch):
