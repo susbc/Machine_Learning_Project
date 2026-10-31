@@ -1116,10 +1116,23 @@ def test_workflow_failed_state_and_error_survive_reconnect_without_artifact(tmp_
     assert "msg" not in restarted_status
 
 
+def _linear_regression_agent_config(_data_features: dict, _scenario: str) -> dict:
+    """Keeps step3 offline: without this stub the AutoML agent calls a real LLM provider."""
+    return {
+        "task_type": "regression",
+        "optimization_metric": "rmse",
+        "candidate_models": ["linear_regression"],
+        "n_trials": 10,
+        "search_spaces": {},
+        "rationale": "deterministic offline sentinel",
+    }
+
+
 def test_workflow_rejects_overlapping_run_and_keeps_original_run_id(tmp_path, monkeypatch):
     task_id = _prepare_workflow_task(tmp_path)
     monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    monkeypatch.setattr(workflow, "recommend_automl_config", _linear_regression_agent_config)
     entered = threading.Event()
     release = threading.Event()
 
@@ -1161,6 +1174,7 @@ def test_workflow_cancel_endpoint_propagates_to_optimizer_and_persists_cancelled
     task_id = _prepare_workflow_task(tmp_path)
     monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(workflow, "SAVED_DIR", tmp_path / "saved")
+    monkeypatch.setattr(workflow, "recommend_automl_config", _linear_regression_agent_config)
     entered = threading.Event()
     observed_cancel_event: list[threading.Event] = []
 
@@ -1192,17 +1206,6 @@ def test_workflow_cancel_endpoint_propagates_to_optimizer_and_persists_cancelled
     assert persisted["status"] == "cancelled"
     assert persisted["error"] == "训练已取消"
     assert not thread.is_alive()
-
-
-def _linear_regression_agent_config(_data_features: dict, _scenario: str) -> dict:
-    return {
-        "task_type": "regression",
-        "optimization_metric": "rmse",
-        "candidate_models": ["linear_regression"],
-        "n_trials": 10,
-        "search_spaces": {},
-        "rationale": "terminal publication sentinel",
-    }
 
 
 def test_workflow_cancel_after_artifact_replace_rolls_back_run_owned_publication(
