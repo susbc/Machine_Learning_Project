@@ -568,7 +568,8 @@ async def create_automl_job(
         **recommendation,
         "optimization_metric": resolved_metric,
         "use_llm_requested": use_llm,
-        "llm_status": "not_configured_fallback" if use_llm else "disabled",
+        # AutoML 任务始终使用确定性启发式推荐，LLM 不参与调参；如实标注避免误导
+        "llm_status": "not_used" if use_llm else "disabled",
         "business_context": business_context,
     }
 

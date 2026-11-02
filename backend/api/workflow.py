@@ -22,8 +22,6 @@ import uuid
 import hashlib
 import joblib
 import asyncio
-import time
-import random
 import logging
 import re
 import threading
@@ -52,7 +50,7 @@ from core.automl.problem_spec import (
     validate_cv,
     validate_train_test_split,
 )
-from model_code.feature_executor import FeatureEngineeringExecutor, FeatureEngineeringTransformer
+from model_code.feature_executor import FeatureEngineeringTransformer
 from core.automl.automl_optimizer import AutoMLOptimizer, OptimizationCancelled
 from core.llm.agent_schemas import FeatureAction, FeatureStrategy
 
@@ -909,12 +907,6 @@ class FeatureGenerationRequest(BaseModel):
     eda_report_text: str = Field("", description="可选：用户补充的业务先验知识")
 
 
-class TrainRequest(BaseModel):
-    """步骤 3：训练请求"""
-    task_id: str = Field(..., description="任务 ID")
-    n_trials: int = Field(30, description="Optuna Trial 次数", ge=10, le=100)
-
-
 class PredictRequest(BaseModel):
     """步骤 4：线上预测请求"""
     model_version: str = Field(..., description="模型版本 (task_id)", example="task_abc123")
@@ -955,8 +947,11 @@ async def retrieve_data(req: DataRetrievalRequest):
         """
         
         # 2. DataRetrieval_Agent 生成 SQL
+        # LLM 调用是同步阻塞的，移出事件循环线程，避免卡住所有并发请求
         logger.info("调用 DataRetrieval_Agent 生成 SQL...")
-        sql_result = orchestrator.run_data_retrieval_agent(graph_schema, req.user_query)
+        sql_result = await asyncio.to_thread(
+            orchestrator.run_data_retrieval_agent, graph_schema, req.user_query
+        )
         
         if not sql_result.is_executable:
             return {
@@ -976,16 +971,16 @@ async def retrieve_data(req: DataRetrievalRequest):
         # db.disconnect()
         # =====================================================================
 
-        # 模拟数据
-        np.random.seed(42)
+        # 模拟数据（局部 RNG：np.random.seed 会改写进程级全局状态，污染并发请求）
+        rng = np.random.default_rng(42)
         n_samples = 1000
         df = pd.DataFrame({
             'order_id': range(n_samples),
-            'driver_id': np.random.randint(1, 100, n_samples),
-            'order_fee': np.random.uniform(10, 500, n_samples),
-            'age': np.random.randint(20, 60, n_samples),
-            'city_code': np.random.choice(['北京', '上海', '广州', '深圳'], n_samples),
-            'is_fraud': np.random.randint(0, 2, n_samples)
+            'driver_id': rng.integers(1, 100, n_samples),
+            'order_fee': rng.uniform(10, 500, n_samples),
+            'age': rng.integers(20, 60, n_samples),
+            'city_code': rng.choice(['北京', '上海', '广州', '深圳'], n_samples),
+            'is_fraud': rng.integers(0, 2, n_samples)
         })
         
         logger.info(f"数据提取完成：{df.shape}")
@@ -1095,10 +1090,12 @@ async def generate_features(req: FeatureGenerationRequest):
         eda_summary_json = json.dumps(_agent_visible_eda(eda_summary), ensure_ascii=False)
         
         # 2. Feature_Agent 生成策略
+        # LLM 调用是同步阻塞的，移出事件循环线程
         logger.info("调用 Feature_Agent 生成策略...")
-        strategy_obj = orchestrator.run_feature_agent(
+        strategy_obj = await asyncio.to_thread(
+            orchestrator.run_feature_agent,
             eda_summary_json,
-            req.eda_report_text
+            req.eda_report_text,
         )
         
         logger.info(f"策略生成完成：{len(strategy_obj.actions)} 个动作")
@@ -1111,7 +1108,7 @@ async def generate_features(req: FeatureGenerationRequest):
         return {
             "status": "success",
             "task_id": req.task_id,
-            "strategy": strategy_obj.dict(),
+            "strategy": strategy_obj.model_dump(),
             "actions_count": len(strategy_obj.actions)
         }
         
@@ -1328,7 +1325,11 @@ async def train_stream(
     cv_folds: int = Query(5, description="交叉验证折数", ge=3, le=10)
 ):
     """预检并启动一个 task 独占、holdout-safe 的训练运行。"""
-    context = _prepare_workflow_training(task_id, problem_type, cv_folds)
+    # 预检包含 parquet 读取与可能的 LLM 策略重生成，均为同步阻塞调用，
+    # 整体移出事件循环线程
+    context = await asyncio.to_thread(
+        _prepare_workflow_training, task_id, problem_type, cv_folds
+    )
     control = _claim_workflow_run(task_id)
     run_id = control.run_id
     queue = asyncio.Queue()
