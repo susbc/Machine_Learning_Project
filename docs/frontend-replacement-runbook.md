@@ -4,7 +4,7 @@
 
 ## 当前结论
 
-Vue + TypeScript 前端已经覆盖当前主线工作台：数据管理、训练、分析、监控、配置、Agent 工作流、模型管理、预测实验室和自动迭代兼容入口都已接入 FastAPI API。Streamlit 暂时保留为回退和历史功能对照入口。
+Vue + TypeScript 前端已经覆盖当前主线工作台：数据管理、训练、分析、监控、配置、Agent 工作流、模型管理和预测实验室都已接入 FastAPI API。Streamlit 暂时保留为回退和历史功能对照入口。
 
 ## 启动方式
 
@@ -66,7 +66,10 @@ export FRONTEND_DIST_PATH=/absolute/path/to/frontend/dist
 - Agent 工作流
 - 模型管理（统一 registry、详情、多模型指标对比）
 - 预测实验室（单条 JSON 预测、CSV 批量预测、结果摘要）
-- 自动迭代训练（兼容入口，合并至 AutoML/Optuna 流程）
+
+已下线：
+
+- 自动迭代训练入口（与 AutoML 训练渲染同一页面，属于冗余路由，已移除；Streamlit 侧的自动迭代功能保留在回退入口中）
 
 待迁移或待明确下线：
 

@@ -21,12 +21,6 @@ export const moduleRoutes: RouteRecordRaw[] = [
     meta: { label: 'AutoML 训练', navGroup: 'core' },
   },
   {
-    path: '/auto-iteration',
-    name: 'auto-iteration',
-    component: AutoMLView,
-    meta: { label: '自动迭代', navGroup: 'core' },
-  },
-  {
     path: '/ai-analysis',
     name: 'ai-analysis',
     component: () => import('@/modules/ai-analysis/views/AiAnalysisView.vue'),

@@ -15,7 +15,7 @@ describe('OverviewView', () => {
     expect(wrapper.text()).toContain('生产托管')
     expect(wrapper.text()).toContain('AutoML 训练')
     expect(wrapper.text()).toContain('灰度可用')
-    expect(wrapper.text()).toContain('自动迭代训练')
+    expect(wrapper.text()).not.toContain('自动迭代训练')
     expect(wrapper.text()).toContain('数据管理')
     expect(wrapper.text()).not.toContain('待迁移')
     expect(wrapper.text()).not.toContain('Phase 0 迁移目标')

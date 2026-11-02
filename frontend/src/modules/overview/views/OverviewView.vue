@@ -49,7 +49,6 @@ const modules = [
   { name: 'AI 智能分析', scope: '规则诊断、跨模块上下文、报告历史', status: '灰度可用', tone: 'ready' },
   { name: 'MLOps 监控', scope: '状态、PSI、模型健康、日志、重训触发', status: '灰度可用', tone: 'ready' },
   { name: 'Agent 工作流', scope: '取数、特征策略、训练、预测、模型列表', status: '灰度可用', tone: 'ready' },
-  { name: '自动迭代训练', scope: '兼容入口，合并至 AutoML/Optuna 流程', status: '灰度可用', tone: 'ready' },
   { name: '模型管理 / 模型对比', scope: '统一 registry、来源、指标、详情、多模型对比', status: '灰度可用', tone: 'ready' },
   { name: '预测实验室 / 结果分析', scope: '选择模型、单条 JSON 预测、CSV 批量预测、结果摘要', status: '灰度可用', tone: 'ready' },
 ]

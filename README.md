@@ -130,7 +130,7 @@ export ML_RUNTIME_STATE_DIR=/path/to/runtime_state
 - 数据库连接：支持 SQLite、MySQL、PostgreSQL 等常见数据库连接与查询构建。
 - 知识检索：提供 Neo4j 图谱、FAISS 向量索引和 Schema Embedding 组件。
 - MLOps：支持数值与类别特征的 PSI 数据漂移检测、基线保存、巡检日志和重训触发接口；每日巡检调度器已内置，但线上数据源接入前为占位实现（见「已知注意事项」）。
-- Web UI：Vue 工作台提供数据管理、手动训练、AutoML、自动迭代兼容入口、AI 智能分析、数据库连接、LLM 配置、Agent 工作流、MLOps 监控、模型管理与多模型对比、预测实验室（单条和 CSV 批量预测）等主线页面；Streamlit 暂时保留为回退和历史功能对照入口。
+- Web UI：Vue 工作台提供数据管理、手动训练、AutoML、AI 智能分析、数据库连接、LLM 配置、Agent 工作流、MLOps 监控、模型管理与多模型对比、预测实验室（单条和 CSV 批量预测）等主线页面；Streamlit 暂时保留为回退和历史功能对照入口。
 
 ## 分类与回归任务
 
