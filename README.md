@@ -1,4 +1,12 @@
+<div align="center">
+
+<img src="docs/assets/brand-logo-full.png" alt="溯算编程 SUSUAN PROGRAMMING" width="220" />
+
 # Machine Learning Project
+
+**Agentic AutoML Platform** · 由 [溯算编程（susuancode）](https://github.com/susuancode) 构建与维护
+
+</div>
 
 Agentic AutoML Platform 是一个面向表格数据建模的机器学习平台，包含 Streamlit Web UI、FastAPI 工作流服务、传统训练/预测流水线、AutoML 调参、LLM Agent、数据库连接、知识检索和 MLOps 漂移监控模块。
 
@@ -293,5 +301,9 @@ docker compose --profile training up trainer
 `config/llm_providers.json`，再通过界面或本地文件填写密钥。
 
 ---
+
+<div align="center">
+<sub>© 2026 溯算编程（susuancode）· Agentic AutoML Platform</sub>
+</div>
 
 Last Updated: 2026-11-02

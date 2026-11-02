@@ -6,15 +6,6 @@ import { describe, expect, it, vi } from 'vitest'
 
 import AppShell from './AppShell.vue'
 
-vi.mock('@/api/client', () => ({
-  apiClient: {
-    getHealth: vi.fn(async () => ({
-      status: 'healthy',
-      version: '3.0.0',
-    })),
-  },
-}))
-
 vi.mock('@/shared/composables/useModuleNav', () => ({
   useModuleNav: () => ({
     navItems: [
@@ -42,6 +33,33 @@ describe('AppShell', () => {
 
     expect(wrapper.text()).not.toContain('Phase 0')
     expect(wrapper.text()).not.toContain('前端工程初始化')
-    expect(wrapper.text()).toContain('FastAPI 已连接：3.0.0')
+    expect(wrapper.text()).not.toContain('FastAPI 已连接')
+    expect(wrapper.text()).not.toContain('刷新后端状态')
+  })
+
+  it('zooms the brand logo to fullscreen and back on click', async () => {
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [{ path: '/', component: { template: '<section>当前模块</section>' } }],
+    })
+    await router.push('/')
+    await router.isReady()
+
+    const wrapper = mount(AppShell, {
+      global: {
+        plugins: [createPinia(), router, ElementPlus],
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.find('.brand-lightbox').exists()).toBe(false)
+
+    await wrapper.find('.brand-mark-button').trigger('click')
+    const lightbox = wrapper.find('.brand-lightbox')
+    expect(lightbox.exists()).toBe(true)
+    expect(lightbox.find('img').attributes('alt')).toContain('溯算编程')
+
+    await lightbox.trigger('click')
+    expect(wrapper.find('.brand-lightbox').exists()).toBe(false)
   })
 })

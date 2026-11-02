@@ -2,10 +2,17 @@
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-mark">ML</div>
+        <button
+          type="button"
+          class="brand-mark-button"
+          aria-label="放大查看溯算编程品牌标识"
+          @click="logoZoomed = true"
+        >
+          <img class="brand-mark" src="@/assets/brand-logo.png" alt="溯算编程" />
+        </button>
         <div>
           <strong>Agentic AutoML</strong>
-          <span>TypeScript Frontend</span>
+          <span>溯算编程 · susuancode</span>
         </div>
       </div>
 
@@ -19,36 +26,42 @@
           <span>{{ item.label }}</span>
         </RouterLink>
       </nav>
+
+      <footer class="sidebar-footer">© 2026 溯算编程 susuancode</footer>
     </aside>
 
     <main class="workspace">
-      <header class="topbar">
-        <section class="status-strip" :class="{ healthy: system.isHealthy, degraded: system.error }">
-          <span class="status-dot" />
-          <span v-if="system.isHealthy">FastAPI 已连接：{{ system.health?.version ?? 'unknown' }}</span>
-          <span v-else-if="system.error">{{ system.error }}</span>
-          <span v-else>等待后端状态检查</span>
-        </section>
-        <el-button :loading="system.loading" plain @click="system.refreshHealth">
-          刷新后端状态
-        </el-button>
-      </header>
-
       <RouterView />
     </main>
+
+    <div
+      v-if="logoZoomed"
+      class="brand-lightbox"
+      role="dialog"
+      aria-modal="true"
+      aria-label="溯算编程品牌标识，点击任意处关闭"
+      @click="logoZoomed = false"
+    >
+      <img src="@/assets/brand-logo-full.webp" alt="溯算编程 SUSUAN PROGRAMMING" />
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 
 import { useModuleNav } from '@/shared/composables/useModuleNav'
-import { useSystemStore } from '@/stores/system'
 
 const { navItems } = useModuleNav()
-const system = useSystemStore()
 
-onMounted(() => {
-  void system.refreshHealth()
-})
+const logoZoomed = ref(false)
+
+const closeOnEscape = (event: KeyboardEvent) => {
+  if (event.key === 'Escape') {
+    logoZoomed.value = false
+  }
+}
+
+onMounted(() => window.addEventListener('keydown', closeOnEscape))
+onBeforeUnmount(() => window.removeEventListener('keydown', closeOnEscape))
 </script>

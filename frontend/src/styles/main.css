@@ -46,15 +46,23 @@ a {
   min-height: 48px;
 }
 
+.brand-mark-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: zoom-in;
+}
+
 .brand-mark {
-  display: grid;
+  display: block;
   width: 40px;
   height: 40px;
-  place-items: center;
-  border-radius: 8px;
-  background: #2f6f73;
-  color: #ffffff;
-  font-weight: 700;
+  object-fit: contain;
+  transition: transform 0.15s ease;
+}
+
+.brand-mark-button:hover .brand-mark {
+  transform: scale(1.08);
 }
 
 .brand strong,
@@ -65,6 +73,30 @@ a {
 .brand span {
   color: #66757b;
   font-size: 0.84rem;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  color: #9aa7ac;
+  font-size: 0.75rem;
+  text-align: center;
+}
+
+.brand-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  background: rgba(7, 12, 20, 0.88);
+  cursor: zoom-out;
+}
+
+.brand-lightbox img {
+  max-width: min(72vmin, 560px);
+  max-height: 72vmin;
+  object-fit: contain;
+  filter: drop-shadow(0 0 32px rgba(41, 182, 246, 0.45));
 }
 
 .nav-list {
@@ -92,14 +124,6 @@ a {
   padding: 24px;
 }
 
-.topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 18px;
-}
-
 .section-heading h2 {
   margin: 0;
   font-size: 1.45rem;
@@ -125,28 +149,6 @@ a {
   color: #66757b;
   margin-bottom: 18px;
   padding: 0 14px;
-}
-
-.topbar .status-strip {
-  flex: 1;
-  margin-bottom: 0;
-}
-
-.status-strip.healthy {
-  border-color: #b7d7ce;
-  color: #235f53;
-}
-
-.status-strip.degraded {
-  border-color: #e5b6b0;
-  color: #9a3f35;
-}
-
-.status-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: currentColor;
 }
 
 .page-section {
@@ -276,7 +278,6 @@ a {
     padding: 18px;
   }
 
-  .topbar,
   .module-row {
     align-items: flex-start;
     flex-direction: column;

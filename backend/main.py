@@ -114,6 +114,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Machine Learning Project - Agentic ML Studio",
     description="""
+由 **溯算编程（susuancode）** 构建与维护。
+
 ## 功能特性
 
 ### 🤖 Agentic AutoML 工作流
