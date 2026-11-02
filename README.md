@@ -22,11 +22,13 @@ Agentic AutoML Platform 是一个面向表格数据建模的机器学习平台�
 ├── model_code/              # 训练、预测、预处理、模型工厂、数据库连接
 ├── web_app/                 # Streamlit 应用和页面（迁移期 fallback）
 ├── frontend/                # Vue + TypeScript 前端工作台
+├── config/                  # LLM Provider 等本地配置（密钥文件不入库）
+├── docs/                    # 前端迁移 runbook 等工程文档
 ├── tests/                   # 单元测试和集成测试
 ├── scripts/                 # 数据生成、演示、辅助脚本
 ├── input_data/              # 本地输入数据目录
 ├── output/                  # 工作流中间产物和预测输出
-├── saved/                   # FastAPI 工作流模型产物
+├── saved/                   # FastAPI 工作流模型产物与 runtime_state 持久化
 └── model_code/saved/        # 传统训练流水线模型产物
 ```
 
@@ -119,7 +121,7 @@ export ML_RUNTIME_STATE_DIR=/path/to/runtime_state
 - Agent 工作流：自然语言取数、结构化特征策略生成、SSE 训练进度推送、在线预测。
 - 数据库连接：支持 SQLite、MySQL、PostgreSQL 等常见数据库连接与查询构建。
 - 知识检索：提供 Neo4j 图谱、FAISS 向量索引和 Schema Embedding 组件。
-- MLOps：支持 PSI 数据漂移检测、基线保存、巡检日志和重训触发接口。
+- MLOps：支持数值与类别特征的 PSI 数据漂移检测、基线保存、巡检日志和重训触发接口；每日巡检调度器已内置，但线上数据源接入前为占位实现（见「已知注意事项」）。
 - Web UI：Vue 工作台提供数据管理、手动训练、AutoML、自动迭代兼容入口、AI 智能分析、数据库连接、LLM 配置、Agent 工作流、MLOps 监控、模型管理与多模型对比、预测实验室（单条和 CSV 批量预测）等主线页面；Streamlit 暂时保留为回退和历史功能对照入口。
 
 ## 分类与回归任务
@@ -147,9 +149,10 @@ export ML_RUNTIME_STATE_DIR=/path/to/runtime_state
 `rmse`、`mae` 或 `r2`。保存后的 schema-v3 产物会保留最终任务类型和指标方向，
 模型注册表及后续预测不会重新推断任务类型。
 
-Agent 工作流的 `best_metric`/`best_value` 是交叉验证优化结果；最终 `metrics` 中的
-RMSE、MAE 和 R² 来自在全部工作流数据上重新拟合后的模型，并以
-`metrics_evaluation.scope=training_data` 明确标记为训练数据指标，不能视为独立测试集表现。
+Agent 工作流在 Step 1 即将数据划分为训练分区（75%）与保留集（holdout，25%），EDA、
+特征策略与交叉验证优化只接触训练分区。`best_metric`/`best_value` 是训练分区上的交叉验证
+优化结果；最终 `metrics` 中的 RMSE、MAE 和 R² 来自仅在训练分区拟合的模型在保留集上的
+一次性评估，并以 `metrics_evaluation.scope=holdout` 标记，可视为独立测试表现。
 
 在 Vue 工作台中，可从“手动训练”或“AutoML”上传 CSV，选择目标列，将任务类型保留为
 “自动识别”或改为“回归”，再选择兼容算法并启动任务。等任务完成并保存模型后，可在
@@ -224,6 +227,17 @@ export ML_OUTPUT_DIR=output
 export ML_MODEL_DIR=model_code/saved
 export LLM_API_KEY=your_api_key
 export LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+
+# 安全与部署
+export API_KEY=$(openssl rand -hex 32)     # /api/* 接口鉴权（对外部署时必需）
+export ALLOW_NETWORK_API_WITHOUT_AUTH=1    # 未配置 API_KEY 时显式放开远程访问（不推荐）
+export FRONTEND_DIST_PATH=frontend/dist    # 自定义前端构建产物目录（可选）
+export ML_MAX_UPLOAD_MB=50                 # 数据文件上传大小上限（MB）
+
+# MLOps 监控（backend/scheduler.py）
+export ACTIVE_MODEL_VERSION=task_xxxxxxxx  # 每日巡检监控的工作流任务 ID
+export FEISHU_WEBHOOK=https://open.feishu.cn/...  # 漂移告警飞书 webhook
+export ALERT_EMAIL=a@example.com,b@example.com    # 告警邮件收件人（预留）
 ```
 
 ## 测试
@@ -268,6 +282,9 @@ docker compose --profile training up trainer
 - `requirements.txt` 按 Python 3.12 依赖栈更新，并对 LangChain/Pydantic、requests/chardet 等已知冲突使用兼容约束；如果遇到 LightGBM、FAISS、sentence-transformers 等二进制依赖问题，建议重建虚拟环境。
 - 知识检索和 LLM 测试需要外部服务或可用 API Key；CI 中建议 mock 或用 pytest marker 隔离。
 - `backend/api/workflow.py` 的 Step 1 目前仍是 demo 数据，生产使用前需要接入真实数据库执行链路。
+- MLOps 调度器（`backend/scheduler.py`）的 `fetch_online_data` 仍是占位实现（返回空），
+  接入生产数据源前每日巡检会自动跳过；自动重训链路尚未实现，触发后只会发出
+  跳过/失败告警，不会误报"重训成功"。
 
 ## 开源协议
 
@@ -277,4 +294,4 @@ docker compose --profile training up trainer
 
 ---
 
-Last Updated: 2026-09-09
+Last Updated: 2026-11-02
