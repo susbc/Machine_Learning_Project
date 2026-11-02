@@ -10,6 +10,10 @@ MLOps Scheduler - 定时监控任务调度
 - 每日凌晨 3:00 执行漂移检测
 - PSI ≥ 0.2 自动触发重训
 - 告警通过飞书/邮件发送
+
+当前状态:
+- fetch_online_data() 为占位实现（返回 None），接入真实数据源前，
+  每日巡检会自动跳过，自动重训触发后以失败/跳过告警收尾，不会误报成功。
 """
 
 import asyncio
@@ -21,7 +25,7 @@ from typing import Optional, Dict, Any
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from model_code.mlops_monitor import DataDriftMonitor, check_drift
+from model_code.mlops_monitor import DataDriftMonitor
 
 logger = logging.getLogger("MLOps_Monitor")
 
@@ -34,7 +38,9 @@ ACTIVE_TASK_ID: Optional[str] = None
 # 告警配置
 ALERT_CONFIG = {
     "feishu_webhook": os.getenv("FEISHU_WEBHOOK", ""),
-    "email_recipients": os.getenv("ALERT_EMAIL", "").split(","),
+    "email_recipients": [
+        addr.strip() for addr in os.getenv("ALERT_EMAIL", "").split(",") if addr.strip()
+    ],
     "psi_threshold_low": 0.1,
     "psi_threshold_high": 0.2
 }
@@ -181,15 +187,16 @@ async def simulate_online_data():
     import pandas as pd
     import numpy as np
 
-    np.random.seed(42)
+    # 使用局部 RNG：np.random.seed 会改写进程级全局状态，污染其他流程
+    rng = np.random.default_rng(42)
     n_samples = 1000
 
     df = pd.DataFrame({
-        'age': np.random.randint(20, 60, n_samples),
-        'income': np.random.uniform(3000, 50000, n_samples),
-        'city_code': np.random.choice(['北京', '上海', '广州', '深圳'], n_samples),
-        'order_count': np.random.randint(1, 100, n_samples),
-        'is_fraud': np.random.randint(0, 2, n_samples)
+        'age': rng.integers(20, 60, n_samples),
+        'income': rng.uniform(3000, 50000, n_samples),
+        'city_code': rng.choice(['北京', '上海', '广州', '深圳'], n_samples),
+        'order_count': rng.integers(1, 100, n_samples),
+        'is_fraud': rng.integers(0, 2, n_samples)
     })
 
     # 模拟一些漂移 (实际数据中会有真实漂移)
@@ -277,8 +284,13 @@ Top 漂移特征:
                     "text": alert_message
                 }
             }
-            
-            requests.post(feishu_webhook, json=payload, timeout=10)
+
+            # 同步 requests 在事件循环线程中直接调用会阻塞整个服务，
+            # 移到工作线程执行
+            response = await asyncio.to_thread(
+                requests.post, feishu_webhook, json=payload, timeout=10
+            )
+            response.raise_for_status()
             logger.info("飞书告警已发送")
             
         except Exception as e:
@@ -330,24 +342,27 @@ async def auto_retrain_job(task_id: str):
     try:
         # 1. 拉取最新数据
         df_new = await fetch_online_data()
-        
-        # 2. 执行 AutoML 训练
-        # 这里可以调用 workflow.py 中的训练逻辑
-        # new_task_id = await trigger_training(df_new)
-        
-        logger.info(f"✅ 自动重训完成")
-        
-        # 3. 发送通知
-        await send_alert(
-            "✅ MLOps 自动重训完成",
-            f"任务 {task_id} 的自动重训已成功完成。",
-            level="info"
-        )
-        
-        # 4. 更新 ACTIVE_TASK_ID
-        # global ACTIVE_TASK_ID
-        # ACTIVE_TASK_ID = new_task_id
-        
+
+        if df_new is None or len(df_new) == 0:
+            # 数据源未接入时如实告警收尾，绝不伪造"重训完成"
+            logger.warning(
+                "自动重训跳过：未获取到线上数据 (task_id: %s)，"
+                "fetch_online_data 尚未接入数据源",
+                task_id,
+            )
+            await send_alert(
+                "⚠️ MLOps 自动重训跳过",
+                f"任务 {task_id} 已触发重训，但线上数据源未接入"
+                f"（fetch_online_data 返回空），本次未执行任何训练。",
+                level="warning"
+            )
+            return
+
+        # 2. 训练执行链路尚未实现。接入前以失败收尾，避免误报成功误导运维。
+        #    接入点：复用训练/AutoML 任务接口（参考 backend/api/training.py），
+        #    成功后再更新 ACTIVE_TASK_ID 并发送完成通知。
+        raise NotImplementedError("自动重训训练链路尚未实现，请接入训练逻辑后启用")
+
     except Exception as e:
         logger.error(f"自动重训失败：{e}", exc_info=True)
         await send_alert(
@@ -378,14 +393,19 @@ def setup_scheduler():
 
 
 def start_scheduler():
-    """启动调度器"""
+    """启动调度器（幂等：已在运行时不重复注册任务）"""
+    if scheduler.running:
+        logger.info("MLOps 调度器已在运行，跳过重复启动")
+        return
     setup_scheduler()
     scheduler.start()
     logger.info("🚀 MLOps 后台监控任务已启动")
 
 
 def stop_scheduler():
-    """停止调度器"""
+    """停止调度器（未启动时静默返回，避免关闭路径二次报错）"""
+    if not scheduler.running:
+        return
     scheduler.shutdown(wait=False)
     logger.info("🛑 MLOps 后台监控任务已关闭")
 

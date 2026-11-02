@@ -64,27 +64,30 @@ class DataDriftMonitor:
             float: PSI 值
         """
         bins = bins or self.bins
-        
-        # 数据清洗
-        expected_array = np.array(expected_array).dropna() if hasattr(expected_array, 'dropna') else np.array(expected_array)
-        actual_array = np.array(actual_array).dropna() if hasattr(actual_array, 'dropna') else np.array(actual_array)
-        
-        expected_array = expected_array[~np.isnan(expected_array)]
-        actual_array = actual_array[~np.isnan(actual_array)]
-        
+
+        # 数据清洗：统一经 pandas 去缺失，兼容 list / ndarray / Series 输入。
+        # （此前 np.array(...).dropna() 的写法对 Series 输入会抛 AttributeError，
+        #   因为 np.array 之后是 ndarray，并没有 dropna 方法。）
+        expected_array = np.asarray(pd.Series(expected_array).dropna(), dtype=float)
+        actual_array = np.asarray(pd.Series(actual_array).dropna(), dtype=float)
+
         if len(expected_array) == 0 or len(actual_array) == 0:
             logger.warning("数据为空，无法计算 PSI")
             return 0.0
-        
+
         # 1. 确定分箱边界 (基于训练集 Expected)
         breakpoints = np.arange(0, bins + 1) / bins * 100
         q = np.percentile(expected_array, breakpoints)
-        
+
         # 处理边界重复值
         q = np.unique(q)
         if len(q) < 2:
             logger.warning("分箱边界过少，PSI 计算可能不准确")
             return 0.0
+
+        # 首尾边界扩到 ±inf：np.histogram 默认丢弃界外样本，会把
+        # "线上取值超出训练范围"这类最典型的漂移静默漏掉
+        q[0], q[-1] = -np.inf, np.inf
         
         # 2. 计算 Expected 分布比例
         expected_percents = np.histogram(expected_array, bins=q)[0] / len(expected_array)
@@ -228,30 +231,36 @@ class DataDriftMonitor:
             }
         }
         
-        for feature, data in baseline_data.items():
-            # 跳过统计信息键
-            if feature.endswith("_stats") or feature.endswith("_dist"):
+        for key, data in baseline_data.items():
+            # 统计信息键不构成特征
+            if key.endswith("_stats"):
                 continue
-            
+
+            # 类别特征的基线只有 {col}_dist（extract_baseline 不保留原始样本），
+            # 必须以 _dist 键为入口解析出特征名；若只认裸特征名键，
+            # 类别特征会整体被跳过，漂移永远漏检
+            if key.endswith("_dist"):
+                feature = key[: -len("_dist")]
+                baseline_dist = data if isinstance(data, dict) else None
+            else:
+                feature = key
+                baseline_dist = None
+
             if feature not in df_online.columns:
                 continue
-            
+
             stats = baseline_data.get(f"{feature}_stats", {})
             feature_type = stats.get("type", "unknown")
-            
+
             # 获取线上数据
             online_data = df_online[feature].dropna()
-            
+
             if len(online_data) == 0:
                 continue
-            
+
             # 计算 PSI
-            if feature_type == "numeric":
-                # 数值型：使用分箱 PSI
-                psi = self.calculate_psi(data, online_data.values)
-            else:
+            if baseline_dist is not None or feature_type == "categorical":
                 # 类别型：使用类别 PSI
-                baseline_dist = baseline_data.get(f"{feature}_dist", {})
                 if baseline_dist:
                     # 从分布重建数组 (近似)
                     baseline_samples = []
@@ -261,6 +270,9 @@ class DataDriftMonitor:
                     psi = self.calculate_categorical_psi(baseline_samples, online_data.tolist())
                 else:
                     psi = 0.0
+            else:
+                # 数值型：使用分箱 PSI
+                psi = self.calculate_psi(data, online_data.values)
             
             # 判断漂移程度
             if psi >= threshold_high:
