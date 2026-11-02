@@ -568,3 +568,139 @@ def test_automl_preset_cancel_event_marks_job_cancelled():
 
     assert job.status == "cancelled"
     assert job.result is None
+
+
+def test_automl_early_stopping_halts_search():
+    """大 min_improvement + 1 轮早停：AUC 不可能再改进 0.5，搜索应在第 2 个 Trial 后停止。"""
+    client = TestClient(app)
+    file_name, file_body, content_type = _csv_upload()
+    response = client.post(
+        "/api/automl/jobs",
+        files={"file": (file_name, file_body, content_type)},
+        data={
+            "target_col": "label",
+            "n_trials": "10",
+            "cv_folds": "2",
+            "candidate_models": '["logistic_regression"]',
+            "optimization_metric": "roc_auc",
+            "use_llm": "false",
+            "early_stopping_rounds": "1",
+            "min_improvement": "0.5",
+        },
+    )
+    assert response.status_code == 201
+    job_id = response.json()["job_id"]
+
+    final = _wait_for_completion(client, job_id)
+
+    assert final["status"] == "completed"
+    result = client.get(f"/api/automl/jobs/{job_id}/result").json()
+    assert result["early_stopped"] is True
+    assert 0 < len(result["trial_history"]) <= 2
+
+
+def test_automl_rejects_sampling_for_non_binary_task():
+    client = TestClient(app)
+    file_name, file_body, content_type = _regression_csv(rows=40)
+
+    response = client.post(
+        "/api/automl/jobs",
+        files={"file": (file_name, file_body, content_type)},
+        data={
+            "problem_type": "regression",
+            "optimization_metric": "rmse",
+            "enable_sampling": "true",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["field"] == "enable_sampling"
+
+
+def _imbalanced_csv(rows: int = 200, positives: int = 20) -> tuple[str, io.BytesIO, str]:
+    rng = np.random.default_rng(7)
+    score = rng.normal(0, 1, rows)
+    label = np.zeros(rows, dtype=int)
+    label[rng.choice(rows, size=positives, replace=False)] = 1
+    df = pd.DataFrame(
+        {
+            "age": rng.integers(18, 70, rows),
+            "score": score,
+            "label": label,
+        }
+    )
+    return "imbalanced.csv", io.BytesIO(df.to_csv(index=False).encode("utf-8")), "text/csv"
+
+
+def test_automl_sampling_reduces_training_rows_only():
+    """智能采样：训练集负样本被缩减，测试集保持原始分布，任务正常完成。"""
+    client = TestClient(app)
+    file_name, file_body, content_type = _imbalanced_csv()
+    response = client.post(
+        "/api/automl/jobs",
+        files={"file": (file_name, file_body, content_type)},
+        data={
+            "target_col": "label",
+            "problem_type": "binary_classification",
+            "n_trials": "1",
+            "cv_folds": "2",
+            "candidate_models": '["logistic_regression"]',
+            "optimization_metric": "roc_auc",
+            "use_llm": "false",
+            "enable_sampling": "true",
+            "sampling_negative_ratio": "0.5",
+        },
+    )
+    assert response.status_code == 201
+    job_id = response.json()["job_id"]
+
+    final = _wait_for_completion(client, job_id)
+
+    assert final["status"] == "completed"
+    result = client.get(f"/api/automl/jobs/{job_id}/result").json()
+    sampling = result["sampling"]
+    assert sampling["applied"] is True
+    assert sampling["sampled_rows"] < sampling["original_rows"]
+    assert sampling["kept_negative_rows"] < sampling["negative_rows"]
+    assert sampling["positive_rows"] > 0
+
+
+def test_automl_feature_selection_reduces_features_and_artifact_predicts():
+    """特征选择：选择的特征数减少，selector 随 artifact 持久化且推理一致。"""
+    from backend.api._dataset import predict_with_artifact
+
+    client = TestClient(app)
+    file_name, file_body, content_type = _categorical_csv()
+    response = client.post(
+        "/api/automl/jobs",
+        files={"file": (file_name, file_body, content_type)},
+        data={
+            "target_col": "label",
+            "n_trials": "1",
+            "cv_folds": "2",
+            "candidate_models": '["random_forest"]',
+            "optimization_metric": "accuracy",
+            "use_llm": "false",
+            "enable_feature_selection": "true",
+        },
+    )
+    assert response.status_code == 201
+    job_id = response.json()["job_id"]
+
+    final = _wait_for_completion(client, job_id, timeout=60.0)
+
+    assert final["status"] == "completed"
+    result = client.get(f"/api/automl/jobs/{job_id}/result").json()
+    selection = result["feature_selection"]
+    assert selection["applied"] is True
+    assert 0 < selection["selected_feature_count"] < selection["original_feature_count"]
+
+    saved = client.post(f"/api/automl/jobs/{job_id}/save")
+    assert saved.status_code == 200
+    artifact_path = Path(__file__).parents[1] / saved.json()["artifact_path"]
+    artifact = joblib.load(artifact_path)
+    assert artifact["feature_selector"] is not None
+
+    predictions = predict_with_artifact(artifact, [{"age": 30, "score": 0.5, "city": "北京"}])
+    assert len(predictions) == 1
+    assert predictions[0]["prediction"] in (0, 1)

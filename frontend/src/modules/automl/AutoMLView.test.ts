@@ -112,6 +112,8 @@ describe('AutoMLView', () => {
 
     expect(automlMocks.createJob).toHaveBeenCalledWith(expect.objectContaining({
       problemType: 'auto', optimizationMetric: 'auto', candidateModels: undefined,
+      enableFeatureSelection: false, enableSampling: false,
+      earlyStoppingRounds: 0, minImprovement: 0.001, samplingNegativeRatio: 0.1,
     }))
     wrapper.unmount()
   })

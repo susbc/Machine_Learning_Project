@@ -29,6 +29,33 @@ describe('automl api', () => {
     expect(form.get('optimization_metric')).toBe('roc_auc')
     expect(form.get('use_llm')).toBe('false')
     expect(form.get('business_context')).toBe('credit risk')
+    // 自动迭代增强项的默认值
+    expect(form.get('early_stopping_rounds')).toBe('0')
+    expect(form.get('min_improvement')).toBe('0.001')
+    expect(form.get('enable_feature_selection')).toBe('false')
+    expect(form.get('enable_sampling')).toBe('false')
+    expect(form.get('sampling_negative_ratio')).toBe('1')
+  })
+
+  it('serializes auto-iteration enhancement options when enabled', () => {
+    const file = new File(['a,label\n1,0'], 'sample.csv')
+
+    const form = buildAutoMLJobForm({
+      file,
+      nTrials: 20,
+      cvFolds: 3,
+      earlyStoppingRounds: 3,
+      minImprovement: 0.005,
+      enableFeatureSelection: true,
+      enableSampling: true,
+      samplingNegativeRatio: 0.2,
+    })
+
+    expect(form.get('early_stopping_rounds')).toBe('3')
+    expect(form.get('min_improvement')).toBe('0.005')
+    expect(form.get('enable_feature_selection')).toBe('true')
+    expect(form.get('enable_sampling')).toBe('true')
+    expect(form.get('sampling_negative_ratio')).toBe('0.2')
   })
 
   it('serializes problem type and automatic metric', () => {

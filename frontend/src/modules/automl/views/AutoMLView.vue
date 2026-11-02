@@ -104,6 +104,53 @@
         </label>
         <el-alert v-if="selectionResetMessage" type="warning" :title="selectionResetMessage" show-icon :closable="false" />
 
+        <div class="full-field advanced-options">
+          <span class="advanced-title">自动迭代增强（可选）</span>
+
+          <div class="option-row">
+            <span>特征选择 <small>随机森林重要性 + 中位数阈值，逐折重新拟合</small></span>
+            <el-switch v-model="enableFeatureSelection" data-testid="automl-feature-selection" />
+          </div>
+
+          <div class="option-row">
+            <span>智能采样 <small>二分类负样本降采样，仅作用训练集</small></span>
+            <el-switch v-model="enableSampling" data-testid="automl-sampling" />
+          </div>
+
+          <div v-if="enableSampling" class="form-grid">
+            <label>
+              <span>负样本保留比例</span>
+              <el-input-number
+                v-model="samplingNegativeRatio"
+                :min="0.01"
+                :max="1"
+                :step="0.05"
+                :precision="2"
+                controls-position="right"
+              />
+            </label>
+          </div>
+
+          <div class="form-grid">
+            <label>
+              <span>早停轮数（0 为关闭）</span>
+              <el-input-number v-model="earlyStoppingRounds" :min="0" :max="50" :step="1" controls-position="right" />
+            </label>
+            <label>
+              <span>最小改进幅度</span>
+              <el-input-number
+                v-model="minImprovement"
+                :min="0"
+                :max="0.5"
+                :step="0.001"
+                :precision="4"
+                controls-position="right"
+                :disabled="earlyStoppingRounds === 0"
+              />
+            </label>
+          </div>
+        </div>
+
         <label class="full-field">
           <span>业务场景</span>
           <el-input
@@ -205,6 +252,19 @@
               <span>F1：{{ metricLabel('f1') }}</span>
             </template>
           </div>
+          <div
+            v-if="result.early_stopped || result.feature_selection?.applied || result.sampling?.applied"
+            class="enhancement-summary"
+          >
+            <el-tag v-if="result.early_stopped" type="warning" size="small">已触发早停</el-tag>
+            <el-tag v-if="result.feature_selection?.applied" type="success" size="small">
+              特征选择：{{ result.feature_selection.original_feature_count }} →
+              {{ result.feature_selection.selected_feature_count }}
+            </el-tag>
+            <el-tag v-if="result.sampling?.applied" type="success" size="small">
+              智能采样：训练集 {{ result.sampling.original_rows }} → {{ result.sampling.sampled_rows }} 条
+            </el-tag>
+          </div>
           <pre>{{ JSON.stringify(result.best_params, null, 2) }}</pre>
           <el-alert
             v-if="savedArtifactPath"
@@ -288,6 +348,11 @@ const cvFolds = ref(3)
 const candidateModels = ref<AutoMLModel[]>([])
 const businessContext = ref('通用机器学习建模')
 const useLlm = ref(true)
+const enableFeatureSelection = ref(false)
+const enableSampling = ref(false)
+const samplingNegativeRatio = ref(0.1)
+const earlyStoppingRounds = ref(0)
+const minImprovement = ref(0.001)
 
 const job = ref<AutoMLJob | null>(null)
 const result = ref<AutoMLResult | null>(null)
@@ -579,6 +644,11 @@ async function startJob() {
       }),
       useLlm: useLlm.value,
       businessContext: businessContext.value,
+      enableFeatureSelection: enableFeatureSelection.value,
+      enableSampling: enableSampling.value,
+      samplingNegativeRatio: samplingNegativeRatio.value,
+      earlyStoppingRounds: earlyStoppingRounds.value,
+      minImprovement: minImprovement.value,
     })
     localStorage.setItem(STORAGE_KEY, job.value.job_id)
     connectStream(job.value.job_id)
@@ -848,6 +918,38 @@ label,
   margin-top: 16px;
   color: #475569;
   font-size: 13px;
+}
+
+.advanced-options {
+  padding: 12px 14px 4px;
+  border: 1px dashed #d8e0e3;
+  border-radius: 10px;
+}
+
+.advanced-title {
+  display: block;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.advanced-options .option-row {
+  margin-top: 10px;
+}
+
+.advanced-options .option-row small {
+  color: #94a3b8;
+}
+
+.advanced-options .form-grid {
+  margin-top: 10px;
+}
+
+.enhancement-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
 }
 
 .actions {

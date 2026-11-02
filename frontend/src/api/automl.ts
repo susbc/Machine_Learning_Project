@@ -27,6 +27,26 @@ export interface AutoMLDecisionSummary {
   [key: string]: unknown
 }
 
+export interface AutoMLFeatureSelectionInfo {
+  enabled: boolean
+  applied: boolean
+  threshold?: string
+  original_feature_count?: number
+  selected_feature_count?: number
+  reason?: string
+}
+
+export interface AutoMLSamplingInfo {
+  enabled: boolean
+  applied: boolean
+  negative_ratio: number
+  original_rows: number
+  sampled_rows: number
+  positive_rows: number
+  negative_rows: number
+  kept_negative_rows?: number
+}
+
 export interface AutoMLJob {
   job_id: string
   status: AutoMLStatus
@@ -38,6 +58,11 @@ export interface AutoMLJob {
   target_col: string
   decision_summary: AutoMLDecisionSummary
   problem_spec: ProblemSpec
+  early_stopping_rounds?: number
+  min_improvement?: number
+  enable_feature_selection?: boolean
+  enable_sampling?: boolean
+  sampling_negative_ratio?: number
   error?: string | null
   artifact_path?: string | null
 }
@@ -67,6 +92,9 @@ export interface AutoMLResult {
   decision_summary: AutoMLDecisionSummary
   feature_columns: string[]
   problem_spec: ProblemSpec
+  early_stopped?: boolean
+  feature_selection?: AutoMLFeatureSelectionInfo | null
+  sampling?: AutoMLSamplingInfo | null
 }
 
 export interface AutoMLSaveResult {
@@ -85,6 +113,11 @@ export interface CreateAutoMLJobInput {
   optimizationMetric?: AutoMLMetric
   useLlm?: boolean
   businessContext?: string
+  earlyStoppingRounds?: number
+  minImprovement?: number
+  enableFeatureSelection?: boolean
+  enableSampling?: boolean
+  samplingNegativeRatio?: number
 }
 
 interface AutoMLApiOptions {
@@ -125,6 +158,11 @@ export function buildAutoMLJobForm(input: CreateAutoMLJobInput): FormData {
   if (input.businessContext?.trim()) {
     form.append('business_context', input.businessContext.trim())
   }
+  form.append('early_stopping_rounds', String(input.earlyStoppingRounds ?? 0))
+  form.append('min_improvement', String(input.minImprovement ?? 0.001))
+  form.append('enable_feature_selection', String(input.enableFeatureSelection ?? false))
+  form.append('enable_sampling', String(input.enableSampling ?? false))
+  form.append('sampling_negative_ratio', String(input.samplingNegativeRatio ?? 1.0))
   return form
 }
 

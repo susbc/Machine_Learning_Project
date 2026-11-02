@@ -125,7 +125,7 @@ export ML_RUNTIME_STATE_DIR=/path/to/runtime_state
 
 - 模型训练：分类支持 LightGBM、XGBoost、CatBoost、随机森林和逻辑回归；回归支持 LightGBM、XGBoost、CatBoost、随机森林和线性回归。
 - 预测输出：加载训练摘要和 schema-v3 模型产物；分类使用训练阈值，回归直接返回连续浮点预测值。
-- AutoML：基于 Optuna TPE 进行贝叶斯调参和模型选择，并按任务类型选择指标及优化方向。
+- AutoML：基于 Optuna TPE 进行贝叶斯调参和模型选择，并按任务类型选择指标及优化方向。已合并历史「自动迭代」的三项增强能力（均可选）：平台期早停（连续 N 轮改进不足阈值即停止搜索）、特征选择（随机森林重要性 + 中位数阈值，作为 Pipeline 一环逐折拟合，选择器随模型产物持久化，训练/推理一致）、智能采样（二分类负样本降采样，只作用训练集，测试集保持原始分布）。
 - Agent 工作流：自然语言取数、结构化特征策略生成、SSE 训练进度推送、在线预测。
 - 数据库连接：支持 SQLite、MySQL、PostgreSQL 等常见数据库连接与查询构建。
 - 知识检索：提供 Neo4j 图谱、FAISS 向量索引和 Schema Embedding 组件。

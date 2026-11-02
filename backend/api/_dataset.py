@@ -520,6 +520,10 @@ def predict_with_artifact(artifact: Dict[str, Any], features_list: List[Dict[str
         missing = [col for col in feature_columns if col not in frame.columns]
         frame = frame.reindex(columns=feature_columns)
         matrix = preprocessor.transform(frame)
+        # 训练期启用特征选择时，推理必须复用同一选择器（随 artifact 持久化）
+        feature_selector = artifact.get("feature_selector")
+        if feature_selector is not None and hasattr(feature_selector, "transform"):
+            matrix = feature_selector.transform(matrix)
     else:
         if executor is not None and hasattr(executor, "transform"):
             is_fitted = getattr(executor, "is_fitted", None)
