@@ -12,7 +12,7 @@
         </button>
         <div>
           <strong>Agentic AutoML</strong>
-          <span>溯算编程 · susuancode</span>
+          <span>溯算编程</span>
         </div>
       </div>
 
@@ -23,9 +23,17 @@
           :to="item.path"
           class="nav-item"
         >
+          <component :is="navIcon(item.name)" class="nav-icon" :size="17" :stroke-width="1.9" />
           <span>{{ item.label }}</span>
         </RouterLink>
       </nav>
+
+      <img
+        class="sidebar-deco"
+        src="@/assets/brand-logo.png"
+        alt=""
+        aria-hidden="true"
+      />
 
       <footer class="sidebar-footer">© 2026 溯算编程 susuancode</footer>
     </aside>
@@ -48,11 +56,43 @@
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref, type Component } from 'vue'
+import {
+  Box,
+  Boxes,
+  ChartLine,
+  Database,
+  FlaskConical,
+  House,
+  Layers,
+  Link,
+  Menu,
+  Monitor,
+  Play,
+  Share2,
+} from 'lucide-vue-next'
 
 import { useModuleNav } from '@/shared/composables/useModuleNav'
 
 const { navItems } = useModuleNav()
+
+const NAV_ICONS: Record<string, Component> = {
+  overview: House,
+  automl: Layers,
+  'ai-analysis': ChartLine,
+  mlops: Monitor,
+  'data-management': Database,
+  'manual-training': Play,
+  'llm-config': Box,
+  database: Link,
+  'agent-workflow': Share2,
+  'model-registry': Boxes,
+  'prediction-lab': FlaskConical,
+}
+
+function navIcon(name: unknown): Component {
+  return NAV_ICONS[String(name)] ?? Menu
+}
 
 const logoZoomed = ref(false)
 

@@ -6,14 +6,16 @@
         <h2>AutoML 训练</h2>
         <p>上传数据后自动完成目标识别、模型推荐、Optuna 参数搜索、评估和模型保存。</p>
       </div>
-      <el-tag :type="statusTagType" effect="light">{{ statusLabel }}</el-tag>
+      <span class="status-chip" :class="`status-chip--${statusTagType}`">
+        <Clock :size="13" :stroke-width="2" />{{ statusLabel }}
+      </span>
     </div>
 
     <div class="automl-grid">
       <section class="setup-panel">
         <div class="panel-title">
-          <h3>训练输入</h3>
-          <span>{{ datasetFile?.name ?? '未选择数据' }}</span>
+          <h3><Folder class="panel-title-icon" :size="17" :stroke-width="1.9" />训练输入</h3>
+          <span>{{ datasetFile?.name ?? '未选择数据集' }}</span>
         </div>
 
         <el-upload
@@ -26,13 +28,22 @@
           :on-remove="handleFileRemove"
         >
           <div class="upload-copy">
-            <strong>选择 CSV / Excel 数据集</strong>
-            <span>后端会自动完成特征编码和目标检查</span>
+            <CloudUpload class="upload-icon" :size="44" :stroke-width="1.4" />
+            <strong>拖拽文件到此处，或 <em>点击上传</em></strong>
+            <span>支持 CSV / Excel 数据集</span>
+            <small>上传后将自动完成特征编码和目标检查</small>
           </div>
         </el-upload>
+        <div class="file-bar">
+          <el-button class="file-bar-button" plain @click="triggerFilePicker">
+            <Folder :size="15" :stroke-width="1.9" />选择文件
+          </el-button>
+          <span class="file-bar-name">{{ datasetFile?.name ?? '未选择任何文件' }}</span>
+        </div>
         <input
+          ref="nativeFileInput"
           data-testid="automl-file-input"
-          class="native-file-input"
+          class="native-file-input native-file-input--hidden"
           type="file"
           accept=".csv,.xlsx,.xls"
           @change="handleNativeFileChange"
@@ -45,7 +56,7 @@
 
         <div class="form-grid">
           <label>
-            <span>问题类型</span>
+            <span class="field-label"><Crosshair :size="14" :stroke-width="1.9" />问题类型</span>
             <el-select v-model="problemType" aria-label="问题类型" :loading="capabilitiesLoading" @change="applyProblemType">
               <el-option label="自动推断" value="auto" />
               <el-option label="二分类" value="binary_classification" />
@@ -55,12 +66,12 @@
           </label>
 
           <label>
-            <span>目标列</span>
+            <span class="field-label"><Target :size="14" :stroke-width="1.9" />目标列</span>
             <el-input v-model="targetCol" placeholder="留空则自动识别 label / target / 最后一列" clearable />
           </label>
 
           <label>
-            <span>优化指标</span>
+            <span class="field-label"><ChartColumn :size="14" :stroke-width="1.9" />优化指标</span>
             <el-select v-model="optimizationMetric" aria-label="优化指标" :disabled="problemType === 'auto' || explicitActionsBlocked">
               <el-option v-if="problemType === 'auto'" label="自动选择（后端）" value="auto" />
               <el-option
@@ -73,18 +84,18 @@
           </label>
 
           <label>
-            <span>Trial 次数</span>
+            <span class="field-label"><Layers :size="14" :stroke-width="1.9" />Trial 次数</span>
             <el-input-number v-model="nTrials" :min="1" :max="100" :step="1" controls-position="right" />
           </label>
 
           <label>
-            <span>交叉验证</span>
+            <span class="field-label"><Grid2x2 :size="14" :stroke-width="1.9" />交叉验证</span>
             <el-input-number v-model="cvFolds" :min="2" :max="10" :step="1" controls-position="right" />
           </label>
         </div>
 
         <label class="full-field">
-          <span>候选模型</span>
+          <span class="field-label"><Box :size="14" :stroke-width="1.9" />候选模型</span>
           <el-select
             v-model="candidateModels"
             aria-label="候选模型"
@@ -105,21 +116,21 @@
         <el-alert v-if="selectionResetMessage" type="warning" :title="selectionResetMessage" show-icon :closable="false" />
 
         <div class="full-field advanced-options">
-          <span class="advanced-title">自动迭代增强（可选）</span>
+          <span class="advanced-title"><Zap :size="14" :stroke-width="1.9" />自动迭代增强（可选）</span>
 
           <div class="option-row">
-            <span>特征选择 <small>随机森林重要性 + 中位数阈值，逐折重新拟合</small></span>
+            <span class="option-label"><SlidersHorizontal :size="14" :stroke-width="1.9" /><b>特征选择</b><small>随机森林重要性 + 中位数阈值，逐折重新拟合</small></span>
             <el-switch v-model="enableFeatureSelection" data-testid="automl-feature-selection" />
           </div>
 
           <div class="option-row">
-            <span>智能采样 <small>二分类负样本降采样，仅作用训练集</small></span>
+            <span class="option-label"><ChartPie :size="14" :stroke-width="1.9" /><b>智能采样</b><small>二分类负样本降采样，仅作用训练集</small></span>
             <el-switch v-model="enableSampling" data-testid="automl-sampling" />
           </div>
 
           <div v-if="enableSampling" class="form-grid">
             <label>
-              <span>负样本保留比例</span>
+              <span class="field-label"><ChartPie :size="14" :stroke-width="1.9" />负样本保留比例</span>
               <el-input-number
                 v-model="samplingNegativeRatio"
                 :min="0.01"
@@ -133,11 +144,11 @@
 
           <div class="form-grid">
             <label>
-              <span>早停轮数（0 为关闭）</span>
+              <span class="field-label"><Timer :size="14" :stroke-width="1.9" />早停轮数（0 为关闭）</span>
               <el-input-number v-model="earlyStoppingRounds" :min="0" :max="50" :step="1" controls-position="right" />
             </label>
             <label>
-              <span>最小改进幅度</span>
+              <span class="field-label"><Gauge :size="14" :stroke-width="1.9" />最小改进幅度</span>
               <el-input-number
                 v-model="minImprovement"
                 :min="0"
@@ -152,7 +163,7 @@
         </div>
 
         <label class="full-field">
-          <span>业务场景</span>
+          <span class="field-label"><FileText :size="14" :stroke-width="1.9" />业务场景</span>
           <el-input
             v-model="businessContext"
             type="textarea"
@@ -177,42 +188,60 @@
 
       <section class="run-panel">
         <div class="panel-title">
-          <h3>训练进度</h3>
+          <h3><ChartColumn class="panel-title-icon" :size="17" :stroke-width="1.9" />训练进度</h3>
           <span>{{ job?.job_id ?? '等待创建任务' }}</span>
         </div>
 
         <div class="metric-grid">
-          <div class="metric">
-            <span>进度</span>
-            <strong>{{ job?.progress ?? 0 }}%</strong>
+          <div class="metric metric--blue">
+            <span class="metric-icon"><Target :size="18" :stroke-width="1.9" /></span>
+            <div class="metric-body">
+              <span>进度</span>
+              <strong>{{ job?.progress ?? 0 }}%</strong>
+            </div>
           </div>
-          <div class="metric">
-            <span>Trial</span>
-            <strong>{{ job?.current_trial ?? 0 }}/{{ job?.n_trials ?? nTrials }}</strong>
+          <div class="metric metric--teal">
+            <span class="metric-icon"><Layers :size="18" :stroke-width="1.9" /></span>
+            <div class="metric-body">
+              <span>Trial</span>
+              <strong>{{ job?.current_trial ?? 0 }}/{{ job?.n_trials ?? nTrials }}</strong>
+            </div>
           </div>
-          <div class="metric">
-            <span>最佳分数</span>
-            <strong>{{ bestValueLabel }}</strong>
+          <div class="metric metric--amber">
+            <span class="metric-icon"><Trophy :size="18" :stroke-width="1.9" /></span>
+            <div class="metric-body">
+              <span>最佳分数</span>
+              <strong>{{ bestValueLabel }}</strong>
+            </div>
           </div>
-          <div class="metric">
-            <span>最佳模型</span>
-            <strong>{{ result ? modelLabel(result.best_model) : '-' }}</strong>
+          <div class="metric metric--purple">
+            <span class="metric-icon"><Box :size="18" :stroke-width="1.9" /></span>
+            <div class="metric-body">
+              <span>最佳模型</span>
+              <strong class="metric-model">{{ result ? modelLabel(result.best_model) : '-' }}</strong>
+            </div>
           </div>
         </div>
 
-        <el-progress
-          class="progress-bar"
-          :percentage="job?.progress ?? 0"
-          :status="job?.status === 'completed' ? 'success' : job?.status === 'failed' ? 'exception' : undefined"
-          :stroke-width="12"
-          striped
-          striped-flow
-        />
+        <div class="progress-row">
+          <el-progress
+            class="progress-bar"
+            :percentage="job?.progress ?? 0"
+            :show-text="false"
+            :status="job?.status === 'completed' ? 'success' : job?.status === 'failed' ? 'exception' : undefined"
+            :stroke-width="8"
+            striped
+            striped-flow
+          />
+          <span class="progress-value">{{ job?.progress ?? 0 }}%</span>
+        </div>
 
-        <p v-if="resolvedMetric !== 'auto'" class="metric-direction" aria-live="polite">
-          优化指标：{{ chartMetricLabel }}
-        </p>
-        <div ref="chartRef" class="automl-chart"></div>
+        <div class="chart-card">
+          <div class="chart-head">
+            <span class="chart-title">{{ chartMetricLabel }}</span>
+          </div>
+          <div ref="chartRef" class="automl-chart"></div>
+        </div>
 
         <div v-if="activeProblemSpec" class="problem-spec-card" aria-live="polite">
           <strong>已解析任务：{{ problemTypeLabel(activeProblemSpec.resolved_type) }}</strong>
@@ -323,6 +352,24 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { UploadFile } from 'element-plus'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
+import {
+  Box,
+  ChartColumn,
+  ChartPie,
+  Clock,
+  CloudUpload,
+  Crosshair,
+  FileText,
+  Folder,
+  Gauge,
+  Grid2x2,
+  Layers,
+  SlidersHorizontal,
+  Target,
+  Timer,
+  Trophy,
+  Zap,
+} from 'lucide-vue-next'
 import { init, type ECharts } from '@/shared/charts/echarts'
 
 import {
@@ -369,7 +416,12 @@ const capabilitiesError = ref('')
 const selectionResetMessage = ref('')
 const streamController = ref<AbortController | null>(null)
 const chartRef = ref<HTMLElement | null>(null)
+const nativeFileInput = ref<HTMLInputElement | null>(null)
 let chartInstance: ECharts | null = null
+
+function triggerFilePicker() {
+  nativeFileInput.value?.click()
+}
 
 const currentJobId = computed(() => job.value?.job_id ?? localStorage.getItem(STORAGE_KEY) ?? '')
 const explicitCapabilities = computed<ProblemCapabilities | null>(() => {
@@ -791,7 +843,16 @@ function updateChart() {
     yAxis: { type: 'value', name: chartMetricLabel.value },
     series: [
       { name: 'Trial 分数', type: 'scatter', data: trialData, symbolSize: 10, itemStyle: { color: '#2563eb' } },
-      { name: '历史最佳', type: 'line', data: bestData, step: 'start', lineStyle: { color: '#dc2626', width: 3 } },
+      {
+        name: '历史最佳',
+        type: 'line',
+        data: bestData,
+        step: 'start',
+        symbol: 'circle',
+        symbolSize: 7,
+        itemStyle: { color: '#60a5fa' },
+        lineStyle: { color: '#60a5fa', width: 2.5 },
+      },
     ],
   })
 }
@@ -850,11 +911,13 @@ onBeforeUnmount(() => {
 .run-panel,
 .history-panel,
 .decision-panel {
-  border: 1px solid #dbe3ef;
-  border-radius: 8px;
-  background: #ffffff;
-  padding: 18px;
-  box-shadow: 0 14px 40px rgba(15, 23, 42, 0.06);
+  border: 1px solid rgba(219, 227, 239, 0.9);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  padding: 20px;
+  box-shadow: 0 18px 44px rgba(30, 64, 175, 0.08);
 }
 
 .panel-title {
@@ -866,30 +929,161 @@ onBeforeUnmount(() => {
 }
 
 .panel-title h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin: 0;
   color: #111827;
   font-size: 16px;
 }
 
+.panel-title-icon {
+  flex: 0 0 auto;
+  color: #3b82f6;
+}
+
 .panel-title span {
-  color: #64748b;
+  color: #94a3b8;
   font-size: 12px;
 }
 
+.status-chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.85);
+  padding: 5px 12px;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.status-chip--success {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+  color: #15803d;
+}
+
+.status-chip--warning {
+  border-color: #fde68a;
+  background: #fffbeb;
+  color: #b45309;
+}
+
+.status-chip--danger {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
 .dataset-upload {
-  margin-bottom: 16px;
+  margin-bottom: 12px;
+}
+
+.dataset-upload :deep(.el-upload-dragger) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 170px;
+  border: 1.5px dashed #a9c6f2;
+  border-radius: 14px;
+  background: linear-gradient(180deg, #f7faff 0%, #eef5ff 100%);
+  padding: 24px;
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.dataset-upload :deep(.el-upload-dragger:hover) {
+  border-color: #3b82f6;
+  background: linear-gradient(180deg, #f2f7ff 0%, #e6f0ff 100%);
 }
 
 .upload-copy {
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: 6px;
   color: #334155;
+}
+
+.upload-icon {
+  color: #3b82f6;
+  margin-bottom: 4px;
+}
+
+.upload-copy strong {
+  color: #1e293b;
+  font-size: 15px;
+}
+
+.upload-copy em {
+  color: #2563eb;
+  font-style: normal;
 }
 
 .upload-copy span {
   color: #64748b;
   font-size: 13px;
+}
+
+.upload-copy small {
+  border-top: 1px solid #e2eaf6;
+  margin-top: 8px;
+  padding-top: 8px;
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.file-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #e3eaf5;
+  border-radius: 10px;
+  background: #f6f9fd;
+  margin-bottom: 16px;
+  padding: 8px 10px;
+}
+
+.file-bar-button {
+  border-color: #bfdbfe;
+  color: #2563eb;
+  font-weight: 600;
+}
+
+.file-bar-button :deep(span) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.file-bar-name {
+  color: #94a3b8;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.native-file-input--hidden {
+  display: none;
+}
+
+.field-label,
+.option-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.field-label svg,
+.option-label svg,
+.advanced-title svg {
+  flex: 0 0 auto;
+  color: #3b82f6;
 }
 
 .form-grid {
@@ -927,7 +1121,9 @@ label,
 }
 
 .advanced-title {
-  display: block;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   color: #64748b;
   font-size: 12px;
   font-weight: 600;
@@ -937,8 +1133,15 @@ label,
   margin-top: 10px;
 }
 
+.option-label b {
+  color: #334155;
+  font-weight: 600;
+}
+
 .advanced-options .option-row small {
+  margin-left: 2px;
   color: #94a3b8;
+  font-weight: 400;
 }
 
 .advanced-options .form-grid {
@@ -966,33 +1169,114 @@ label,
 }
 
 .metric {
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
-  padding: 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  border-radius: 14px;
+  padding: 14px;
   background: #f8fafc;
 }
 
-.metric span {
+.metric--blue {
+  background: linear-gradient(135deg, #eff6ff 0%, #e0ecff 100%);
+}
+
+.metric--teal {
+  background: linear-gradient(135deg, #effcf8 0%, #d9f5ea 100%);
+}
+
+.metric--amber {
+  background: linear-gradient(135deg, #fffaeb 0%, #fdf0d5 100%);
+}
+
+.metric--purple {
+  background: linear-gradient(135deg, #f7f4ff 0%, #ede8ff 100%);
+}
+
+.metric-icon {
+  display: grid;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 10px;
+}
+
+.metric--blue .metric-icon {
+  background: #dbeafe;
+  color: #2563eb;
+}
+
+.metric--teal .metric-icon {
+  background: #d1f2e5;
+  color: #0d9488;
+}
+
+.metric--amber .metric-icon {
+  background: #fdeecd;
+  color: #d97706;
+}
+
+.metric--purple .metric-icon {
+  background: #e6e0fb;
+  color: #7c5ce0;
+}
+
+.metric-body span {
   display: block;
   color: #64748b;
   font-size: 12px;
 }
 
-.metric strong {
+.metric-body strong {
   display: block;
-  margin-top: 5px;
+  margin-top: 3px;
   color: #0f172a;
   font-size: 20px;
 }
 
-.progress-bar {
+.metric-model {
+  font-size: 15px;
+}
+
+.progress-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   margin: 16px 0;
 }
 
-.metric-direction {
-  margin: 14px 0 -4px;
+.progress-bar {
+  flex: 1;
+  margin: 0;
+}
+
+.progress-value {
+  min-width: 40px;
   color: #475569;
   font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.chart-card {
+  border: 1px solid #e6eefb;
+  border-radius: 14px;
+  background: #fbfdff;
+  padding: 12px 16px 6px;
+}
+
+.chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.chart-title {
+  color: #334155;
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .automl-chart {
@@ -1032,6 +1316,41 @@ pre {
 .decision-panel p {
   margin: 10px 0 0;
   color: #475569;
+}
+
+.setup-panel :deep(.el-input__wrapper),
+.setup-panel :deep(.el-select__wrapper) {
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px #dbe3ef inset;
+}
+
+.setup-panel :deep(.el-input__wrapper.is-focus),
+.setup-panel :deep(.el-select__wrapper.is-focused) {
+  box-shadow: 0 0 0 1px #3b82f6 inset;
+}
+
+.setup-panel :deep(.el-input-number) {
+  width: 100%;
+}
+
+.capability-alert {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #fde68a;
+  border-radius: 10px;
+  background: #fffbeb;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  color: #b45309;
+  font-size: 13px;
+}
+
+.actions :deep(.el-button--primary) {
+  border: 0;
+  border-radius: 8px;
+  background: linear-gradient(90deg, #3b82f6, #2563eb);
+  font-weight: 600;
 }
 
 @media (max-width: 1100px) {
