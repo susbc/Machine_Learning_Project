@@ -3,6 +3,7 @@ import { ElButton } from 'element-plus/es/components/button/index.mjs'
 import { ElCheckbox, ElCheckboxGroup } from 'element-plus/es/components/checkbox/index.mjs'
 import { ElEmpty } from 'element-plus/es/components/empty/index.mjs'
 import { ElForm, ElFormItem } from 'element-plus/es/components/form/index.mjs'
+import { ElIcon } from 'element-plus/es/components/icon/index.mjs'
 import { ElInput } from 'element-plus/es/components/input/index.mjs'
 import { ElInputNumber } from 'element-plus/es/components/input-number/index.mjs'
 import { ElProgress } from 'element-plus/es/components/progress/index.mjs'
@@ -24,6 +25,7 @@ import 'element-plus/theme-chalk/el-checkbox-group.css'
 import 'element-plus/theme-chalk/el-empty.css'
 import 'element-plus/theme-chalk/el-form.css'
 import 'element-plus/theme-chalk/el-form-item.css'
+import 'element-plus/theme-chalk/el-icon.css'
 import 'element-plus/theme-chalk/el-input.css'
 import 'element-plus/theme-chalk/el-input-number.css'
 import 'element-plus/theme-chalk/el-message.css'
@@ -50,6 +52,7 @@ export const elementPlusComponents: Plugin[] = [
   ElEmpty,
   ElForm,
   ElFormItem,
+  ElIcon,
   ElInput,
   ElInputNumber,
   ElOption,
