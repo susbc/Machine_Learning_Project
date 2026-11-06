@@ -10,7 +10,7 @@ AutoML Optuna SSE 测试脚本
 4. curl + 前端双验证
 
 使用方法:
-    python test_optuna_sse.py
+    python scripts/examples/test_optuna_sse.py
 
 访问:
     http://127.0.0.1:8000/api/optimize/stream?total_trials=50

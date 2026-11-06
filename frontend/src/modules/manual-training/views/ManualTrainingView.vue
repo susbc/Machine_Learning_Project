@@ -1,5 +1,5 @@
 <template>
-  <section class="training-workspace">
+  <section class="workspace-theme training-workspace">
     <div class="section-heading training-heading">
       <div>
         <p class="eyebrow">Phase 4</p>
@@ -352,10 +352,10 @@ function handleFileRemove() {
 }
 
 function setDatasetFile(file: File | null) {
-  if (file && file.size > 50 * 1024 * 1024) {
+  if (file && file.size > 100 * 1024 * 1024) {
     datasetFile.value = null
     invalidateDatasetContext()
-    errorMessage.value = '文件超过 50 MB 上传限制'
+    errorMessage.value = '文件超过 100 MB 上传限制'
     return
   }
   if (datasetFile.value !== file) {

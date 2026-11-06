@@ -1,5 +1,5 @@
 <template>
-  <section class="llm-workspace">
+  <section class="workspace-theme llm-workspace">
     <div class="section-heading llm-heading">
       <div>
         <p class="eyebrow">Phase 5</p>
@@ -51,13 +51,13 @@
             @click="selectProvider(provider)"
           >
             <div class="provider-main">
-              <div>
+              <div class="provider-identity">
                 <strong>{{ provider.name }}</strong>
                 <span>{{ provider.config.model ?? provider.type }}</span>
               </div>
-              <el-tag v-if="provider.is_active" type="success" effect="light">激活</el-tag>
-              <el-tag v-else-if="provider.enabled" effect="light">启用</el-tag>
-              <el-tag v-else type="info" effect="light">停用</el-tag>
+              <el-tag v-if="provider.is_active" class="provider-badge" type="success" effect="light">激活</el-tag>
+              <el-tag v-else-if="provider.enabled" class="provider-badge" effect="light">启用</el-tag>
+              <el-tag v-else class="provider-badge" type="info" effect="light">停用</el-tag>
             </div>
             <div class="provider-meta">
               <span>{{ providerTypeLabel(provider.type) }}</span>
@@ -481,12 +481,26 @@ onMounted(loadProviders)
   background: #f3faf8;
 }
 
-.provider-main strong,
-.provider-main span {
-  display: block;
+.provider-identity {
+  min-width: 0;
+  flex: 1;
 }
 
-.provider-main span {
+.provider-badge {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+}
+
+.provider-identity > strong,
+.provider-identity > span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.provider-identity > span {
   color: #64748b;
   font-size: 13px;
 }

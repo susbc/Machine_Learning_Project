@@ -26,6 +26,8 @@ from sklearn.metrics import (
 from model_code.model_factory import ModelFactory
 from model_code.auto_selector import AutoModelSelector
 
+from model_code.config.config import MODEL_DIR, OUTPUT_DIR
+
 
 class ModelTrainer:
     """统一训练编排器"""
@@ -50,8 +52,8 @@ class ModelTrainer:
         self.y_train = y_train
         self.X_test = X_test
         self.y_test = y_test
-        self.model_dir = Path(model_dir) if model_dir else Path("saved")
-        self.output_dir = Path(output_dir) if output_dir else Path("output")
+        self.model_dir = Path(model_dir) if model_dir else MODEL_DIR
+        self.output_dir = Path(output_dir) if output_dir else OUTPUT_DIR
         self.random_state = random_state
 
         self.model_dir.mkdir(parents=True, exist_ok=True)

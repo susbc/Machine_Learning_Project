@@ -49,9 +49,14 @@ export interface DatabaseConnectionPayload {
 }
 
 export interface DatabaseTestResponse {
-  connection_id: string
+  connection_id?: string
   ok: boolean
   message: string
+}
+
+export interface DatabaseTestConfigInput {
+  config: DatabaseConfig
+  connection_id?: string
 }
 
 export interface TableSample {
@@ -126,6 +131,12 @@ export function createDatabaseApi(options: DatabaseApiOptions) {
     testConnection: (connectionId: string) =>
       requestJson<DatabaseTestResponse>(`/api/database/connections/${encodeURIComponent(connectionId)}/test`, {
         method: 'POST',
+      }),
+    testConfig: (input: DatabaseTestConfigInput) =>
+      requestJson<DatabaseTestResponse>('/api/database/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
       }),
     getSchema: (connectionId: string, sampleLimit = 5) =>
       requestJson<DatabaseSchemaResponse>(

@@ -1,5 +1,8 @@
 # Machine Learning Project - 向 Agentic Workflow 驱动的 AutoML 平台升级
 
+> 本文为历史阶段设计。旧 `agents/` 和 `core/feature_engineering/` 原型已移除；实际 Agent 由 `core/llm/agent_orchestrator.py` 编排，当前目录与运行方式以 [README](README.md) 为准。
+
+
 **版本**: v2.3.2 → v3.0.0
 **制定时间**: 2026-03-23
 **状态**: 🟡 规划中
@@ -898,7 +901,7 @@ for action in strategy.actions:
 
 ```bash
 # 运行测试
-python test_agent_crashproof.py
+python scripts/examples/test_agent_crashproof.py
 
 # 输出:
 # ✅ Pydantic 拦截测试：非法动作被拦截！
@@ -1151,7 +1154,7 @@ class AutoMLAgent:
 
 #### 独立测试脚本
 
-**文件**: `test_optuna_sse.py`
+**文件**: `scripts/examples/test_optuna_sse.py`
 
 **核心机制**:
 1. ✅ CORS 跨域处理 (允许 Vue3 访问)
@@ -1162,7 +1165,7 @@ class AutoMLAgent:
 **运行方法**:
 ```bash
 # 启动服务
-python test_optuna_sse.py
+python scripts/examples/test_optuna_sse.py
 
 # curl 测试
 curl -N http://127.0.0.1:8000/api/optimize/stream?total_trials=10

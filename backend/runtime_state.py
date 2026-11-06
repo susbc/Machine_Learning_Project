@@ -19,9 +19,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 import joblib
 
+from core.paths import ARTIFACT_ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-STATE_ROOT = Path(os.getenv("ML_RUNTIME_STATE_DIR", PROJECT_ROOT / "saved" / "runtime_state")).resolve()
+STATE_ROOT = Path(os.getenv("ML_RUNTIME_STATE_DIR", ARTIFACT_ROOT / "saved" / "runtime_state")).resolve()
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 
 

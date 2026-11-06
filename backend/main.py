@@ -37,8 +37,9 @@ from backend.api.training import router as training_router
 from backend.api.intent import router as intent_router
 from backend.api.automl import prune_automl_runtime, recover_interrupted_automl_jobs
 from backend.api.training import prune_training_runtime, recover_interrupted_training_jobs
-from backend.api._workflow_artifacts import iter_visible_workflow_artifacts
+from backend.storage.workflow_artifacts import iter_visible_workflow_artifacts
 from backend.scheduler import start_scheduler, stop_scheduler
+from core.paths import ARTIFACT_ROOT
 import os
 
 
@@ -84,7 +85,7 @@ async def lifespan(app: FastAPI):
         interrupted = recover_interrupted_training_jobs() + recover_interrupted_automl_jobs()
         # Reconcile any Agent workflow artifact transaction that was interrupted
         # between durable publication and its completed-state commit.
-        list(iter_visible_workflow_artifacts(PROJECT_ROOT))
+        list(iter_visible_workflow_artifacts(ARTIFACT_ROOT))
         if interrupted:
             print(f"已恢复 {interrupted} 个中断任务的持久化状态")
         try:

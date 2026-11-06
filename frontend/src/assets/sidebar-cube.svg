@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="276" height="260" viewBox="0 0 276 260" fill="none">
+  <defs>
+    <linearGradient id="base" x1="64" y1="118" x2="224" y2="246" gradientUnits="userSpaceOnUse"><stop stop-color="#F9FCFF"/><stop offset=".55" stop-color="#BCD5FF"/><stop offset="1" stop-color="#8DBAFF"/></linearGradient>
+    <linearGradient id="top" x1="69" y1="155" x2="210" y2="200" gradientUnits="userSpaceOnUse"><stop stop-color="#fff"/><stop offset="1" stop-color="#CDE4FF"/></linearGradient>
+    <linearGradient id="cube" x1="121" y1="87" x2="196" y2="166" gradientUnits="userSpaceOnUse"><stop stop-color="#ECF9FF"/><stop offset=".5" stop-color="#9CC6FF"/><stop offset="1" stop-color="#61DFE8"/></linearGradient>
+    <linearGradient id="glow" x1="53" y1="177" x2="230" y2="250" gradientUnits="userSpaceOnUse"><stop stop-color="#fff" stop-opacity="0"/><stop offset=".6" stop-color="#A3C5FF" stop-opacity=".55"/><stop offset="1" stop-color="#57DCEB" stop-opacity="0"/></linearGradient>
+    <filter id="shadow" x="25" y="93" width="235" height="185" filterUnits="userSpaceOnUse"><feGaussianBlur stdDeviation="18"/></filter>
+  </defs>
+  <path d="M-40 91C46 106 81 153 143 157c61 4 79-29 147-18M-26 105c79 7 111 51 172 59 63 8 89-23 160-10M-22 117c81 15 112 54 173 58 61 4 93-21 148-9" stroke="#fff" stroke-opacity=".65"/>
+  <path d="M36 222c64-42 111-33 174-56 28-10 53-29 86-35M-11 231c67-45 104-42 172-59 62-16 76-43 124-47" stroke="#C7DCFF" stroke-opacity=".8"/>
+  <ellipse cx="148" cy="224" rx="88" ry="24" fill="#90B4FF" fill-opacity=".48" filter="url(#shadow)"/>
+  <path d="m71 178 77-37 80 38v51l-79 33-78-35z" fill="url(#base)" fill-opacity=".85"/>
+  <path d="m71 178 77 36 80-35-80-38z" fill="url(#top)" stroke="#fff" stroke-width="2"/>
+  <path d="m71 193 77 36 80-35M71 207l77 36 80-35" stroke="#fff" stroke-opacity=".55"/>
+  <path d="m108 124 39-19 42 18v51l-41 19-40-19z" fill="url(#cube)" stroke="#fff" stroke-width="1.5"/>
+  <path d="m108 124 40 18 41-19-42-18z" fill="#E4F3FF" fill-opacity=".86" stroke="#fff" stroke-width="1.5"/>
+  <path d="m148 142 41-19v51l-41 19z" fill="#7FC9FF" fill-opacity=".5" stroke="#fff" stroke-width="1.5"/>
+  <path d="m148 142-40-18v50l40 19z" fill="#C9DDFF" fill-opacity=".53" stroke="#fff" stroke-width="1.5"/>
+  <path d="m70 229 78 34 80-33v-51l-80 35-77-36z" fill="url(#glow)"/>
+  <path d="m198 81 15-8 17 8-16 7z" fill="#E0FFFF" fill-opacity=".6"/>
+</svg>

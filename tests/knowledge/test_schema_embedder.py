@@ -4,13 +4,14 @@ Schema Embedder 单元测试
 
 import pytest
 import numpy as np
+from unittest.mock import patch
 from core.knowledge.schema_embedder import SchemaEmbedder
 
 
 class TestSchemaEmbedder:
     """SchemaEmbedder 测试类"""
     
-    @pytest.fixture
+    @pytest.fixture(scope="class")
     def embedder(self):
         """创建测试 Embedder (使用 mini 模型)"""
         return SchemaEmbedder(model_name="mini")
@@ -22,7 +23,8 @@ class TestSchemaEmbedder:
         assert embedder.model_name == "all-MiniLM-L6-v2"
         assert embedder.model is not None
     
-    def test_init_with_alias(self):
+    @patch("core.knowledge.schema_embedder.SentenceTransformer")
+    def test_init_with_alias(self, model_factory):
         """测试使用别名初始化"""
         embedder_mini = SchemaEmbedder(model_name="mini")
         embedder_base = SchemaEmbedder(model_name="base")
@@ -31,6 +33,9 @@ class TestSchemaEmbedder:
         assert embedder_mini.model_name == "all-MiniLM-L6-v2"
         assert embedder_base.model_name == "all-mpnet-base-v2"
         assert embedder_large.model_name == "multi-qa-mpnet-base-dot-v1"
+        assert [call.args[0] for call in model_factory.call_args_list] == [
+            "all-MiniLM-L6-v2", "all-mpnet-base-v2", "multi-qa-mpnet-base-dot-v1",
+        ]
     
     def test_get_dimension(self, embedder):
         """测试获取维度"""
@@ -152,10 +157,11 @@ class TestSchemaEmbedder:
     
     def test_semantic_similarity(self, embedder):
         """测试语义相似性"""
-        # 相似文本应该有相似的 Embedding
-        emb1 = embedder.embed_text("客户信息表")
-        emb2 = embedder.embed_text("客户数据表")
-        emb3 = embedder.embed_text("汽车价格")
+        # mini 别名使用英文 MiniLM；用英文 Schema 术语验证语义，
+        # 中文输入兼容性由 test_embed_text 单独覆盖。
+        emb1 = embedder.embed_text("customer information table")
+        emb2 = embedder.embed_text("customer data table")
+        emb3 = embedder.embed_text("car prices")
         
         # 计算余弦相似度
         similarity_12 = np.dot(emb1, emb2)

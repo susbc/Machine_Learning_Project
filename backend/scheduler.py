@@ -26,6 +26,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from model_code.mlops_monitor import DataDriftMonitor
+from core.paths import SAVED_DIR
 
 logger = logging.getLogger("MLOps_Monitor")
 
@@ -68,7 +69,7 @@ async def check_data_drift_job():
     
     try:
         # 1. 加载训练时的基线数据
-        baseline_path = f"saved/baseline_{task_id}.json"
+        baseline_path = SAVED_DIR / f"baseline_{task_id}.json"
         if not os.path.exists(baseline_path):
             logger.error(f"基线数据文件不存在：{baseline_path}")
             await send_alert(

@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 from sklearn.linear_model import LinearRegression, LogisticRegression
 
-from backend.api._dataset import prepare_train_pipeline
+from backend.services.datasets import prepare_train_pipeline
 from backend.main import app
 import backend.api.models as model_registry
 from core.automl.problem_spec import ProblemSpec, resolve_problem_spec

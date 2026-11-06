@@ -5,6 +5,7 @@ import { elementPlusComponents } from './app/element-plus'
 import { createAppPinia } from './app/pinia'
 import { createAppRouter } from './app/router'
 import './styles/main.css'
+import './styles/workspace-theme.css'
 
 const app = createApp(App)
 

@@ -1,5 +1,5 @@
 <template>
-  <section class="data-workspace">
+  <section class="workspace-theme data-workspace">
     <div class="section-heading data-heading">
       <div>
         <p class="eyebrow">Phase 9</p>
@@ -136,9 +136,9 @@ const qualitySummary = computed(() => {
 function handleFileChange(event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0] ?? null
-  if (file && file.size > 50 * 1024 * 1024) {
+  if (file && file.size > 100 * 1024 * 1024) {
     datasetFile.value = null
-    errorMessage.value = '文件超过 50 MB 上传限制'
+    errorMessage.value = '文件超过 100 MB 上传限制'
     return
   }
   datasetFile.value = file

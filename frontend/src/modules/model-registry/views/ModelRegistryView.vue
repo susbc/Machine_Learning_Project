@@ -1,5 +1,5 @@
 <template>
-  <section class="model-registry-workspace">
+  <section class="workspace-theme model-registry-workspace">
     <div class="section-heading registry-heading">
       <div>
         <p class="eyebrow">Phase 7</p>

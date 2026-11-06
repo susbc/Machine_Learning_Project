@@ -7,7 +7,6 @@
 - FAISSClient: 向量数据库连接
 - SchemaEmbedder: 表/字段 Embedding
 - NL2SQLEngine: NL2SQL 引擎
-- DataRetrievalAgent: 数据检索智能体
 """
 
 from .neo4j_client import Neo4jClient

@@ -1,5 +1,5 @@
 <template>
-  <section class="database-workspace">
+  <section class="workspace-theme database-workspace">
     <div class="section-heading database-heading">
       <div>
         <p class="eyebrow">Phase 5</p>
@@ -51,12 +51,12 @@
             @click="selectConnection(connection)"
           >
             <div class="connection-main">
-              <div>
+              <div class="connection-identity">
                 <strong>{{ connection.name }}</strong>
                 <span>{{ connection.config.database }}</span>
               </div>
-              <el-tag v-if="connection.is_active" type="success" effect="light">激活</el-tag>
-              <el-tag v-else effect="light">{{ dbTypeLabel(connection.db_type) }}</el-tag>
+              <el-tag v-if="connection.is_active" class="connection-badge" type="success" effect="light">激活</el-tag>
+              <el-tag v-else class="connection-badge" effect="light">{{ dbTypeLabel(connection.db_type) }}</el-tag>
             </div>
             <div class="connection-meta">
               <span>{{ connection.config.host || 'local file' }}</span>
@@ -132,6 +132,7 @@
             <el-switch v-model="form.isActive" active-text="设为激活" inactive-text="普通连接" />
             <div class="form-actions">
               <el-button @click="resetForm">清空</el-button>
+              <el-button :icon="Connection" :loading="testingForm" :disabled="saving" data-testid="test-current-connection" @click="testCurrentConfig">测试连接</el-button>
               <el-button type="primary" :loading="saving" @click="saveConnection">{{ editingConnection ? '保存修改' : '创建连接' }}</el-button>
             </div>
           </div>
@@ -185,7 +186,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { Connection, Delete, Plus, Refresh, Tickets } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 import { ElMessageBox } from 'element-plus/es/components/message-box/index.mjs'
@@ -225,6 +226,7 @@ const loading = ref(false)
 const saving = ref(false)
 const previewing = ref(false)
 const testingId = ref('')
+const testingForm = ref(false)
 const errorMessage = ref('')
 const testResult = ref<DatabaseTestResponse | null>(null)
 const querySql = ref('SELECT * FROM customers')
@@ -241,6 +243,8 @@ const form = reactive<ConnectionForm>({
   description: '',
   isActive: false,
 })
+
+watch(form, () => { testResult.value = null })
 
 const dbTypesText = computed(() => {
   const types = statistics.value?.db_types ?? []
@@ -322,14 +326,7 @@ async function saveConnection() {
   saving.value = true
   errorMessage.value = ''
   try {
-    const config = {
-      db_type: form.dbType,
-      database: form.database.trim(),
-      host: form.dbType === 'sqlite' ? undefined : form.host.trim(),
-      port: form.dbType === 'sqlite' ? undefined : form.port,
-      user: form.dbType === 'sqlite' ? undefined : form.user.trim(),
-      password: form.dbType === 'sqlite' ? undefined : form.password,
-    }
+    const config = buildFormConfig()
     if (editingConnection.value) {
       const updated = await databaseApi.updateConnection(editingConnection.value.id, {
         name: form.name.trim(),
@@ -358,6 +355,17 @@ async function saveConnection() {
   }
 }
 
+function buildFormConfig() {
+  return {
+    db_type: form.dbType,
+    database: form.database.trim(),
+    host: form.dbType === 'sqlite' ? undefined : form.host.trim(),
+    port: form.dbType === 'sqlite' ? undefined : form.port,
+    user: form.dbType === 'sqlite' ? undefined : form.user.trim(),
+    password: form.dbType === 'sqlite' ? undefined : form.password,
+  }
+}
+
 async function testDbConnection(connection: DatabaseConnection) {
   testingId.value = connection.id
   errorMessage.value = ''
@@ -372,6 +380,37 @@ async function testDbConnection(connection: DatabaseConnection) {
     errorMessage.value = error instanceof Error ? error.message : '连接测试失败'
   } finally {
     testingId.value = ''
+  }
+}
+
+// 测试编辑面板里当前填写的配置（无需先保存）；
+// 编辑现有连接且密码留空时，后端复用已存储的凭证
+async function testCurrentConfig() {
+  if (form.dbType !== 'sqlite' && !form.host.trim()) {
+    ElMessage.warning('请先填写 Host')
+    return
+  }
+  if (!form.database.trim()) {
+    ElMessage.warning('请先填写数据库')
+    return
+  }
+  testingForm.value = true
+  testResult.value = null
+  errorMessage.value = ''
+  try {
+    testResult.value = await databaseApi.testConfig({
+      config: buildFormConfig(),
+      connection_id: editingConnection.value?.id,
+    })
+    if (testResult.value.ok) {
+      ElMessage.success(testResult.value.message)
+    } else {
+      ElMessage.warning(testResult.value.message)
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '连接测试失败'
+  } finally {
+    testingForm.value = false
   }
 }
 
@@ -543,6 +582,7 @@ onMounted(loadConnections)
 }
 
 .connection-row {
+  position: relative;
   display: grid;
   gap: 10px;
   border: 1px solid #e2e8f0;
@@ -551,17 +591,25 @@ onMounted(loadConnections)
   cursor: pointer;
 }
 
+.connection-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .connection-row.selected {
   border-color: #2f6f73;
   background: #f3faf8;
 }
 
-.connection-main strong,
-.connection-main span {
+.connection-identity { min-width: 0; overflow-wrap: anywhere; }
+.connection-identity strong,
+.connection-identity > span {
   display: block;
 }
 
-.connection-main span {
+.connection-identity > span {
   color: #64748b;
   font-size: 13px;
 }
@@ -580,6 +628,9 @@ onMounted(loadConnections)
   display: grid;
   gap: 2px;
 }
+
+.form-footer, .form-actions { flex-wrap: wrap; }
+.form-actions .el-button + .el-button { margin-left: 0; }
 
 .form-grid {
   display: grid;

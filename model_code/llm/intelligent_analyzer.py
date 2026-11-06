@@ -158,6 +158,12 @@ class IntelligentAnalyzer:
 - 特征数量：{n_features}
 
 ## 训练结果
+以下为调用方实际提供的指标（训练 API 的 roc_auc/f1/accuracy 和 rmse/mae/r2 均为留出集指标）：
+{reported_metrics}
+
+分类任务使用 AUC/F1 等指标，回归任务使用 RMSE/MAE/R²；不适用的指标请忽略。
+未提供训练集指标时不能推断训练/验证差距，也不能断言过拟合。不要编造缺失值。
+
 - 训练集 AUC：{train_auc}
 - 验证集 AUC：{val_auc}
 - 训练集 F1：{train_f1}
@@ -189,7 +195,7 @@ class IntelligentAnalyzer:
    - 具体应该调整哪些参数？
    - 是否需要更多数据或特征？
 
-请给出具体、可量化的建议。
+请用中文给出具体、可量化的建议，总计不超过 800 字；先给结论，避免重复复述指标。
 """
     
     def _get_prediction_analysis_prompt(self) -> str:
@@ -451,9 +457,9 @@ class IntelligentAnalyzer:
         metrics = metrics or {}
         params = params or {}
         train_auc = _safe_float(metrics.get('train_auc'))
-        val_auc = _safe_float(metrics.get('val_auc'))
+        val_auc = _safe_float(metrics.get('val_auc', metrics.get('test_auc', metrics.get('roc_auc'))))
         train_f1 = _safe_float(metrics.get('train_f1'))
-        val_f1 = _safe_float(metrics.get('val_f1'))
+        val_f1 = _safe_float(metrics.get('val_f1', metrics.get('best_f1', metrics.get('f1'))))
         
         auc_gap = abs(train_auc - val_auc) if train_auc is not None and val_auc is not None else None
         f1_gap = abs(train_f1 - val_f1) if train_f1 is not None and val_f1 is not None else None
@@ -470,6 +476,7 @@ class IntelligentAnalyzer:
         
         # 构建提示词
         prompt = self.prompts['training_analysis'].format(
+            reported_metrics=json.dumps(metrics, ensure_ascii=False, default=_json_default),
             model_type=params.get('model_type', 'Unknown'),
             train_size=metrics.get('train_size', 0),
             val_size=metrics.get('val_size', 0),
@@ -485,7 +492,7 @@ class IntelligentAnalyzer:
         )
         
         messages = [{"role": "user", "content": prompt}]
-        return self.llm_manager.chat(messages, temperature=0.3)
+        return self.llm_manager.chat(messages, temperature=0.3, max_tokens=3000)
     
     def analyze_prediction_results(self, predictions: 'pd.Series',
                                    threshold: float = 0.5,

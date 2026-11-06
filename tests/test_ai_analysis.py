@@ -73,6 +73,45 @@ def test_training_rules_handle_missing_train_metrics():
     assert result.risk_level == "high"
 
 
+def test_training_rules_accept_current_training_api_metrics():
+    result = diagnose_training({"roc_auc": 0.58, "f1": 0.4})
+    evidence = {item.name: item.value for item in result.evidence}
+    assert evidence["val_auc"] == 0.58
+    assert evidence["val_f1"] == 0.4
+    assert {"weak_validation_auc", "weak_validation_f1"} <= {item.title for item in result.risks}
+    assert "auc_gap" not in evidence
+
+
+def test_regression_training_analysis_preserves_metrics_and_flags_negative_r2():
+    result = diagnose_training({"rmse": 1301.67, "mae": 604.59, "r2": -0.2})
+    evidence = {item.name: item.value for item in result.evidence}
+    assert evidence["rmse"] == 1301.67
+    assert evidence["mae"] == 604.59
+    assert evidence["r2"] == -0.2
+    assert "val_auc" not in evidence
+    assert "negative_validation_r2" in {item.title for item in result.risks}
+
+
+def test_missing_training_metrics_do_not_recommend_promotion():
+    result = diagnose_training({})
+    assert "missing_validation_metrics" in {item.title for item in result.risks}
+    assert "promote_candidate_model" not in {item.title for item in result.recommendations}
+
+
+def test_llm_training_prompt_includes_real_regression_metrics():
+    from model_code.llm.intelligent_analyzer import IntelligentAnalyzer
+
+    class CaptureManager:
+        def chat(self, messages, **kwargs):
+            return messages[0]["content"]
+
+    analyzer = IntelligentAnalyzer(CaptureManager())
+    prompt = analyzer.analyze_training_results({"rmse": 1301.67, "mae": 604.59, "r2": 0.9694}, {})
+    assert '"rmse": 1301.67' in prompt
+    assert '"r2": 0.9694' in prompt
+    assert "未提供训练集指标时不能推断" in prompt
+
+
 def test_prediction_rules_detect_extreme_positive_rate_and_shift():
     current = [0.99] * 100
     reference = [0.05] * 50 + [0.95] * 50

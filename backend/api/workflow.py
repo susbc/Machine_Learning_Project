@@ -54,8 +54,8 @@ from model_code.feature_executor import FeatureEngineeringTransformer
 from core.automl.automl_optimizer import AutoMLOptimizer, OptimizationCancelled
 from core.llm.agent_schemas import FeatureAction, FeatureStrategy
 
-from ._dataset import compute_classification_metrics, compute_regression_metrics, predict_with_artifact
-from ._workflow_artifacts import (
+from backend.services.datasets import compute_classification_metrics, compute_regression_metrics, predict_with_artifact
+from backend.storage.workflow_artifacts import (
     artifact_transaction_lock,
     begin_artifact_transaction,
     cleanup_artifact_transaction,
@@ -69,6 +69,8 @@ from ._workflow_artifacts import (
     write_json_atomic,
 )
 
+from core.paths import ARTIFACT_ROOT as PROJECT_ROOT
+
 logger = logging.getLogger(__name__)
 
 # ==================== 路由配置 ====================
@@ -80,7 +82,6 @@ executor_pool = ThreadPoolExecutor(max_workers=4)
 
 TASK_ID_PATTERN = re.compile(r"^task_[a-f0-9]{8}$")
 # 基于项目根目录（而非 CWD），从任意目录启动服务都能定位同一份数据
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = PROJECT_ROOT / "output"
 SAVED_DIR = PROJECT_ROOT / "saved"
 WORKFLOW_HOLDOUT_SIZE = 0.25

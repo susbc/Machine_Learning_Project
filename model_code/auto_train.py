@@ -10,7 +10,6 @@
 """
 
 import pandas as pd
-import numpy as np
 import joblib
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -26,6 +25,8 @@ from model_code.utils import (
     read_file_from_path,
     smart_sampling,
 )
+
+from model_code.config.config import MODEL_DIR
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -76,7 +77,7 @@ class AutoTrainer:
         self.max_iterations = max_iterations
         self.early_stopping_rounds = early_stopping_rounds
         self.min_improvement = min_improvement
-        self.model_dir = Path(model_dir) if model_dir else Path("model_code/saved")
+        self.model_dir = Path(model_dir) if model_dir else MODEL_DIR
         self.model_dir.mkdir(parents=True, exist_ok=True)
         self.algorithm = algorithm  # 算法标识，默认 "auto" 回退到 lightgbm
 

@@ -17,6 +17,8 @@ from typing import Optional, Dict, Any
 from model_code.utils import ConfigDrivenPreprocessor
 from model_code.predict import load_and_predict
 
+from model_code.config.config import MODEL_DIR, OUTPUT_DIR
+
 
 class BuildingModel:
     """
@@ -45,8 +47,8 @@ class BuildingModel:
         self.data_path = Path(data_path)
         self.config_path = Path(config_path)
         self.data_month = data_month
-        self.output_dir = Path(output_dir) if output_dir else Path("../output")
-        self.model_dir = Path(model_dir) if model_dir else Path("saved")
+        self.output_dir = Path(output_dir) if output_dir else OUTPUT_DIR
+        self.model_dir = Path(model_dir) if model_dir else MODEL_DIR
         
         # 确保目录存在
         self.output_dir.mkdir(parents=True, exist_ok=True)

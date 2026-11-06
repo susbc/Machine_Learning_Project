@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -315,12 +316,61 @@ def _preview_sql(sql: str, limit: int) -> str:
 
 
 def _dataframe_payload(df) -> Dict[str, Any]:
-    safe_df = df.where(df.notna(), None)
+    # where(..., None) retains NaT/NaN in datetime/float columns. Let pandas
+    # normalize these to JSON null and serialize actual dates as ISO strings.
+    rows = json.loads(df.to_json(orient="records", date_format="iso"))
     return {
-        "columns": [str(column) for column in safe_df.columns],
-        "rows": safe_df.to_dict(orient="records"),
-        "row_count": int(len(safe_df)),
+        "columns": [str(column) for column in df.columns],
+        "rows": rows,
+        "row_count": int(len(df)),
     }
+
+
+class ConnectionTestRequest(BaseModel):
+    config: DatabaseConfigPayload
+    connection_id: Optional[str] = None
+
+
+@router.post("/test")
+def test_adhoc_connection(payload: ConnectionTestRequest) -> Dict[str, Any]:
+    """按请求中的配置直接测试连接（不要求先保存）。
+
+    编辑现有连接且密码留空时，通过 connection_id 复用已存储的加密凭证，
+    与列表里"测试连接"按钮的语义保持一致。
+    """
+    incoming = payload.config.to_clean_dict(drop_blank_password=True)
+    config = {}
+    if payload.connection_id:
+        raw = _require_connection(_manager(), payload.connection_id)
+        saved = raw.get("config", {})
+        if saved.get("db_type") == incoming["db_type"]:
+            # Match update_connection: preserve credentials and driver options
+            # omitted by the editor, but test all supplied edits without saving.
+            config.update(saved)
+    config.update(incoming)
+    return _test_config(config)
+
+
+def _test_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    connector = None
+    runtime = {}
+    try:
+        runtime = _runtime_config(config)
+        connector = DatabaseConnector(runtime)
+        ok = connector.test_connection()
+        detail = getattr(connector, "last_error", "") or "请检查配置"
+    except HTTPException as exc:
+        ok, detail = False, str(exc.detail)
+    except Exception as exc:
+        ok, detail = False, f"{type(exc).__name__}: {exc}"
+    finally:
+        if connector is not None:
+            connector.disconnect()
+    # Driver errors must not echo a submitted credential into the page.
+    password = runtime.get("password")
+    if password:
+        detail = detail.replace(str(password), "****")
+    return {"ok": bool(ok), "message": "连接测试通过" if ok else f"连接测试失败：{detail}"}
 
 
 @router.get("/connections")
@@ -397,17 +447,7 @@ def delete_connection(connection_id: str) -> Response:
 def test_connection(connection_id: str) -> Dict[str, Any]:
     manager = _manager()
     raw = _require_connection(manager, connection_id)
-    try:
-        connector = _connector_for(raw)
-        ok = connector.test_connection()
-        connector.disconnect()
-    except Exception:
-        ok = False
-    return {
-        "connection_id": connection_id,
-        "ok": bool(ok),
-        "message": "连接测试通过" if ok else "连接测试失败，请检查配置",
-    }
+    return {"connection_id": connection_id, **_test_config(raw.get("config", {}))}
 
 
 @router.get("/connections/{connection_id}/schema")

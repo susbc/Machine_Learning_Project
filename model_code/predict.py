@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Optional, Union, Dict, Any
 import warnings
 
+from model_code.config.config import MODEL_DIR, OUTPUT_DIR
+
 warnings.filterwarnings('ignore')
 
 
@@ -40,8 +42,8 @@ def load_and_predict(
         预测结果 DataFrame
     """
     # 路径处理
-    model_dir = Path(model_dir) if model_dir else Path("saved")
-    output_dir = Path(output_dir) if output_dir else Path("../output")
+    model_dir = Path(model_dir) if model_dir else MODEL_DIR
+    output_dir = Path(output_dir) if output_dir else OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # 加载训练摘要 (获取算法名)
@@ -146,9 +148,9 @@ def batch_predict(
     if len(data_paths) != len(data_months):
         raise ValueError("data_paths 与 data_months 数量必须一致")
 
-    output_dir = Path(output_dir) if output_dir else Path("../output")
+    output_dir = Path(output_dir) if output_dir else OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
-    model_dir = Path(model_dir) if model_dir else Path("saved")
+    model_dir = Path(model_dir) if model_dir else MODEL_DIR
     results = {}
     
     for data_path, data_month in zip(data_paths, data_months):
@@ -215,7 +217,7 @@ def predict_with_explanation(
     Returns:
         包含解释的预测结果
     """
-    model_dir_p = Path(model_dir) if model_dir else Path("saved")
+    model_dir_p = Path(model_dir) if model_dir else MODEL_DIR
     summary_path = model_dir_p / "train_summary.joblib"
     algorithm = "lightgbm"
     if summary_path.exists():

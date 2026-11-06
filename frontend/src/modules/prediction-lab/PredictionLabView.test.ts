@@ -223,7 +223,7 @@ describe('PredictionLabView', () => {
     await flushPromises()
 
     expect(modelMocks.batchPredict).toHaveBeenCalledWith('manual:reg', {
-      rows: [{ x: 3, extra: '' }, { x: 4, extra: 'surplus' }],
+      rows: [{ x: 3, extra: null }, { x: 4, extra: 'surplus' }],
     })
     expect(wrapper.text()).toContain('批量结果')
     expect(wrapper.text()).toContain('7.5')

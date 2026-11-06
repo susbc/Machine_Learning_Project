@@ -14,17 +14,18 @@ from pydantic import BaseModel, Field
 from core.automl.problem_spec import ProblemType
 
 from ._common import validate_entity_id
-from ._dataset import parse_artifact_problem_metadata, predict_with_artifact, resolve_artifact_problem_type
-from ._workflow_artifacts import (
+from backend.services.datasets import parse_artifact_problem_metadata, predict_with_artifact, resolve_artifact_problem_type
+from backend.storage.workflow_artifacts import (
     artifact_transaction_lock,
     iter_visible_workflow_artifacts,
     reconcile_workflow_artifact,
 )
 
+from core.paths import ARTIFACT_ROOT as PROJECT_ROOT
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/models", tags=["Model Registry"])
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 

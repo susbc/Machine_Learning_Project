@@ -1,5 +1,5 @@
 <template>
-  <section class="mlops-workspace">
+  <section class="workspace-theme mlops-workspace">
     <div class="section-heading mlops-heading">
       <div>
         <p class="eyebrow">Phase 3</p>
@@ -18,7 +18,7 @@
       </div>
       <div class="status-item">
         <span>下次巡检</span>
-        <strong>{{ status?.next_run ?? '-' }}</strong>
+        <strong>{{ nextRunLabel }}</strong>
       </div>
       <div class="status-item">
         <span>任务数</span>
@@ -115,6 +115,13 @@ const status = ref<MlopsStatus | null>(null)
 const driftReport = ref<DriftReport | null>(null)
 const healthRows = ref<ModelHealthRow[]>([])
 const logs = ref<InspectionLogRow[]>([])
+
+const nextRunLabel = computed(() => {
+  const value = status.value?.next_run
+  if (!value) return '-'
+  const parts = value.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/)
+  return parts ? `${parts[1]} ${parts[2]}` : value
+})
 
 const psiRows = computed<PsiRow[]>(() => {
   const features = driftReport.value?.features ?? {}

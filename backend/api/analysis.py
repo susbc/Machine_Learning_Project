@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from ._dataset import detect_target_col, read_uploaded_dataframe
+from backend.services.datasets import detect_target_col, read_uploaded_dataframe
 from model_code.analysis.registry import ensure_within_project, list_recent_records, scrub_sensitive
 from model_code.analysis.report_builder import build_composite_report, save_composite_report
 from model_code.analysis.rule_engine import diagnose_dataset, diagnose_prediction, diagnose_training

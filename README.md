@@ -21,10 +21,15 @@ Agentic AutoML Platform 是一个面向表格数据建模的机器学习平台�
 
 ```text
 .
-├── backend/                 # FastAPI 服务、工作流 API、MLOps API、调度器
+├── backend/
+│   ├── api/                 # HTTP 路由、请求校验与任务编排
+│   ├── services/            # 共享数据准备、训练评估与推理管线
+│   ├── storage/             # 工作流模型产物事务、原子写入与恢复
+│   ├── runtime_state.py     # SQLite 任务状态与有界后台执行器
+│   └── main.py              # 服务装配、鉴权与前端托管
 ├── core/
+│   ├── paths.py             # 代码资源与可写产物的统一路径配置
 │   ├── automl/              # Optuna AutoML 优化器
-│   ├── feature_engineering/ # EDA 与特征工程 Agent
 │   ├── knowledge/           # Neo4j/FAISS/Schema Embedding 知识检索
 │   └── llm/                 # LLM Agent 编排与 Pydantic Schema
 ├── model_code/              # 训练、预测、预处理、模型工厂、数据库连接
@@ -33,12 +38,23 @@ Agentic AutoML Platform 是一个面向表格数据建模的机器学习平台�
 ├── config/                  # LLM Provider 等本地配置（密钥文件不入库）
 ├── docs/                    # 前端迁移 runbook 等工程文档
 ├── tests/                   # 单元测试和集成测试
-├── scripts/                 # 数据生成、演示、辅助脚本
+├── scripts/                 # 数据生成与辅助脚本；独立演示位于 examples/
 ├── input_data/              # 本地输入数据目录
 ├── output/                  # 工作流中间产物和预测输出
 ├── saved/                   # FastAPI 工作流模型产物与 runtime_state 持久化
 └── model_code/saved/        # 传统训练流水线模型产物
 ```
+
+路由复用 `backend/services/datasets.py` 完成上传、预处理、指标计算和预测；
+工作流产物的发布与异常恢复集中在 `backend/storage/workflow_artifacts.py`。
+底层 `core/`、`model_code/` 不依赖 HTTP 路由。实际使用的 Agent 统一由
+`core/llm/agent_orchestrator.py` 编排，已移除未接入业务的旧 EDA、特征工程及
+数据检索 Agent 原型；仍在使用的传统训练和 Streamlit 回退功能继续保留。
+
+代码资源路径固定于仓库；可写目录由 `ML_ARTIFACT_ROOT` 控制，默认仍在仓库内。
+传统训练默认统一写入 `model_code/saved/`，预测结果写入 `output/`，不再随启动目录变化。
+显式传入的 `model_dir`、`output_dir` 优先；`ML_RUNTIME_STATE_DIR` 可单独覆盖运行状态目录。
+pytest 在收集测试前分配独立临时产物目录，避免样例模型与测试任务进入正式模型库。
 
 ## 快速开始
 
@@ -86,6 +102,8 @@ export ML_BACKGROUND_WORKERS=2
 export ML_MAX_PENDING_JOBS=32
 # 自动清理超过指定天数的数据集和已结束任务，默认 30 天
 export ML_RUNTIME_RETENTION_DAYS=30
+# 可选：统一迁移模型和工作流输出根目录（修改配置不会自动搬迁现有文件）
+export ML_ARTIFACT_ROOT=/path/to/artifacts
 # 可选：修改 SQLite 元数据与运行时对象的保存位置
 export ML_RUNTIME_STATE_DIR=/path/to/runtime_state
 ```
@@ -240,7 +258,7 @@ export LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 export API_KEY=$(openssl rand -hex 32)     # /api/* 接口鉴权（对外部署时必需）
 export ALLOW_NETWORK_API_WITHOUT_AUTH=1    # 未配置 API_KEY 时显式放开远程访问（不推荐）
 export FRONTEND_DIST_PATH=frontend/dist    # 自定义前端构建产物目录（可选）
-export ML_MAX_UPLOAD_MB=50                 # 数据文件上传大小上限（MB）
+export ML_MAX_UPLOAD_MB=100                 # 数据文件上传大小上限（MB）
 
 # MLOps 监控（backend/scheduler.py）
 export ACTIVE_MODEL_VERSION=task_xxxxxxxx  # 每日巡检监控的工作流任务 ID

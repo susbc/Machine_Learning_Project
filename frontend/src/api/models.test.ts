@@ -152,3 +152,33 @@ describe('models api', () => {
     expect(batch.summary.count).toBe(2)
   })
 })
+
+describe('large prediction batches', () => {
+  it('chunks to the API limit and merges row order and weighted summaries', async () => {
+    const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+      const { rows } = JSON.parse(init!.body as string) as { rows: { x: number }[] }
+      expect(rows.length).toBeLessThanOrEqual(1000)
+      const probability = rows[0]!.x === 0 ? 0.2 : 0.8
+      return new Response(JSON.stringify({
+        model_id: 'manual:test', source: 'manual_training',
+        summary: { count: rows.length, positive_rate: probability, average_probability: probability },
+        rows: rows.map((features, index) => ({ index, features, prediction: features.x, probability })),
+      }))
+    })
+    const api = createModelsApi({ baseUrl: '', fetcher: fetcher as typeof fetch })
+    const rows = Array.from({ length: 2505 }, (_, x) => ({ x }))
+    const result = await api.batchPredict('manual:test', { rows })
+    expect(fetcher).toHaveBeenCalledTimes(3)
+    expect(result.summary.count).toBe(2505)
+    expect(result.summary.average_probability).toBeCloseTo((1000 * 0.2 + 1505 * 0.8) / 2505)
+    expect(result.rows.map((row) => row.index)).toEqual(rows.map((row) => row.x))
+    expect(result.rows.map((row) => row.features)).toEqual(rows)
+  })
+
+  it('stops on a failed chunk instead of returning partial success', async () => {
+    const fetcher = vi.fn(async () => new Response('{"detail":"failed"}', { status: 500 }))
+    const api = createModelsApi({ baseUrl: '', fetcher: fetcher as typeof fetch })
+    await expect(api.batchPredict('manual:test', { rows: Array.from({ length: 2001 }, () => ({ x: 1 })) })).rejects.toThrow()
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  })
+})

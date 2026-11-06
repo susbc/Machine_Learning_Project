@@ -12,18 +12,17 @@ from pathlib import Path
 import os
 from typing import Optional
 
+from core.paths import PROJECT_ROOT, ARTIFACT_ROOT
+
 
 # ============================================================================
 # 基础路径配置
 # ============================================================================
 
-# 项目根目录
-PROJECT_ROOT = Path(__file__).parent.parent
-
 # 输入输出目录
 INPUT_DIR = PROJECT_ROOT / "input_data"
-OUTPUT_DIR = PROJECT_ROOT / "output"
-MODEL_DIR = PROJECT_ROOT / "model_code" / "saved"
+OUTPUT_DIR = ARTIFACT_ROOT / "output"
+MODEL_DIR = ARTIFACT_ROOT / "model_code" / "saved"
 CONFIG_DIR = PROJECT_ROOT / "model_code" / "config"
 
 # 确保目录存在

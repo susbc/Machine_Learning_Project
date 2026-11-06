@@ -1,5 +1,5 @@
 <template>
-  <section class="analysis-workspace">
+  <section class="workspace-theme analysis-workspace">
     <div class="section-heading analysis-heading">
       <div>
         <p class="eyebrow">Phase 2</p>

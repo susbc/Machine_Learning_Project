@@ -21,6 +21,8 @@ from sklearn.metrics import (
 import lightgbm as lgb
 from sklearn.base import clone
 
+from model_code.config.config import MODEL_DIR, OUTPUT_DIR
+
 
 def lgbm_train_with_random_search(
     X: pd.DataFrame,
@@ -55,8 +57,8 @@ def lgbm_train_with_random_search(
         训练结果字典
     """
     # 路径处理
-    model_dir = Path(model_dir) if model_dir else Path("saved")
-    output_dir = Path(output_dir) if output_dir else Path("../output")
+    model_dir = Path(model_dir) if model_dir else MODEL_DIR
+    output_dir = Path(output_dir) if output_dir else OUTPUT_DIR
     model_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     

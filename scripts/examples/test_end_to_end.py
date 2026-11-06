@@ -11,11 +11,11 @@ Agentic AutoML Platform v3.0.0 - 端到端测试脚本
 运行方式:
     cd /Users/rgj/PycharmProjects/Machine_Learning_Project
     source .venv/bin/activate
-    python test_end_to_end.py
+    python scripts/examples/test_end_to_end.py
 
 输出:
     - 控制台实时输出测试结果
-    - 验证报告保存到桌面
+    - 验证报告保存到 output/examples/
 """
 
 import os
@@ -29,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 # 添加项目路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 # 配置日志
 logging.basicConfig(
@@ -43,6 +43,8 @@ class EndToEndTester:
     """端到端测试器"""
     
     def __init__(self):
+        self.artifact_dir = Path(__file__).resolve().parents[2] / "output" / "examples" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.test_results = []
         self.start_time = None
         self.end_time = None
@@ -320,7 +322,7 @@ class EndToEndTester:
             
             # Step 4: 持久化
             result["details"].append("\nStep 4: 模型持久化")
-            os.makedirs("saved", exist_ok=True)
+            self.artifact_dir.mkdir(parents=True, exist_ok=True)
             self.task_id = f"test_{int(time.time())}"
             
             import joblib
@@ -328,13 +330,13 @@ class EndToEndTester:
                 "model": model,
                 "feature_executor": executor,
                 "config": {"task_type": "binary_classification"}
-            }, f"saved/model_{self.task_id}.pkl")
+            }, self.artifact_dir / f"model_{self.task_id}.pkl")
             
-            result["details"].append(f"  ✅ 模型已保存：saved/model_{self.task_id}.pkl")
+            result["details"].append(f"  ✅ 模型已保存：{self.artifact_dir}/model_{self.task_id}.pkl")
             
             # Step 5: 线上推理
             result["details"].append("\nStep 5: 线上推理")
-            artifact = joblib.load(f"saved/model_{self.task_id}.pkl")
+            artifact = joblib.load(self.artifact_dir / f"model_{self.task_id}.pkl")
             loaded_executor = artifact["feature_executor"]
             loaded_model = artifact["model"]
             
@@ -359,9 +361,9 @@ class EndToEndTester:
             result["details"].append("\nStep 6: MLOps 监控")
             monitor = self.DataDriftMonitor()
             baseline = monitor.extract_baseline(df_clean, ['age', 'order_fee'])
-            monitor.save_baseline(baseline, f"saved/baseline_{self.task_id}.json")
+            monitor.save_baseline(baseline, self.artifact_dir / f"baseline_{self.task_id}.json")
             
-            result["details"].append(f"  ✅ 基线数据已保存：saved/baseline_{self.task_id}.json")
+            result["details"].append(f"  ✅ 基线数据已保存：{self.artifact_dir}/baseline_{self.task_id}.json")
             
             # 模拟漂移检测
             psi_report = monitor.generate_drift_report(baseline, df_clean)
@@ -451,8 +453,8 @@ class EndToEndTester:
 ## 📦 测试产物
 
 - **任务 ID**: `{report['task_id']}`
-- **模型文件**: `saved/model_{report['task_id']}.pkl`
-- **基线数据**: `saved/baseline_{report['task_id']}.json`
+- **模型文件**: `{self.artifact_dir}/model_{report['task_id']}.pkl`
+- **基线数据**: `{self.artifact_dir}/baseline_{report['task_id']}.json`
 
 ---
 
@@ -488,8 +490,8 @@ def main():
     # 运行所有测试
     report = tester.run_all_tests()
     
-    # 保存报告到桌面
-    desktop_path = Path.home() / "Desktop"
+    # 保存报告到示例输出目录
+    desktop_path = tester.artifact_dir
     desktop_path.mkdir(exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -506,7 +508,7 @@ def main():
     logger.info(f"失败：{report['summary']['failed']}")
     logger.info(f"通过率：{report['summary']['pass_rate']}")
     logger.info(f"测试耗时：{report['duration_seconds']:.2f}秒")
-    logger.info(f"\n📄 报告已保存到桌面：{report_path}")
+    logger.info(f"\n📄 报告已保存：{report_path}")
     logger.info("\n" + "=" * 60)
     
     # 返回退出码

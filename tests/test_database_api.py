@@ -256,3 +256,118 @@ def test_query_preview_blocks_side_effect_functions(monkeypatch, tmp_path):
         json={"connection_id": connection_id, "sql": "SELECT id, name FROM customers", "limit": 5},
     )
     assert normal.status_code == 200
+
+
+def test_draft_connection_reuses_credentials_and_driver_options_without_saving(monkeypatch, tmp_path):
+    storage = tmp_path / 'connections.json'
+    monkeypatch.setenv('DATABASE_CONNECTIONS_PATH', str(storage))
+    monkeypatch.setenv('DATABASE_CONFIG_SECRET', 'draft-test-secret')
+    client = TestClient(app)
+    saved_config = {
+        'db_type': 'mysql', 'host': 'localhost', 'database': 'original',
+        'user': 'tester', 'password': 'saved-secret',
+        'extra_params': {'charset': 'utf8mb4'},
+    }
+    connection = client.post('/api/database/connections', json={
+        'name': 'draft test', 'config': saved_config,
+    }).json()
+    before = storage.read_bytes()
+    seen, closed = [], []
+
+    class Connector:
+        last_error = None
+
+        def __init__(self, config):
+            seen.append(config)
+
+        def test_connection(self):
+            return True
+
+        def disconnect(self):
+            closed.append(True)
+
+    monkeypatch.setattr(database_api, 'DatabaseConnector', Connector)
+    draft = {**saved_config, 'database': 'edited', 'password': ''}
+    draft.pop('extra_params')
+    for password, expected in [('', 'saved-secret'), ('replacement-secret', 'replacement-secret')]:
+        draft['password'] = password
+        response = client.post('/api/database/test', json={
+            'connection_id': connection['id'], 'config': draft,
+        })
+        assert response.status_code == 200
+        assert response.json()['ok'] is True
+        assert seen[-1]['database'] == 'edited'
+        assert seen[-1]['password'] == expected
+        assert seen[-1]['extra_params'] == {'charset': 'utf8mb4'}
+        assert storage.read_bytes() == before
+    assert len(closed) == 2
+
+
+def test_draft_connection_failure_closes_connector_and_redacts_password(monkeypatch):
+    closed = []
+
+    class Connector:
+        def __init__(self, config):
+            self.password = config['password']
+
+        def test_connection(self):
+            raise RuntimeError('connection rejected: ' + self.password)
+
+        def disconnect(self):
+            closed.append(True)
+
+    monkeypatch.setattr(database_api, 'DatabaseConnector', Connector)
+    response = TestClient(app).post('/api/database/test', json={'config': {
+        'db_type': 'mysql', 'host': 'localhost', 'database': 'draft', 'password': 'private-secret',
+    }})
+    assert response.status_code == 200
+    assert response.json()['ok'] is False
+    assert 'connection rejected' in response.json()['message']
+    assert 'private-secret' not in response.text
+    assert closed == [True]
+
+
+def test_schema_and_preview_serialize_missing_dates_and_numbers(monkeypatch, tmp_path):
+    import pandas as pd
+
+    monkeypatch.setenv('DATABASE_CONNECTIONS_PATH', str(tmp_path / 'connections.json'))
+    client = TestClient(app)
+    connection = client.post('/api/database/connections', json={
+        'name': 'nullable data', 'config': {'db_type': 'sqlite', 'database': ':memory:'},
+    }).json()
+    frame = pd.DataFrame({
+        'recorded_at': pd.to_datetime(['2026-11-06 03:00:00', None, None]),
+        'score': [1.25, float('nan'), float('inf')],
+        'note': ['中文', None, None],
+    })
+
+    class Connector:
+        def list_tables(self):
+            return ['records']
+
+        def get_table_columns(self, name):
+            return [{'name': 'recorded_at', 'type': 'DATETIME', 'nullable': True}]
+
+        def read_table(self, name, limit):
+            return frame
+
+        def query(self, sql):
+            return frame
+
+        def disconnect(self):
+            pass
+
+    monkeypatch.setattr(database_api, '_connector_for', lambda raw: Connector())
+    schema = client.get(f"/api/database/connections/{connection['id']}/schema")
+    assert schema.status_code == 200
+    preview = client.post('/api/database/query-preview', json={
+        'connection_id': connection['id'], 'sql': 'SELECT * FROM records',
+    })
+    assert preview.status_code == 200
+    for payload in [schema.json()['tables'][0]['sample'], preview.json()]:
+        assert payload['row_count'] == 3
+        assert payload['rows'][0] == {
+            'recorded_at': '2026-11-06T03:00:00.000', 'score': 1.25, 'note': '中文',
+        }
+        assert payload['rows'][1] == {'recorded_at': None, 'score': None, 'note': None}
+        assert payload['rows'][2]['score'] is None

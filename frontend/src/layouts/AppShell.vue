@@ -23,14 +23,14 @@
           :to="item.path"
           class="nav-item"
         >
-          <component :is="navIcon(item.name)" class="nav-icon" :size="17" :stroke-width="1.9" />
+          <component :is="navIcon(item.name)" class="nav-icon" :size="20" :stroke-width="1.8" />
           <span>{{ item.label }}</span>
         </RouterLink>
       </nav>
 
       <img
         class="sidebar-deco"
-        src="@/assets/brand-logo.png"
+        src="@/assets/sidebar-cube.svg"
         alt=""
         aria-hidden="true"
       />

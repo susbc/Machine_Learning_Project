@@ -1,5 +1,5 @@
 <template>
-  <section class="page-section">
+  <section class="workspace-theme page-section">
     <div class="section-heading">
       <p class="eyebrow">Migration Status</p>
       <h2>前端替代状态看板</h2>

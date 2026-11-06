@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="310" viewBox="0 0 1000 310" fill="none">
+  <defs><linearGradient id="wave" x1="320" y1="180" x2="800" y2="0" gradientUnits="userSpaceOnUse"><stop stop-color="#fff" stop-opacity="0"/><stop offset=".45" stop-color="#fff" stop-opacity=".68"/><stop offset=".7" stop-color="#7CF4F0" stop-opacity=".75"/><stop offset="1" stop-color="#C8E4FF" stop-opacity=".42"/></linearGradient></defs>
+  <g stroke="url(#wave)" stroke-width="1.25">
+    <path d="M20 218C228 97 414 176 555 106 652 58 678-28 868-40"/>
+    <path d="M20 224C229 100 415 172 557 101 655 53 685-24 877-37"/>
+    <path d="M20 230C229 103 418 169 560 96 659 48 692-21 886-34"/>
+    <path d="M20 236C229 106 421 165 563 91 663 43 699-17 895-31"/>
+    <path d="M20 242C229 109 424 162 566 86 667 38 706-14 904-28"/>
+    <path d="M20 248C229 112 427 158 569 81 671 33 713-10 913-25"/>
+    <path d="M20 254C229 115 430 155 572 76 675 28 720-7 922-22"/>
+    <path d="M20 260C229 118 433 151 575 71 679 23 727-3 931-19"/>
+    <path d="M20 266C229 121 436 148 578 66 683 18 734 0 940-16"/>
+    <path d="M20 272C229 124 439 144 581 61 687 13 741 4 949-13"/>
+    <path d="M20 278C229 127 442 141 584 56 691 8 748 7 958-10"/>
+    <path d="M20 284C229 130 445 137 587 51 695 3 755 11 967-7"/>
+  </g>
+  <g stroke="#fff" stroke-opacity=".42" stroke-width="1"><path d="M375 238C540 139 611 132 778 127S923 174 1030 225"/><path d="M382 245C543 146 617 139 782 134S928 182 1030 234"/><path d="M389 252C546 153 623 146 786 141S933 190 1030 243"/></g>
+</svg>

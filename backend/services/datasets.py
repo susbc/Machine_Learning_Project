@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 LABEL_NAME_CANDIDATES = ("label", "target", "y", "class", "is_fraud", "是否违约", "标签", "目标")
 KEY_COLUMN_TOKENS = ("id", "uuid", "key", "编号", "序号", "订单号", "用户号")
-MAX_UPLOAD_BYTES = int(os.getenv("ML_MAX_UPLOAD_MB", "50")) * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.getenv("ML_MAX_UPLOAD_MB", "100")) * 1024 * 1024
 SUPPORTED_DATA_SUFFIXES = {".csv", ".txt", ".xlsx", ".xls"}
 
 

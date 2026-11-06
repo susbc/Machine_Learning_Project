@@ -203,7 +203,7 @@ def test_manual_multiclass_training_keeps_default_threshold_calibration():
     expected_calibration = {"threshold": 0.5, "source": "default", "calibration_size": 0}
     assert result["threshold_calibration"] == expected_calibration
     saved = client.post(f"/api/training/jobs/{job['job_id']}/save")
-    artifact = joblib.load(Path(__file__).parents[1] / saved.json()["artifact_path"])
+    artifact = joblib.load(training_api.PROJECT_ROOT / saved.json()["artifact_path"])
     assert artifact["decision_threshold"] == 0.5
     assert artifact["threshold_calibration"] == expected_calibration
 
@@ -243,7 +243,7 @@ def test_manual_linear_regression_completes_with_regression_metrics():
 
     saved = client.post(f"/api/training/jobs/{job['job_id']}/save")
     assert saved.status_code == 200
-    artifact = joblib.load(Path(__file__).parents[1] / saved.json()["artifact_path"])
+    artifact = joblib.load(training_api.PROJECT_ROOT / saved.json()["artifact_path"])
     assert artifact["artifact_schema_version"] == 3
     assert artifact["problem_type"] == "regression"
     assert artifact["problem_spec"]["resolved_type"] == "regression"

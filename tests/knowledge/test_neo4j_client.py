@@ -28,8 +28,8 @@ class TestNeo4jClient:
         
         # 模拟 session
         mock_session = MagicMock()
-        mock_driver.driver.return_value.__enter__ = Mock(return_value=mock_session)
-        mock_driver.driver.return_value.__exit__ = Mock(return_value=None)
+        mock_driver.driver.return_value.session.return_value.__enter__ = Mock(return_value=mock_session)
+        mock_driver.driver.return_value.session.return_value.__exit__ = Mock(return_value=None)
         
         client = Neo4jClient(
             uri=TEST_NEO4J_URI,
@@ -63,7 +63,7 @@ class TestNeo4jClient:
     def test_get_table_node(self, client, mock_driver):
         """测试获取表节点"""
         # 模拟返回
-        mock_session = mock_driver.driver.return_value.__enter__.return_value
+        mock_session = mock_driver.driver.return_value.session.return_value.__enter__.return_value
         mock_result = MagicMock()
         mock_result.single.return_value = {"name": "test_table", "description": "测试表"}
         mock_session.run.return_value = mock_result
@@ -75,7 +75,7 @@ class TestNeo4jClient:
     
     def test_get_table_node_not_found(self, client, mock_driver):
         """测试获取不存在的表节点"""
-        mock_session = mock_driver.driver.return_value.__enter__.return_value
+        mock_session = mock_driver.driver.return_value.session.return_value.__enter__.return_value
         mock_result = MagicMock()
         mock_result.single.return_value = None
         mock_session.run.return_value = mock_result
@@ -86,7 +86,7 @@ class TestNeo4jClient:
     
     def test_list_tables(self, client, mock_driver):
         """测试列出所有表"""
-        mock_session = mock_driver.driver.return_value.__enter__.return_value
+        mock_session = mock_driver.driver.return_value.session.return_value.__enter__.return_value
         mock_result = MagicMock()
         mock_result.__iter__ = Mock(return_value=iter([
             {"name": "table1"},
@@ -118,7 +118,7 @@ class TestNeo4jClient:
     
     def test_get_columns(self, client, mock_driver):
         """测试获取字段列表"""
-        mock_session = mock_driver.driver.return_value.__enter__.return_value
+        mock_session = mock_driver.driver.return_value.session.return_value.__enter__.return_value
         mock_result = MagicMock()
         mock_result.__iter__ = Mock(return_value=iter([
             {"name": "id", "type": "INT", "description": "主键"},
@@ -145,7 +145,7 @@ class TestNeo4jClient:
     
     def test_get_foreign_keys(self, client, mock_driver):
         """测试获取外键列表"""
-        mock_session = mock_driver.driver.return_value.__enter__.return_value
+        mock_session = mock_driver.driver.return_value.session.return_value.__enter__.return_value
         mock_result = MagicMock()
         mock_result.__iter__ = Mock(return_value=iter([
             {
@@ -165,7 +165,7 @@ class TestNeo4jClient:
     
     def test_get_related_tables(self, client, mock_driver):
         """测试获取相关表"""
-        mock_session = mock_driver.driver.return_value.__enter__.return_value
+        mock_session = mock_driver.driver.return_value.session.return_value.__enter__.return_value
         mock_result = MagicMock()
         mock_result.__iter__ = Mock(return_value=iter([
             {"name": "customers", "description": "客户表"}
@@ -180,7 +180,7 @@ class TestNeo4jClient:
     def test_export_schema(self, client, mock_driver):
         """测试导出 Schema"""
         # 模拟 list_tables
-        mock_session = mock_driver.driver.return_value.__enter__.return_value
+        mock_session = mock_driver.driver.return_value.session.return_value.__enter__.return_value
         mock_session.run.return_value.__iter__ = Mock(return_value=iter([
             {"name": "table1"}
         ]))
@@ -193,7 +193,7 @@ class TestNeo4jClient:
     def test_get_table_schema_text(self, client, mock_driver):
         """测试获取表 Schema 文本"""
         # 模拟返回
-        mock_session = mock_driver.driver.return_value.__enter__.return_value
+        mock_session = mock_driver.driver.return_value.session.return_value.__enter__.return_value
         
         # get_table_node 返回
         mock_result = MagicMock()

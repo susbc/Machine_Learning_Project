@@ -13,7 +13,6 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -23,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from ._common import validate_entity_id
 from backend.runtime_state import TaskQueueFullError, background_tasks, runtime_state
-from ._dataset import (
+from backend.services.datasets import (
     calibrate_binary_threshold,
     compute_classification_metrics,
     compute_regression_metrics,
@@ -46,11 +45,12 @@ from core.automl.problem_spec import (
     validate_train_test_split,
 )
 
+from core.paths import ARTIFACT_ROOT as PROJECT_ROOT
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/training", tags=["Manual Training"])
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_DIR = PROJECT_ROOT / "saved" / "manual_training"
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}

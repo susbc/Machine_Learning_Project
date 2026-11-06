@@ -16,13 +16,14 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from core.paths import SAVED_DIR
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/mlops", tags=["MLOps 监控"])
 
 # 日志文件路径
 LOGS_DIR = "logs"
-SAVED_DIR = "saved"
 
 
 class DriftReportRequest(BaseModel):

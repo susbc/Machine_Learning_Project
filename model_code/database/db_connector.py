@@ -69,6 +69,8 @@ class DatabaseConnector:
         self.engine: Optional[Any] = None
         self.connection = None
         self._connection_string = None
+        # 最近一次连接/测试失败的原因，供 API 层返回给用户定位问题
+        self.last_error: Optional[str] = None
         
         # 验证配置
         self._validate_config()
@@ -163,9 +165,11 @@ class DatabaseConnector:
             )
             self.connection = self.engine.connect()
             logger.info(f"成功连接到 {self.db_type} 数据库")
+            self.last_error = None
             return True
         except SQLAlchemyError as e:
             logger.error(f"数据库连接失败：{str(e)}")
+            self.last_error = str(e)
             self.engine = None
             self.connection = None
             return False
@@ -186,9 +190,11 @@ class DatabaseConnector:
             with self.engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
             logger.info("数据库连接测试成功")
+            self.last_error = None
             return True
         except SQLAlchemyError as e:
             logger.error(f"数据库连接测试失败：{str(e)}")
+            self.last_error = str(e)
             return False
     
     def disconnect(self) -> None:

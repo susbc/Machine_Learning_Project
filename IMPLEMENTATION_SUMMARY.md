@@ -160,7 +160,7 @@ pyodbc>=4.0.0
   - DataGenerator 测试
 
 **演示脚本:**
-- `demo_all_features.py` - 全功能演示 (6.6KB)
+- `scripts/examples/demo_all_features.py` - 全功能演示 (6.6KB)
 
 ---
 
@@ -287,7 +287,7 @@ brew install libomp
 - [x] 依赖更新 (requirements.txt)
 - [x] 主应用导航更新 (app.py)
 - [x] 功能文档 (NEW_FEATURES.md)
-- [x] 演示脚本 (demo_all_features.py)
+- [x] 演示脚本 (scripts/examples/demo_all_features.py)
 
 ---
 

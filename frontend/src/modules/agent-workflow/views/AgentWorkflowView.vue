@@ -1,5 +1,5 @@
 <template>
-  <section class="workflow-workspace">
+  <section class="workspace-theme workflow-workspace">
     <div class="section-heading workflow-heading">
       <div>
         <p class="eyebrow">Phase 6</p>

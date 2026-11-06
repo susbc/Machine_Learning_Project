@@ -4,10 +4,18 @@ Pytest 配置文件
 提供全局的 fixture 和配置
 """
 
+from pathlib import Path
+import os
+import tempfile
+
+# 必须在 pytest 收集并导入应用模块前设置；fixture 执行时全局存储已初始化。
+_test_runtime = tempfile.TemporaryDirectory(prefix="automl-pytest-")
+os.environ["ML_ARTIFACT_ROOT"] = _test_runtime.name
+os.environ["ML_RUNTIME_STATE_DIR"] = str(Path(_test_runtime.name) / "saved" / "runtime_state")
+
 import pytest
 import pandas as pd
 import numpy as np
-from pathlib import Path
 import sys
 
 # 添加项目根目录到路径

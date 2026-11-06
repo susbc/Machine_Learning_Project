@@ -290,9 +290,9 @@ def diagnose_training(
     next_actions: List[str] = []
 
     train_auc = _as_optional_float(metrics.get("train_auc"))
-    val_auc = _as_optional_float(metrics.get("val_auc", metrics.get("test_auc")))
+    val_auc = _as_optional_float(metrics.get("val_auc", metrics.get("test_auc", metrics.get("roc_auc"))))
     train_f1 = _as_optional_float(metrics.get("train_f1"))
-    val_f1 = _as_optional_float(metrics.get("val_f1", metrics.get("best_f1")))
+    val_f1 = _as_optional_float(metrics.get("val_f1", metrics.get("best_f1", metrics.get("f1"))))
     train_size = int(safe_float(metrics.get("train_size"), 0.0))
     val_size = int(safe_float(metrics.get("val_size", metrics.get("test_size")), 0.0))
     n_features = int(safe_float(metrics.get("n_features"), 0.0))
@@ -309,6 +309,30 @@ def diagnose_training(
             EvidenceItem("n_features", n_features, "特征数"),
         ]
     )
+
+    # 当前训练 API 的指标来自留出集；回归指标不能作为分类 AUC/F1 解释。
+    regression_metrics = {
+        name: _as_optional_float(metrics.get(name)) for name in ("rmse", "mae", "r2")
+    }
+    is_regression = any(value is not None for value in regression_metrics.values())
+    if is_regression:
+        evidence = [item for item in evidence if item.name not in {"train_auc", "val_auc", "train_f1", "val_f1"}]
+        for name, value in regression_metrics.items():
+            if value is not None:
+                evidence.append(EvidenceItem(name, _none_or_round(value), f"留出集 {name.upper()}"))
+        if regression_metrics["r2"] is not None and regression_metrics["r2"] < 0:
+            _risk(risks, "negative_validation_r2", "high", "留出集 R² 小于 0，效果差于均值基线。",
+                  "检查目标、异常值和特征有效性，并与简单回归基线比较。", ["r2"])
+        recommendations.append(RecommendationItem(
+            title="validate_regression_error", action="结合目标单位和业务容忍度评估 MAE/RMSE，并检查残差分布。",
+            priority="medium", reason="误差绝对值依赖目标尺度，不能套用分类概率或阈值规则。",
+        ))
+
+    if val_auc is None and val_f1 is None and not is_regression and not any(
+        _as_optional_float(metrics.get(name)) is not None for name in ("accuracy", "balanced_accuracy", "macro_f1")
+    ):
+        _risk(risks, "missing_validation_metrics", "medium", "未提供可识别的验证指标，无法判断模型效果。",
+              "提供留出集分类或回归指标后再评估模型。")
 
     if val_auc is not None:
         if val_auc < 0.6:
@@ -408,7 +432,7 @@ def diagnose_training(
                 title="promote_candidate_model",
                 action="当前训练指标没有触发明显风险，可进入模型对比或 MLOps 基线保存。",
                 priority="medium",
-                reason="验证指标、过拟合信号和阈值均未触发规则告警。",
+                reason="已提供的指标未触发规则告警；缺少训练指标时无法判断过拟合。",
             )
         )
         next_actions.append("保存模型并建立监控基线")

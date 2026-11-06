@@ -1,4 +1,4 @@
-"""共享数据处理管线（backend/api/_dataset.py）的单元测试。
+"""共享数据处理管线（backend/services/datasets.py）的单元测试。
 
 覆盖：先划分后拟合（无泄漏）、小数据集、高基数类别限爆、指标省略语义、
 统一推理（v2/executor/legacy 三形态）、特征重要性命名。
@@ -13,8 +13,8 @@ import pytest
 from fastapi import HTTPException
 from starlette.datastructures import UploadFile
 
-import backend.api._dataset as dataset_api
-from backend.api._dataset import (
+import backend.services.datasets as dataset_api
+from backend.services.datasets import (
     TrainBundle,
     _normalise_dataframe,
     _read_csv_bytes,

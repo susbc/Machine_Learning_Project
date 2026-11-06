@@ -4,7 +4,7 @@ Agent Crash-Proof 防崩测试
 测试 LangChain + Pydantic 结构化输出的防幻觉能力。
 
 运行方法:
-    python test_agent_crashproof.py
+    python scripts/examples/test_agent_crashproof.py
 
 前置条件:
     pip install langchain langchain-openai pydantic
@@ -12,9 +12,10 @@ Agent Crash-Proof 防崩测试
 
 import os
 import sys
+from pathlib import Path
 
 # 添加项目路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from core.llm.agent_orchestrator import AgentOrchestrator, create_orchestrator
 

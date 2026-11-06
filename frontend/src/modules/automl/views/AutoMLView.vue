@@ -85,12 +85,12 @@
 
           <label>
             <span class="field-label"><Layers :size="14" :stroke-width="1.9" />Trial 次数</span>
-            <el-input-number v-model="nTrials" :min="1" :max="100" :step="1" controls-position="right" />
+            <el-input-number v-model="nTrials" :min="1" :max="100" :step="1" />
           </label>
 
           <label>
             <span class="field-label"><Grid2x2 :size="14" :stroke-width="1.9" />交叉验证</span>
-            <el-input-number v-model="cvFolds" :min="2" :max="10" :step="1" controls-position="right" />
+            <el-input-number v-model="cvFolds" :min="2" :max="10" :step="1" />
           </label>
         </div>
 
@@ -137,7 +137,6 @@
                 :max="1"
                 :step="0.05"
                 :precision="2"
-                controls-position="right"
               />
             </label>
           </div>
@@ -145,7 +144,7 @@
           <div class="form-grid">
             <label>
               <span class="field-label"><Timer :size="14" :stroke-width="1.9" />早停轮数（0 为关闭）</span>
-              <el-input-number v-model="earlyStoppingRounds" :min="0" :max="50" :step="1" controls-position="right" />
+              <el-input-number v-model="earlyStoppingRounds" :min="0" :max="50" :step="1" />
             </label>
             <label>
               <span class="field-label"><Gauge :size="14" :stroke-width="1.9" />最小改进幅度</span>
@@ -155,35 +154,12 @@
                 :max="0.5"
                 :step="0.001"
                 :precision="4"
-                controls-position="right"
                 :disabled="earlyStoppingRounds === 0"
               />
             </label>
           </div>
         </div>
 
-        <label class="full-field">
-          <span class="field-label"><FileText :size="14" :stroke-width="1.9" />业务场景</span>
-          <el-input
-            v-model="businessContext"
-            type="textarea"
-            :rows="3"
-            placeholder="例如：信贷风控、流失预测、质量检测"
-          />
-        </label>
-
-        <div class="option-row">
-          <span>调用 LLM 决策</span>
-          <el-switch v-model="useLlm" active-text="启用" inactive-text="禁用" />
-        </div>
-
-        <div class="actions">
-          <el-button type="primary" :loading="creatingJob" :disabled="!canStart" @click="startJob">
-            开始全自动训练
-          </el-button>
-          <el-button plain :disabled="!currentJobId" @click="refreshJob">刷新状态</el-button>
-          <el-button type="danger" plain :disabled="!canCancel" @click="cancelJob">取消任务</el-button>
-        </div>
       </section>
 
       <section class="run-panel">
@@ -229,7 +205,7 @@
             :percentage="job?.progress ?? 0"
             :show-text="false"
             :status="job?.status === 'completed' ? 'success' : job?.status === 'failed' ? 'exception' : undefined"
-            :stroke-width="8"
+            :stroke-width="12"
             striped
             striped-flow
           />
@@ -239,6 +215,10 @@
         <div class="chart-card">
           <div class="chart-head">
             <span class="chart-title">{{ chartMetricLabel }}</span>
+            <div class="chart-legend" aria-label="图例">
+              <span><i class="legend-dot"></i>Trial 分数</span>
+              <span><i class="legend-line"></i>历史最佳</span>
+            </div>
           </div>
           <div ref="chartRef" class="automl-chart"></div>
         </div>
@@ -305,6 +285,32 @@
         </div>
       </section>
     </div>
+
+    <section class="execution-panel">
+      <div class="panel-title"><h3><FileText class="panel-title-icon" :size="18" />训练设置与操作</h3></div>
+      <div class="execution-fields">
+        <label class="full-field">
+          <span class="field-label"><FileText :size="14" :stroke-width="1.9" />业务场景</span>
+          <el-input
+            v-model="businessContext"
+            type="textarea"
+            :rows="2"
+            placeholder="例如：信贷风控、流失预测、质量检测"
+          />
+        </label>
+        <div class="option-row">
+          <span>调用 LLM 决策</span>
+          <el-switch v-model="useLlm" active-text="启用" inactive-text="禁用" />
+        </div>
+      </div>
+      <div class="actions">
+        <el-button type="primary" :loading="creatingJob" :disabled="!canStart" @click="startJob">
+          开始全自动训练
+        </el-button>
+        <el-button plain :disabled="!currentJobId" @click="refreshJob">刷新状态</el-button>
+        <el-button type="danger" plain :disabled="!canCancel" @click="cancelJob">取消任务</el-button>
+      </div>
+    </section>
 
     <section class="history-panel">
       <div class="panel-title">
@@ -831,18 +837,36 @@ function updateChart() {
   const bestData = trialHistory.value
     .filter((item) => typeof item.best_value === 'number')
     .map((item) => [item.trial_number ?? 0, item.best_value])
+  const hasData = trialData.length > 0 || bestData.length > 0
+  const startsAtZero = [...trialData, ...bestData].some(([trial]) => trial === 0)
   chartInstance.setOption({
     backgroundColor: 'transparent',
     tooltip: {
       trigger: 'axis',
       valueFormatter: (value: number | string) => `${value}${metricDirectionHint(resolvedMetricDirection.value)}`,
     },
-    legend: { top: 8, right: 12, data: ['Trial 分数', '历史最佳'] },
-    grid: { left: 44, right: 24, top: 56, bottom: 36, containLabel: true },
-    xAxis: { type: 'value', name: 'Trial', minInterval: 1 },
-    yAxis: { type: 'value', name: chartMetricLabel.value },
+    legend: { show: false, data: ['Trial 分数', '历史最佳'] },
+    grid: { left: 38, right: 8, top: 21, bottom: 24, containLabel: true },
+    xAxis: {
+      type: 'value', name: 'Trial', nameLocation: 'middle', nameGap: 28,
+      min: startsAtZero ? 0 : 1, max: Math.max(startsAtZero ? nTrials.value - 1 : nTrials.value, startsAtZero ? 9 : 10), interval: 1,
+      axisLine: { lineStyle: { color: '#9cb0cf' } },
+      axisTick: { show: false },
+      axisLabel: { color: '#405886', fontSize: 12 },
+      splitLine: { show: true, lineStyle: { color: '#dce8ff', type: 'dashed', width: 1 } },
+      nameTextStyle: { color: '#405886', fontSize: 13 },
+    },
+    yAxis: {
+      type: 'value', name: resolvedMetric.value === 'auto' ? '分数' : chartMetricLabel.value, nameLocation: 'middle', nameGap: 34,
+      ...(hasData ? {} : { min: 0, max: 1, interval: .1 }),
+      axisLine: { show: true, lineStyle: { color: '#9cb0cf' } },
+      axisTick: { show: false },
+      axisLabel: { color: '#405886', fontSize: 12, formatter: (value: number) => value.toFixed(1) },
+      splitLine: { show: true, lineStyle: { color: '#dce8ff', type: 'dashed', width: 1 } },
+      nameTextStyle: { color: '#405886', fontSize: 13 },
+    },
     series: [
-      { name: 'Trial 分数', type: 'scatter', data: trialData, symbolSize: 10, itemStyle: { color: '#2563eb' } },
+      { name: 'Trial 分数', type: 'scatter', data: trialData, symbolSize: 10, itemStyle: { color: '#3484ff' } },
       {
         name: '历史最佳',
         type: 'line',
@@ -850,8 +874,8 @@ function updateChart() {
         step: 'start',
         symbol: 'circle',
         symbolSize: 7,
-        itemStyle: { color: '#60a5fa' },
-        lineStyle: { color: '#60a5fa', width: 2.5 },
+        itemStyle: { color: '#fff', borderColor: '#2374ff', borderWidth: 2 },
+        lineStyle: { color: '#2374ff', width: 2 },
       },
     ],
   })
@@ -891,7 +915,7 @@ onBeforeUnmount(() => {
 .automl-workspace {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 18px;
 }
 
 .automl-heading {
@@ -899,53 +923,93 @@ onBeforeUnmount(() => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 18px;
+  min-height: 92px;
+  max-width: none;
+  width: 100%;
+  padding-left: 15px;
+}
+
+.automl-heading .eyebrow {
+  display: table;
+  border-radius: 999px;
+  background: #c7e7ff;
+  color: #075cf2;
+  padding: 1px 9px;
+  font-size: 11px;
+  line-height: 18px;
+  margin-bottom: 2px;
 }
 
 .automl-grid {
   display: grid;
-  grid-template-columns: minmax(320px, 440px) minmax(0, 1fr);
+  grid-template-columns: minmax(500px, .735fr) minmax(0, 1fr);
   gap: 18px;
+  align-items: stretch;
 }
 
 .setup-panel,
 .run-panel,
 .history-panel,
-.decision-panel {
-  border: 1px solid rgba(219, 227, 239, 0.9);
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.72);
+.decision-panel,
+.execution-panel {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgba(199, 221, 255, .96);
+  border-radius: var(--workbench-radius);
+  background: var(--workbench-surface);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-  padding: 20px;
-  box-shadow: 0 18px 44px rgba(30, 64, 175, 0.08);
+  padding: 22px 24px;
+  box-shadow: var(--workbench-shadow);
 }
+
+.setup-panel::after,
+.run-panel::after {
+  content: '';
+  position: absolute;
+  width: 520px;
+  height: 190px;
+  right: -80px;
+  bottom: -50px;
+  pointer-events: none;
+  opacity: .82;
+  background: url('@/assets/card-waves.svg') no-repeat center / contain, radial-gradient(ellipse at 60% 75%, rgba(69,218,232,.22), transparent 60%), radial-gradient(ellipse at 75% 90%, rgba(94,153,255,.25), transparent 62%);
+}
+
+.setup-panel > *, .run-panel > * { position: relative; z-index: 1; }
+.setup-panel, .run-panel { padding-bottom: 12px; }
 
 .panel-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 14px;
+  margin-bottom: 18px;
 }
 
 .panel-title h3 {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 12px;
   margin: 0;
-  color: #111827;
-  font-size: 16px;
+  color: #08143b;
+  font-size: 20px;
+  font-weight: 750;
 }
 
 .panel-title-icon {
   flex: 0 0 auto;
-  color: #3b82f6;
+  color: #287dff;
+  width: 23px;
+  height: 23px;
 }
 
 .panel-title span {
-  color: #94a3b8;
-  font-size: 12px;
+  color: #51658e;
+  font-size: 14px;
 }
+
+.run-panel > .panel-title { margin-bottom: 22px; }
 
 .status-chip {
   display: inline-flex;
@@ -953,13 +1017,14 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 6px;
   white-space: nowrap;
-  border: 1px solid #e2e8f0;
+  border: 1px solid #fff;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.85);
-  padding: 5px 12px;
-  color: #64748b;
-  font-size: 12px;
+  background: rgba(255, 255, 255, 0.75);
+  padding: 5px 13px;
+  color: #3f5891;
+  font-size: 13px;
   font-weight: 600;
+  margin: 2px 10px 0 0;
 }
 
 .status-chip--success {
@@ -981,18 +1046,18 @@ onBeforeUnmount(() => {
 }
 
 .dataset-upload {
-  margin-bottom: 12px;
+  margin-bottom: 16px;
 }
 
 .dataset-upload :deep(.el-upload-dragger) {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 170px;
-  border: 1.5px dashed #a9c6f2;
-  border-radius: 14px;
-  background: linear-gradient(180deg, #f7faff 0%, #eef5ff 100%);
-  padding: 24px;
+  min-height: 181px;
+  border: 1.5px dashed #7eafff;
+  border-radius: 13px;
+  background: radial-gradient(ellipse at 96% 85%, rgba(137,184,255,.20), transparent 40%), linear-gradient(150deg, #eef5ff 0%, #f7faff 55%, #eaf2ff 100%);
+  padding: 16px;
   transition: border-color 0.2s ease, background 0.2s ease;
 }
 
@@ -1005,18 +1070,18 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   color: #334155;
 }
 
 .upload-icon {
-  color: #3b82f6;
-  margin-bottom: 4px;
+  color: #448eff;
+  margin-bottom: 7px;
 }
 
 .upload-copy strong {
-  color: #1e293b;
-  font-size: 15px;
+  color: #0b1941;
+  font-size: 16px;
 }
 
 .upload-copy em {
@@ -1025,27 +1090,26 @@ onBeforeUnmount(() => {
 }
 
 .upload-copy span {
-  color: #64748b;
-  font-size: 13px;
+  color: #536791;
+  font-size: 14px;
 }
 
 .upload-copy small {
-  border-top: 1px solid #e2eaf6;
-  margin-top: 8px;
-  padding-top: 8px;
-  color: #94a3b8;
-  font-size: 12px;
+  margin-top: 9px;
+  color: #8296bc;
+  font-size: 13px;
 }
 
 .file-bar {
   display: flex;
   align-items: center;
   gap: 12px;
-  border: 1px solid #e3eaf5;
+  border: 1px solid #dbe5f5;
   border-radius: 10px;
   background: #f6f9fd;
   margin-bottom: 16px;
-  padding: 8px 10px;
+  min-height: 44px;
+  padding: 4px 9px;
 }
 
 .file-bar-button {
@@ -1061,8 +1125,8 @@ onBeforeUnmount(() => {
 }
 
 .file-bar-name {
-  color: #94a3b8;
-  font-size: 13px;
+  color: #65789e;
+  font-size: 14px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1089,20 +1153,21 @@ onBeforeUnmount(() => {
 .form-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 14px;
+  column-gap: 26px;
+  row-gap: 12px;
 }
 
 label,
 .full-field {
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  color: #475569;
-  font-size: 13px;
+  gap: 5px;
+  color: #2d416b;
+  font-size: 14px;
 }
 
 .full-field {
-  margin-top: 14px;
+  margin-top: 12px;
 }
 
 .option-row {
@@ -1115,38 +1180,65 @@ label,
 }
 
 .advanced-options {
-  padding: 12px 14px 4px;
-  border: 1px dashed #d8e0e3;
-  border-radius: 10px;
+  padding: 10px 10px 12px 20px;
+  border: 1px solid #e2ebfb;
+  border-radius: 12px;
+  background: linear-gradient(155deg, #f0f6ff, #f9fbff 74%);
+  box-shadow: 0 7px 18px rgba(50, 100, 183, .06);
 }
 
 .advanced-title {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  color: #64748b;
-  font-size: 12px;
-  font-weight: 600;
+  color: #132450;
+  font-size: 14px;
+  font-weight: 700;
 }
 
 .advanced-options .option-row {
   margin-top: 10px;
+  min-height: 23px;
 }
 
+.advanced-options :deep(.el-switch) { height: 22px; }
+.advanced-options :deep(.el-switch__core) { min-height: 20px; height: 20px; }
+.advanced-options :deep(.el-switch__action) { width: 16px; height: 16px; }
+
 .option-label b {
-  color: #334155;
+  color: #23385e;
   font-weight: 600;
 }
 
 .advanced-options .option-row small {
   margin-left: 2px;
-  color: #94a3b8;
+  color: #899bbd;
   font-weight: 400;
 }
 
 .advanced-options .form-grid {
-  margin-top: 10px;
+  margin-top: 9px;
+  column-gap: 15px;
 }
+
+.advanced-options .form-grid label {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.advanced-options .form-grid .field-label { white-space: nowrap; }
+/* Compact steppers share the same geometry as the main form. */
+.advanced-options .form-grid :deep(.el-input-number) {
+  --stepper-button-width: 19px;
+  --stepper-input-padding: 4px;
+  width: 85px;
+  flex: 0 0 85px;
+}
+.advanced-options .form-grid :deep(.el-input__inner) { font-size: 12px; }
 
 .enhancement-summary {
   display: flex;
@@ -1165,87 +1257,92 @@ label,
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
+  gap: 17px;
 }
 
 .metric {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  border: 1px solid rgba(226, 232, 240, 0.9);
-  border-radius: 14px;
-  padding: 14px;
-  background: #f8fafc;
+  display: block;
+  min-width: 0;
+  min-height: 101px;
+  border: 1px solid #bfd8ff;
+  border-radius: 15px;
+  padding: 15px 20px 10px;
+  background: #f4f8ff;
+  box-shadow: 0 9px 18px rgba(46, 111, 228, .09), inset 0 1px rgba(255,255,255,.9);
 }
 
 .metric--blue {
-  background: linear-gradient(135deg, #eff6ff 0%, #e0ecff 100%);
+  background: linear-gradient(130deg, #f7fbff, #edf5ff);
 }
 
 .metric--teal {
-  background: linear-gradient(135deg, #effcf8 0%, #d9f5ea 100%);
+  border-color: #a9ebff;
+  background: linear-gradient(130deg, #f5fcff, #def7ff);
 }
 
 .metric--amber {
-  background: linear-gradient(135deg, #fffaeb 0%, #fdf0d5 100%);
+  border-color: #cfd5ff;
+  background: linear-gradient(130deg, #f8f9ff, #e9edff);
 }
 
 .metric--purple {
-  background: linear-gradient(135deg, #f7f4ff 0%, #ede8ff 100%);
+  border-color: #c7d7ff;
+  background: linear-gradient(130deg, #f8fbff, #e7efff);
 }
 
 .metric-icon {
-  display: grid;
-  flex: 0 0 auto;
-  width: 38px;
-  height: 38px;
-  place-items: center;
-  border-radius: 10px;
+  display: inline-flex;
+  vertical-align: middle;
+  align-items: center;
+  width: 30px;
+  height: 27px;
 }
 
 .metric--blue .metric-icon {
-  background: #dbeafe;
-  color: #2563eb;
+  color: #36a6ff;
 }
 
 .metric--teal .metric-icon {
-  background: #d1f2e5;
-  color: #0d9488;
+  color: #08c8e4;
 }
 
 .metric--amber .metric-icon {
-  background: #fdeecd;
-  color: #d97706;
+  color: #7072ff;
 }
 
 .metric--purple .metric-icon {
-  background: #e6e0fb;
-  color: #7c5ce0;
+  color: #5a7dff;
 }
 
+.metric-body { display: inline; }
+
 .metric-body span {
-  display: block;
-  color: #64748b;
-  font-size: 12px;
+  display: inline;
+  color: #415684;
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .metric-body strong {
   display: block;
-  margin-top: 3px;
-  color: #0f172a;
-  font-size: 20px;
+  margin: 2px 0 0 40px;
+  color: #071747;
+  font-size: 28px;
+  line-height: 1.1;
 }
 
 .metric-model {
-  font-size: 15px;
+  font-size: 22px !important;
 }
 
 .progress-row {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin: 16px 0;
+  margin: 19px 0 27px;
 }
+
+.progress-row :deep(.el-progress-bar__outer) { background: #d5e2ff; }
 
 .progress-bar {
   flex: 1;
@@ -1253,18 +1350,20 @@ label,
 }
 
 .progress-value {
-  min-width: 40px;
-  color: #475569;
-  font-size: 13px;
+  min-width: 32px;
+  color: #405582;
+  font-size: 18px;
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
 
 .chart-card {
-  border: 1px solid #e6eefb;
-  border-radius: 14px;
-  background: #fbfdff;
-  padding: 12px 16px 6px;
+  height: 438px;
+  border: 1px solid #dce9ff;
+  border-radius: 15px;
+  background: linear-gradient(145deg, rgba(255,255,255,.9), rgba(247,250,255,.94));
+  padding: 18px 17px 12px;
+  box-shadow: 0 9px 24px rgba(51, 110, 207, .06);
 }
 
 .chart-head {
@@ -1274,15 +1373,32 @@ label,
 }
 
 .chart-title {
-  color: #334155;
-  font-size: 14px;
-  font-weight: 600;
+  color: #263c6d;
+  font-size: 16px;
+  font-weight: 650;
 }
+
+.chart-legend {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  color: #435783;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.chart-legend span { display: inline-flex; align-items: center; gap: 8px; }
+.legend-dot { width: 15px; height: 15px; border-radius: 50%; background: linear-gradient(#67abff,#1866fa); }
+.legend-line { width: 28px; height: 2px; background: #2374ff; position: relative; }
+.legend-line::after { content: ''; position: absolute; top: -6px; left: 10px; width: 12px; height: 12px; border: 2px solid #2374ff; border-radius: 50%; background: #fff; }
 
 .automl-chart {
   width: 100%;
-  height: 320px;
+  height: 378px;
 }
+
+.execution-fields { display: grid; grid-template-columns: minmax(250px, 1fr) auto; align-items: center; gap: 25px; }
+.execution-fields .full-field, .execution-fields .option-row { margin: 0; }
 
 .status-alert,
 .result-box {
@@ -1320,8 +1436,10 @@ pre {
 
 .setup-panel :deep(.el-input__wrapper),
 .setup-panel :deep(.el-select__wrapper) {
-  border-radius: 8px;
-  box-shadow: 0 0 0 1px #dbe3ef inset;
+  min-height: 33px;
+  border-radius: 7px;
+  background: linear-gradient(#fff, #f8faff);
+  box-shadow: 0 0 0 1px #d0dced inset, 0 2px 5px rgba(33,77,160,.04);
 }
 
 .setup-panel :deep(.el-input__wrapper.is-focus),
@@ -1330,8 +1448,40 @@ pre {
 }
 
 .setup-panel :deep(.el-input-number) {
+  --stepper-button-width: 35px;
+  --stepper-input-padding: 10px;
   width: 100%;
+  height: 33px;
 }
+
+.setup-panel :deep(.el-input-number .el-input) { height: 100%; }
+.setup-panel :deep(.el-input-number .el-input__wrapper) {
+  padding-left: var(--stepper-input-padding);
+  padding-right: calc(2 * var(--stepper-button-width) + var(--stepper-input-padding));
+}
+.setup-panel :deep(.el-input-number__decrease),
+.setup-panel :deep(.el-input-number__increase) {
+  top: 1px;
+  bottom: 1px;
+  left: auto;
+  width: var(--stepper-button-width);
+  height: auto;
+  border: 0;
+  border-left: 1px solid #dae5f6;
+  background: #f3f7ff;
+  color: #56729d;
+}
+.setup-panel :deep(.el-input-number__decrease) {
+  right: calc(var(--stepper-button-width) + 1px);
+  border-radius: 0;
+}
+.setup-panel :deep(.el-input-number__increase) {
+  right: 1px;
+  border-radius: 0 6px 6px 0;
+}
+.setup-panel :deep(.el-input-number__decrease.is-disabled),
+.setup-panel :deep(.el-input-number__increase.is-disabled) { color: #b2bfd3; }
+.setup-panel :deep(.el-switch__core) { min-width: 43px; }
 
 .capability-alert {
   display: flex;
@@ -1353,16 +1503,28 @@ pre {
   font-weight: 600;
 }
 
-@media (max-width: 1100px) {
+@media (max-width: 1250px) {
   .automl-grid,
-  .metric-grid,
   .result-grid,
   .decision-grid {
     grid-template-columns: 1fr;
   }
 
+  .metric-grid { grid-template-columns: repeat(4, minmax(0,1fr)); }
+
+  .automl-grid { align-items: start; }
+
+  .setup-panel, .run-panel { min-width: 0; }
+}
+
+@media (max-width: 700px) {
+  .metric-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
   .form-grid {
     grid-template-columns: 1fr;
   }
+
+  .execution-fields { grid-template-columns: 1fr; }
+  .chart-legend { gap: 10px; font-size: 11px; }
+  .chart-title { font-size: 13px; }
 }
 </style>

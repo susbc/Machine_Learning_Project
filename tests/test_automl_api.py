@@ -280,7 +280,7 @@ def test_automl_regression_snapshot_events_and_schema_v3_artifact_survive_reload
 
     saved = client.post(f"/api/automl/jobs/{job_id}/save")
     assert saved.status_code == 200
-    artifact_path = Path(__file__).parents[1] / saved.json()["artifact_path"]
+    artifact_path = automl_api.PROJECT_ROOT / saved.json()["artifact_path"]
     artifact = joblib.load(artifact_path)
     assert artifact["artifact_schema_version"] == 3
     assert artifact["problem_type"] == "regression"
@@ -667,7 +667,7 @@ def test_automl_sampling_reduces_training_rows_only():
 
 def test_automl_feature_selection_reduces_features_and_artifact_predicts():
     """特征选择：选择的特征数减少，selector 随 artifact 持久化且推理一致。"""
-    from backend.api._dataset import predict_with_artifact
+    from backend.services.datasets import predict_with_artifact
 
     client = TestClient(app)
     file_name, file_body, content_type = _categorical_csv()
@@ -697,7 +697,7 @@ def test_automl_feature_selection_reduces_features_and_artifact_predicts():
 
     saved = client.post(f"/api/automl/jobs/{job_id}/save")
     assert saved.status_code == 200
-    artifact_path = Path(__file__).parents[1] / saved.json()["artifact_path"]
+    artifact_path = automl_api.PROJECT_ROOT / saved.json()["artifact_path"]
     artifact = joblib.load(artifact_path)
     assert artifact["feature_selector"] is not None
 

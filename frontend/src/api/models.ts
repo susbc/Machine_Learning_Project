@@ -85,12 +85,35 @@ export function createModelsApi(options: ModelsApiOptions) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
       }),
-    batchPredict: (modelId: string, input: ModelBatchPredictionInput) =>
-      requestJson<ModelBatchPredictionResponse>(`/api/models/${encodeURIComponent(modelId)}/batch-predict`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(input),
-      }),
+    batchPredict: async (modelId: string, input: ModelBatchPredictionInput): Promise<ModelBatchPredictionResponse> => {
+      let combined: ModelBatchPredictionResponse | undefined
+      for (let offset = 0; offset < Math.max(input.rows.length, 1); offset += 1000) {
+        const rows = input.rows.slice(offset, offset + 1000)
+        const batch = await requestJson<ModelBatchPredictionResponse>(`/api/models/${encodeURIComponent(modelId)}/batch-predict`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rows }),
+        })
+        if (batch.rows.length !== rows.length || batch.summary.count !== rows.length) {
+          throw new Error('批量预测返回行数不一致，请重试')
+        }
+        batch.rows = batch.rows.map((row, index) => ({ ...row, index: offset + index }))
+        if (!combined) combined = batch
+        else {
+          const previousCount = combined.summary.count
+          const count = previousCount + batch.summary.count
+          for (const key of ['positive_rate', 'average_probability'] as const) {
+            const previous = combined.summary[key]
+            const current = batch.summary[key]
+            combined.summary[key] = previous == null || current == null ? null
+              : (previous * previousCount + current * batch.summary.count) / count
+          }
+          combined.summary.count = count
+          combined.rows.push(...batch.rows)
+        }
+      }
+      return combined!
+    },
   }
 }
 

@@ -1,10 +1,10 @@
 <template>
-  <section class="prediction-workspace">
+  <section class="workspace-theme prediction-workspace">
     <div class="section-heading prediction-heading">
       <div>
         <p class="eyebrow">Phase 8</p>
         <h2>预测实验室</h2>
-        <p>选择已保存模型进行单条 JSON 预测，后续可扩展批量预测、阈值分析和结果导出。</p>
+        <p>选择已保存模型进行单条 JSON 预测，支持 CSV 批量预测和结果导出。</p>
       </div>
       <el-button
         data-testid="prediction-refresh-models"
@@ -93,7 +93,8 @@
     <section v-if="batchResult" class="panel">
       <div class="panel-title">
         <h3>批量结果</h3>
-        <span>{{ batchResult.summary.count }} 行</span>
+        <span>{{ batchResult.summary.count }} 行（预览前 200 行）</span>
+        <el-button plain @click="exportBatchResults">导出全部结果</el-button>
       </div>
       <div v-if="!isRegressionModel" class="summary-grid">
         <div>
@@ -105,9 +106,9 @@
           <strong>{{ formatMetric(batchResult.summary.average_probability) }}</strong>
         </div>
       </div>
-      <el-table :data="batchResult.rows" height="360">
+      <el-table :data="batchResult.rows.slice(0, 200)" height="360">
         <el-table-column prop="index" label="#" width="80" />
-        <el-table-column prop="prediction" label="预测值" width="120" />
+        <el-table-column prop="prediction" label="预测值" width="150" show-overflow-tooltip />
         <el-table-column v-if="!isRegressionModel" prop="encoded_prediction" label="类别编码" width="110" />
         <el-table-column v-if="!isRegressionModel" label="预测概率" width="140">
           <template #default="{ row }">{{ formatMetric(row.probability) }}</template>
@@ -121,7 +122,7 @@
             <span v-else>-</span>
           </template>
         </el-table-column>
-        <el-table-column label="输入特征">
+        <el-table-column label="输入特征" min-width="260" show-overflow-tooltip>
           <template #default="{ row }">{{ JSON.stringify(row.features) }}</template>
         </el-table-column>
       </el-table>
@@ -131,6 +132,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import { parseFeatureCsv } from '../csv'
 
 import {
   modelsApi,
@@ -206,57 +208,9 @@ async function runPrediction() {
   }
 }
 
-function parseCsvLine(line: string): string[] {
-  const cells: string[] = []
-  let current = ''
-  let inQuotes = false
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index]
-    const next = line[index + 1]
-    if (char === '"' && inQuotes && next === '"') {
-      current += '"'
-      index += 1
-    } else if (char === '"') {
-      inQuotes = !inQuotes
-    } else if (char === ',' && !inQuotes) {
-      cells.push(current.trim())
-      current = ''
-    } else {
-      current += char
-    }
-  }
-  cells.push(current.trim())
-  return cells
-}
-
-function coerceCsvValue(value: string): unknown {
-  if (value === '') return ''
-  const numeric = Number(value)
-  if (Number.isFinite(numeric)) return numeric
-  if (value.toLowerCase() === 'true') return true
-  if (value.toLowerCase() === 'false') return false
-  return value
-}
-
 function parseCsvText(text: string) {
   invalidateBatchResult()
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-  const [headerLine, ...dataLines] = lines
-  if (!headerLine || dataLines.length === 0) {
-    batchRows.value = []
-    return
-  }
-  const headers = parseCsvLine(headerLine)
-  batchRows.value = dataLines.map((line) => {
-    const values = parseCsvLine(line)
-    return headers.reduce<Record<string, unknown>>((row, header, index) => {
-      row[header] = coerceCsvValue(values[index] ?? '')
-      return row
-    }, {})
-  })
+  batchRows.value = parseFeatureCsv(text)
 }
 
 async function onCsvSelected(event: Event) {
@@ -298,6 +252,23 @@ async function runBatchPrediction() {
   } finally {
     if (requestGeneration === batchRequestGeneration) batchPredicting.value = false
   }
+}
+
+function exportBatchResults() {
+  if (!batchResult.value) return
+  const rows = batchResult.value.rows
+  const featureNames = Object.keys(rows[0]?.features ?? {})
+  const escape = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`
+  const csv = [
+    [...featureNames, 'prediction', 'probability'].map(escape).join(','),
+    ...rows.map((row) => [...featureNames.map((name) => row.features[name]), row.prediction, row.probability].map(escape).join(',')),
+  ].join('\r\n')
+  const url = URL.createObjectURL(new Blob(['\uFEFF', csv], { type: 'text/csv;charset=utf-8' }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'predictions.csv'
+  link.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 function formatMetric(value: number | null | undefined) {

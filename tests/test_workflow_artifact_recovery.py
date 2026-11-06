@@ -11,7 +11,7 @@ from sklearn.linear_model import LinearRegression
 
 import backend.api.models as model_registry
 import backend.api.workflow as workflow
-import backend.api._workflow_artifacts as workflow_artifacts
+import backend.storage.workflow_artifacts as workflow_artifacts
 from backend.main import app
 
 
