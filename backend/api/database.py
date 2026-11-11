@@ -19,8 +19,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Response, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, validator
+from sqlalchemy import inspect as sqlalchemy_inspect
 
 from model_code.database import DatabaseConnector
 from model_code.database.connection_manager import ConnectionManager
@@ -28,6 +29,10 @@ from model_code.database.connection_manager import ConnectionManager
 from ._common import mask_secret, validate_entity_id
 
 router = APIRouter(prefix="/api/database", tags=["Database Config"])
+
+# 表名白名单：标识符（可带 schema 前缀），与连接器 _quote_identifier 的语义一致。
+TABLE_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+TABLE_ROWS_LIMIT_MAX = 10000
 
 WRITE_SQL_PATTERN = re.compile(
     r"\b(insert|update|delete|drop|alter|create|truncate|replace|merge|grant|revoke|call|execute|vacuum|attach|detach)\b",
@@ -294,6 +299,11 @@ def _connector_for(raw: Dict[str, Any]) -> DatabaseConnector:
     return DatabaseConnector(_runtime_config(raw.get("config", {})))
 
 
+def get_connector(connection_id: str) -> DatabaseConnector:
+    """按已保存连接 ID 返回凭证已解密的连接器，供同级 API 模块复用（不存在时 404）。"""
+    return _connector_for(_require_connection(_manager(), connection_id))
+
+
 def _is_readonly_sql(sql: str) -> bool:
     normalized = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
     normalized = re.sub(r"--.*?$", " ", normalized, flags=re.MULTILINE).strip().rstrip(";").strip()
@@ -493,6 +503,34 @@ def query_preview(payload: QueryPreviewRequest) -> Dict[str, Any]:
         "limit": payload.limit,
         **_dataframe_payload(df),
     }
+
+
+@router.get("/connections/{connection_id}/tables/{table_name}/rows")
+def get_table_rows(
+    connection_id: str,
+    table_name: str,
+    limit: int = Query(default=1000, ge=1, le=TABLE_ROWS_LIMIT_MAX),
+) -> Dict[str, Any]:
+    """只读读取指定表数据，供批量预测等场景导入特征行。"""
+    if not TABLE_NAME_PATTERN.fullmatch(table_name):
+        raise HTTPException(status_code=400, detail="无效的表名：仅支持字母/数字/下划线，可带 schema 前缀")
+    manager = _manager()
+    raw = _require_connection(manager, connection_id)
+    connector = _connector_for(raw)
+    try:
+        if connector.engine is None and not connector.connect():
+            raise HTTPException(status_code=400, detail=f"数据库连接失败：{connector.last_error or '请检查连接配置'}")
+        schema, _, name = table_name.rpartition(".")
+        if not sqlalchemy_inspect(connector.engine).has_table(name, schema=schema or None):
+            raise HTTPException(status_code=404, detail="未找到数据表")
+        df = connector.read_table(table_name, limit=limit)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"表数据读取失败：{type(exc).__name__}") from exc
+    finally:
+        connector.disconnect()
+    return _dataframe_payload(df)
 
 
 @router.get("/connections/{invalid_connection_id:path}/schema")

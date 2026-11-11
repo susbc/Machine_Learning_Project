@@ -7,6 +7,9 @@ import { ElIcon } from 'element-plus/es/components/icon/index.mjs'
 import { ElInput } from 'element-plus/es/components/input/index.mjs'
 import { ElInputNumber } from 'element-plus/es/components/input-number/index.mjs'
 import { ElProgress } from 'element-plus/es/components/progress/index.mjs'
+// ElRadio 的 install 会一并注册 RadioGroup/RadioButton；
+// 单独导入 ElRadioGroup/ElRadioButton 是 withNoopInstall，app.use 不会注册任何组件。
+import { ElRadio } from 'element-plus/es/components/radio/index.mjs'
 import { ElOption, ElSelect } from 'element-plus/es/components/select/index.mjs'
 import { ElStep, ElSteps } from 'element-plus/es/components/steps/index.mjs'
 import { ElSwitch } from 'element-plus/es/components/switch/index.mjs'
@@ -32,6 +35,11 @@ import 'element-plus/theme-chalk/el-message.css'
 import 'element-plus/theme-chalk/el-message-box.css'
 import 'element-plus/theme-chalk/el-option.css'
 import 'element-plus/theme-chalk/el-progress.css'
+import 'element-plus/theme-chalk/el-radio-button.css'
+import 'element-plus/theme-chalk/el-radio-group.css'
+import 'element-plus/theme-chalk/el-radio.css'
+// select 下拉与 table 滚动容器依赖 ElScrollbar 的 overflow 样式，缺失会导致选项溢出弹层
+import 'element-plus/theme-chalk/el-scrollbar.css'
 import 'element-plus/theme-chalk/el-select.css'
 import 'element-plus/theme-chalk/el-step.css'
 import 'element-plus/theme-chalk/el-steps.css'
@@ -57,6 +65,7 @@ export const elementPlusComponents: Plugin[] = [
   ElInputNumber,
   ElOption,
   ElProgress,
+  ElRadio,
   ElSelect,
   ElStep,
   ElSteps,

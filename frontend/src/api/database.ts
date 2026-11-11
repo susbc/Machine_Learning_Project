@@ -97,6 +97,12 @@ export interface QueryPreviewResponse {
   limit?: number
 }
 
+export interface TableRowsResponse {
+  columns: string[]
+  rows: Array<Record<string, unknown>>
+  row_count: number
+}
+
 interface DatabaseApiOptions {
   baseUrl: string
   fetcher?: typeof fetch
@@ -149,6 +155,11 @@ export function createDatabaseApi(options: DatabaseApiOptions) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...input, limit: input.limit ?? 100 }),
       }),
+    getTableRows: (connectionId: string, tableName: string, limit = 1000) =>
+      requestJson<TableRowsResponse>(
+        `/api/database/connections/${encodeURIComponent(connectionId)}/tables/${encodeURIComponent(tableName)}/rows?limit=${limit}`,
+        { method: 'GET' },
+      ),
   }
 }
 

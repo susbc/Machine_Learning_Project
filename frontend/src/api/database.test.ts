@@ -50,6 +50,11 @@ describe('database api', () => {
           status: 200,
         })
       }
+      if (url === '/api/database/connections/c2/tables/customers/rows?limit=2' && init?.method === 'GET') {
+        return new Response(JSON.stringify({ columns: ['id'], rows: [{ id: 1 }, { id: 2 }], row_count: 2 }), {
+          status: 200,
+        })
+      }
       if (url === '/api/database/connections/c2' && init?.method === 'DELETE') {
         return new Response(null, { status: 204 })
       }
@@ -72,6 +77,9 @@ describe('database api', () => {
     expect((await api.testConnection('c2')).ok).toBe(true)
     expect((await api.getSchema('c2')).tables[0].name).toBe('customers')
     expect((await api.previewQuery({ connection_id: 'c2', sql: 'SELECT * FROM customers', limit: 2 })).row_count).toBe(1)
+    const tableRows = await api.getTableRows('c2', 'customers', 2)
+    expect(tableRows.columns).toEqual(['id'])
+    expect(tableRows.rows).toEqual([{ id: 1 }, { id: 2 }])
     await expect(api.deleteConnection('c2')).resolves.toBeUndefined()
   })
 })

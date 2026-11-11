@@ -151,6 +151,46 @@ describe('models api', () => {
     expect(batch.rows[0].probability).toBeNull()
     expect(batch.summary.count).toBe(2)
   })
+
+  it('posts prediction exports to the export endpoint', async () => {
+    const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response(
+      JSON.stringify({
+        target: 'file',
+        exported: true,
+        status: 'ok',
+        warnings: [],
+        row_count: 1,
+        path: 'output/predictions_manual_m1.csv',
+        connection_id: null,
+        table_name: null,
+        table_created: null,
+      }),
+      { status: 200 },
+    ))
+    const api = createModelsApi({ baseUrl: '', fetcher: fetcher as typeof fetch })
+    const result = await api.exportPredictions({
+      model_id: 'manual:m1',
+      target: 'file',
+      rows: [
+        { index: 0, features: { age: 30 }, prediction: 1.5, encoded_prediction: null, probability: null, diagnostics: null },
+      ],
+      output_dir: 'output',
+    })
+
+    expect(result.exported).toBe(true)
+    expect(result.path).toBe('output/predictions_manual_m1.csv')
+    const [url, init] = fetcher.mock.calls[0]!
+    expect(url).toBe('/api/prediction-exports')
+    expect(init?.method).toBe('POST')
+    expect(JSON.parse(init!.body as string)).toEqual({
+      model_id: 'manual:m1',
+      target: 'file',
+      rows: [
+        { index: 0, features: { age: 30 }, prediction: 1.5, encoded_prediction: null, probability: null, diagnostics: null },
+      ],
+      output_dir: 'output',
+    })
+  })
 })
 
 describe('large prediction batches', () => {

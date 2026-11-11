@@ -67,6 +67,38 @@ export interface ModelBatchPredictionResponse {
   rows: ModelBatchPredictionRow[]
 }
 
+export interface PredictionExportRow {
+  index: number
+  features: Record<string, unknown>
+  prediction: PredictionValue
+  encoded_prediction: number | null
+  probability: number | null
+  diagnostics: PredictionDiagnostics | null
+}
+
+export type PredictionExportTarget = 'file' | 'database'
+
+export interface PredictionExportInput {
+  model_id: string
+  target: PredictionExportTarget
+  rows: PredictionExportRow[]
+  output_dir?: string
+  connection_id?: string
+  table_name?: string
+}
+
+export interface PredictionExportResponse {
+  target: PredictionExportTarget
+  exported: boolean
+  status: 'ok' | 'permission_denied' | string
+  warnings: string[]
+  row_count: number
+  path: string | null
+  connection_id: string | null
+  table_name: string | null
+  table_created: boolean | null
+}
+
 interface ModelsApiOptions {
   baseUrl: string
   fetcher?: typeof fetch
@@ -114,6 +146,12 @@ export function createModelsApi(options: ModelsApiOptions) {
       }
       return combined!
     },
+    exportPredictions: (input: PredictionExportInput) =>
+      requestJson<PredictionExportResponse>('/api/prediction-exports', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      }),
   }
 }
 

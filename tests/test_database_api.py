@@ -371,3 +371,35 @@ def test_schema_and_preview_serialize_missing_dates_and_numbers(monkeypatch, tmp
         }
         assert payload['rows'][1] == {'recorded_at': None, 'score': None, 'note': None}
         assert payload['rows'][2]['score'] is None
+
+
+def test_table_rows_endpoint_reads_features_for_batch_import(monkeypatch, tmp_path):
+    db_path = tmp_path / "sample.db"
+    _create_sqlite_db(db_path)
+    monkeypatch.setenv("DATABASE_CONNECTIONS_PATH", str(tmp_path / "saved_connections.json"))
+    monkeypatch.setenv("DATABASE_CONFIG_SECRET", "test-secret")
+    client = TestClient(app)
+    connection_id = client.post(
+        "/api/database/connections",
+        json={"name": "rows sqlite", "config": {"db_type": "sqlite", "database": str(db_path)}},
+    ).json()["id"]
+
+    response = client.get(f"/api/database/connections/{connection_id}/tables/customers/rows?limit=2")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["columns"] == ["id", "name", "score"]
+    assert payload["row_count"] == 2
+    assert payload["rows"][0] == {"id": 1, "name": "Ada", "score": 0.91}
+
+    full = client.get(f"/api/database/connections/{connection_id}/tables/customers/rows")
+    assert full.status_code == 200
+    assert full.json()["row_count"] == 3
+
+    missing = client.get(f"/api/database/connections/{connection_id}/tables/no_such_table/rows")
+    assert missing.status_code == 404
+
+    invalid = client.get(f"/api/database/connections/{connection_id}/tables/bad%20name/rows")
+    assert invalid.status_code == 400
+
+    oversized = client.get(f"/api/database/connections/{connection_id}/tables/customers/rows?limit=10001")
+    assert oversized.status_code == 422

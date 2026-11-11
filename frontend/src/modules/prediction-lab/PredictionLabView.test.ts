@@ -8,10 +8,21 @@ const modelMocks = vi.hoisted(() => ({
   listModels: vi.fn(),
   predict: vi.fn(),
   batchPredict: vi.fn(),
+  exportPredictions: vi.fn(),
 }))
 
 vi.mock('@/api/models', () => ({
   modelsApi: modelMocks,
+}))
+
+const dbMocks = vi.hoisted(() => ({
+  listConnections: vi.fn(),
+  getSchema: vi.fn(),
+  getTableRows: vi.fn(),
+}))
+
+vi.mock('@/api/database', () => ({
+  databaseApi: dbMocks,
 }))
 
 const regressionSpec = {
@@ -144,6 +155,42 @@ const classificationBatch = {
   ],
 } as const
 
+const sqliteConnection = {
+  id: 'conn1',
+  name: '本地 SQLite',
+  db_type: 'sqlite',
+  is_active: true,
+  config: { db_type: 'sqlite', database: 'local.db' },
+} as const
+
+const mysqlConnection = {
+  id: 'conn2',
+  name: '生产 MySQL',
+  db_type: 'mysql',
+  is_active: true,
+  config: { db_type: 'mysql', database: 'prod' },
+} as const
+
+const disabledConnection = {
+  id: 'conn3',
+  name: '停用连接',
+  db_type: 'sqlite',
+  is_active: false,
+  config: { db_type: 'sqlite', database: 'old.db' },
+} as const
+
+const fileExportSuccess = {
+  target: 'file',
+  exported: true,
+  status: 'ok',
+  warnings: [],
+  row_count: 2,
+  path: 'exports/predictions_manual_reg.csv',
+  connection_id: null,
+  table_name: null,
+  table_created: null,
+} as const
+
 function actionButton(wrapper: VueWrapper, label: string) {
   const button = wrapper.findAll('button').find((candidate) => candidate.text().trim() === label)
   if (!button) throw new Error(`Expected ${label} action`)
@@ -158,6 +205,24 @@ async function selectOption(wrapper: VueWrapper, optionLabel: string) {
     .find((candidate) => candidate.textContent?.trim() === optionLabel)
   if (!option) throw new Error(`Expected ${optionLabel} option`)
   option.click()
+  await flushPromises()
+}
+
+async function selectByLabel(wrapper: VueWrapper, ariaLabel: string, optionLabel: string) {
+  await wrapper.get(`[aria-label="${ariaLabel}"]`).trigger('click')
+  await flushPromises()
+  const option = Array.from(document.querySelectorAll<HTMLElement>('.el-select-dropdown__item'))
+    .reverse()
+    .find((candidate) => candidate.textContent?.trim() === optionLabel)
+  if (!option) throw new Error(`Expected ${optionLabel} option`)
+  option.click()
+  await flushPromises()
+}
+
+async function chooseRadio(wrapper: VueWrapper, groupLabel: string, value: string) {
+  const input = wrapper.get(`[aria-label="${groupLabel}"] input[value="${value}"]`)
+  ;(input.element as HTMLInputElement).checked = true
+  await input.trigger('change')
   await flushPromises()
 }
 
@@ -191,11 +256,35 @@ describe('PredictionLabView', () => {
     modelMocks.listModels.mockReset()
     modelMocks.predict.mockReset()
     modelMocks.batchPredict.mockReset()
+    modelMocks.exportPredictions.mockReset()
+    dbMocks.listConnections.mockReset()
+    dbMocks.getSchema.mockReset()
+    dbMocks.getTableRows.mockReset()
     modelMocks.listModels.mockResolvedValue({
       models: [regressionRecord, classificationRecord, legacyRecord, invalidMetadataRecord],
     })
     modelMocks.predict.mockResolvedValue(regressionPrediction)
     modelMocks.batchPredict.mockResolvedValue(regressionBatch)
+    modelMocks.exportPredictions.mockResolvedValue(fileExportSuccess)
+    dbMocks.listConnections.mockResolvedValue({
+      connections: [sqliteConnection, mysqlConnection, disabledConnection],
+      active_connection: sqliteConnection,
+    })
+    dbMocks.getSchema.mockResolvedValue({
+      connection: sqliteConnection,
+      tables: [
+        {
+          name: 'customers',
+          columns: [{ name: 'age', type: 'INTEGER', nullable: true }],
+          sample: { columns: ['age'], rows: [], row_count: 0 },
+        },
+      ],
+    })
+    dbMocks.getTableRows.mockResolvedValue({
+      columns: ['age'],
+      rows: [{ age: 30 }, { age: 70 }],
+      row_count: 2,
+    })
   })
 
   it('renders a regression prediction and diagnostics without category or probability fields', async () => {
@@ -389,6 +478,172 @@ describe('PredictionLabView', () => {
     expect(actionButton(wrapper, '执行批量预测').attributes('disabled')).toBeDefined()
     resolveRead('x\n8')
     await flushPromises()
+    wrapper.unmount()
+  })
+
+  it('exports batch results to a server-side CSV directory', async () => {
+    const wrapper = mount(PredictionLabView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await chooseCsv(wrapper, 'x\n3\n4')
+    await actionButton(wrapper, '执行批量预测').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('结果导出')
+    await wrapper.get('[aria-label="导出目录"]').setValue('exports')
+    await actionButton(wrapper, '导出结果').trigger('click')
+    await flushPromises()
+
+    expect(modelMocks.exportPredictions).toHaveBeenCalledWith(expect.objectContaining({
+      model_id: 'manual:reg',
+      target: 'file',
+      output_dir: 'exports',
+      rows: [
+        {
+          index: 0,
+          features: { x: 3 },
+          prediction: 7.5,
+          encoded_prediction: null,
+          probability: null,
+          diagnostics: { unknown_input_keys: [], missing_columns_imputed: ['city'] },
+        },
+        {
+          index: 1,
+          features: { x: 4 },
+          prediction: 9.5,
+          encoded_prediction: null,
+          probability: null,
+          diagnostics: { unknown_input_keys: ['extra'], missing_columns_imputed: [] },
+        },
+      ],
+    }))
+    expect(wrapper.text()).toContain('已导出 2 行到 exports/predictions_manual_reg.csv')
+    wrapper.unmount()
+  })
+
+  it('exports a single prediction when no batch result exists', async () => {
+    const wrapper = mount(PredictionLabView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await actionButton(wrapper, '执行预测').trigger('click')
+    await flushPromises()
+
+    await actionButton(wrapper, '导出结果').trigger('click')
+    await flushPromises()
+
+    expect(modelMocks.exportPredictions).toHaveBeenCalledWith(expect.objectContaining({
+      target: 'file',
+      rows: [
+        {
+          index: 0,
+          features: { x: 3 },
+          prediction: 7.5,
+          encoded_prediction: null,
+          probability: null,
+          diagnostics: { unknown_input_keys: ['extra'], missing_columns_imputed: ['city'] },
+        },
+      ],
+    }))
+    wrapper.unmount()
+  })
+
+  it('exports to a database table and surfaces privilege warnings', async () => {
+    modelMocks.exportPredictions.mockResolvedValue({
+      target: 'database',
+      exported: true,
+      status: 'ok',
+      warnings: [],
+      row_count: 2,
+      path: null,
+      connection_id: 'conn1',
+      table_name: 'lab_exports',
+      table_created: true,
+    })
+    const wrapper = mount(PredictionLabView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await chooseCsv(wrapper, 'x\n3\n4')
+    await actionButton(wrapper, '执行批量预测').trigger('click')
+    await flushPromises()
+
+    await chooseRadio(wrapper, '导出目标', 'database')
+    expect(dbMocks.listConnections).toHaveBeenCalled()
+    expect(actionButton(wrapper, '导出结果').attributes('disabled')).toBeUndefined()
+
+    await selectByLabel(wrapper, '导出数据库连接', '生产 MySQL（mysql）')
+    await wrapper.get('[aria-label="导出表名"]').setValue('lab_exports')
+    await actionButton(wrapper, '导出结果').trigger('click')
+    await flushPromises()
+
+    expect(modelMocks.exportPredictions).toHaveBeenCalledWith(expect.objectContaining({
+      target: 'database',
+      connection_id: 'conn2',
+      table_name: 'lab_exports',
+    }))
+    expect(wrapper.text()).toContain('已导出 2 行到数据库表 lab_exports（表不存在，已自动创建）')
+
+    modelMocks.exportPredictions.mockResolvedValue({
+      target: 'database',
+      exported: false,
+      status: 'permission_denied',
+      warnings: ['数据库权限不足：当前连接账号缺少建表或写入权限（INSERT command denied）。'],
+      row_count: 0,
+      path: null,
+      connection_id: 'conn1',
+      table_name: 'lab_exports',
+      table_created: false,
+    })
+    await actionButton(wrapper, '导出结果').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('.el-alert--warning').exists()).toBe(true)
+    expect(wrapper.text()).toContain('数据库权限不足')
+    wrapper.unmount()
+  })
+
+  it('defaults the database export to the active connection and offers only enabled ones', async () => {
+    const wrapper = mount(PredictionLabView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    await chooseCsv(wrapper, 'x\n3\n4')
+    await actionButton(wrapper, '执行批量预测').trigger('click')
+    await flushPromises()
+
+    await chooseRadio(wrapper, '导出目标', 'database')
+    await flushPromises()
+
+    await actionButton(wrapper, '导出结果').trigger('click')
+    await flushPromises()
+    expect(modelMocks.exportPredictions).toHaveBeenCalledWith(expect.objectContaining({
+      target: 'database',
+      connection_id: 'conn1',
+    }))
+
+    await wrapper.get('[aria-label="导出数据库连接"]').trigger('click')
+    await flushPromises()
+    const optionLabels = Array.from(document.querySelectorAll<HTMLElement>('.el-select-dropdown__item'))
+      .map((option) => option.textContent?.trim())
+    expect(optionLabels).toContain('本地 SQLite（sqlite）')
+    expect(optionLabels).toContain('生产 MySQL（mysql）')
+    expect(optionLabels).not.toContain('停用连接（sqlite）')
+    wrapper.unmount()
+  })
+
+  it('imports batch features from a database table and predicts on them', async () => {
+    const wrapper = mount(PredictionLabView, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await chooseRadio(wrapper, '批量特征来源', 'database')
+    expect(dbMocks.listConnections).toHaveBeenCalled()
+    await flushPromises()
+    expect(dbMocks.getSchema).toHaveBeenCalledWith('conn1', 1)
+
+    await selectByLabel(wrapper, '批量特征表', 'customers')
+    await actionButton(wrapper, '从数据库导入').trigger('click')
+    await flushPromises()
+
+    expect(dbMocks.getTableRows).toHaveBeenCalledWith('conn1', 'customers', 1000)
+    expect(wrapper.text()).toContain('已解析 2 行')
+
+    await actionButton(wrapper, '执行批量预测').trigger('click')
+    await flushPromises()
+    expect(modelMocks.batchPredict).toHaveBeenCalledWith('manual:reg', { rows: [{ age: 30 }, { age: 70 }] })
     wrapper.unmount()
   })
 })

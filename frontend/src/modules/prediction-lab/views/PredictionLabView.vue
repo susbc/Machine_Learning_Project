@@ -41,6 +41,13 @@
           </el-tab-pane>
           <el-tab-pane label="批量预测" name="batch">
             <label class="field-row">
+              <span>特征来源</span>
+              <el-radio-group v-model="batchSource" aria-label="批量特征来源">
+                <el-radio-button value="csv">CSV 文件</el-radio-button>
+                <el-radio-button value="database">数据库表</el-radio-button>
+              </el-radio-group>
+            </label>
+            <label v-if="batchSource === 'csv'" class="field-row">
               <span>CSV 特征表</span>
               <input
                 data-testid="prediction-csv-input"
@@ -51,6 +58,44 @@
                 @change="onCsvSelected"
               />
             </label>
+            <template v-else>
+              <label class="field-row">
+                <span>数据库连接（默认使用激活连接）</span>
+                <el-select
+                  v-model="batchConnectionId"
+                  aria-label="批量数据库连接"
+                  filterable
+                  placeholder="选择数据库连接"
+                  :loading="loadingConnections"
+                >
+                  <el-option
+                    v-for="connection in connections"
+                    :key="connection.id"
+                    :label="`${connection.name}（${connection.db_type}）`"
+                    :value="connection.id"
+                  />
+                </el-select>
+              </label>
+              <label class="field-row">
+                <span>特征表</span>
+                <el-select
+                  v-model="batchTableName"
+                  aria-label="批量特征表"
+                  filterable
+                  placeholder="选择数据表"
+                  :loading="loadingTables"
+                >
+                  <el-option v-for="table in tableOptions" :key="table" :label="table" :value="table" />
+                </el-select>
+              </label>
+              <div class="batch-preview import-controls">
+                <span>导入行数上限</span>
+                <el-input-number v-model="batchImportLimit" aria-label="导入行数上限" :min="1" :max="10000" :step="100" />
+                <el-button plain :loading="importingRows" :disabled="!canImportRows" @click="importBatchRowsFromDatabase">
+                  从数据库导入
+                </el-button>
+              </div>
+            </template>
             <div class="batch-preview">
               <span>已解析 {{ batchRows.length }} 行</span>
               <el-button type="primary" :loading="batchPredicting" :disabled="!canBatchPredict" @click="runBatchPrediction">
@@ -127,6 +172,59 @@
         </el-table-column>
       </el-table>
     </section>
+
+    <section v-if="hasExportableResults" class="panel">
+      <div class="panel-title">
+        <h3>结果导出</h3>
+        <span>{{ exportScope === 'batch' ? `批量结果 ${exportRows.length} 行` : '单条预测 1 行' }}</span>
+      </div>
+      <label class="field-row">
+        <span>导出内容</span>
+        <el-radio-group v-model="exportScope" aria-label="导出内容">
+          <el-radio-button v-if="batchResult" value="batch">批量结果</el-radio-button>
+          <el-radio-button v-if="predictionResult" value="single">单条预测</el-radio-button>
+        </el-radio-group>
+      </label>
+      <label class="field-row">
+        <span>导出目标</span>
+        <el-radio-group v-model="exportTarget" aria-label="导出目标">
+          <el-radio-button value="file">服务器文件</el-radio-button>
+          <el-radio-button value="database">数据库</el-radio-button>
+        </el-radio-group>
+      </label>
+      <label v-if="exportTarget === 'file'" class="field-row">
+        <span>导出目录（相对项目根目录，不存在时自动创建）</span>
+        <el-input v-model="exportDir" aria-label="导出目录" placeholder="默认 output" clearable />
+      </label>
+      <template v-else>
+        <label class="field-row">
+          <span>数据库连接（默认使用激活连接）</span>
+          <el-select
+            v-model="exportConnectionId"
+            aria-label="导出数据库连接"
+            filterable
+            placeholder="选择数据库连接"
+            :loading="loadingConnections"
+          >
+            <el-option
+              v-for="connection in connections"
+              :key="connection.id"
+              :label="`${connection.name}（${connection.db_type}）`"
+              :value="connection.id"
+            />
+          </el-select>
+        </label>
+        <label class="field-row">
+          <span>表名（表不存在时按默认结构自动创建）</span>
+          <el-input v-model="exportTableName" aria-label="导出表名" placeholder="默认 prediction_results" clearable />
+        </label>
+      </template>
+      <div class="batch-preview">
+        <span>{{ exportTarget === 'file' ? '以 CSV 文件写入服务器指定目录' : '将预测结果写入指定数据库表' }}</span>
+        <el-button type="primary" :loading="exporting" :disabled="!canExport" @click="runExport">导出结果</el-button>
+      </div>
+      <el-alert v-if="exportNotice" :type="exportNotice.type" :title="exportNotice.text" show-icon :closable="false" />
+    </section>
   </section>
 </template>
 
@@ -134,12 +232,16 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { parseFeatureCsv } from '../csv'
 
+import { databaseApi, type DatabaseConnection } from '@/api/database'
 import {
   modelsApi,
   type ModelBatchPredictionResponse,
   type ModelPredictionResponse,
   type ModelRegistryRecord,
   type PredictionDiagnostics,
+  type PredictionExportResponse,
+  type PredictionExportRow,
+  type PredictionExportTarget,
 } from '@/api/models'
 
 const models = ref<ModelRegistryRecord[]>([])
@@ -153,6 +255,22 @@ const loadingModels = ref(false)
 const predicting = ref(false)
 const batchPredicting = ref(false)
 const errorMessage = ref('')
+const connections = ref<DatabaseConnection[]>([])
+const exportScope = ref<'single' | 'batch'>('batch')
+const exportTarget = ref<PredictionExportTarget>('file')
+const exportDir = ref('')
+const exportConnectionId = ref('')
+const exportTableName = ref('')
+const exporting = ref(false)
+const loadingConnections = ref(false)
+const exportNotice = ref<{ type: 'success' | 'warning'; text: string } | null>(null)
+const batchSource = ref<'csv' | 'database'>('csv')
+const batchConnectionId = ref('')
+const batchTableName = ref('')
+const batchImportLimit = ref(1000)
+const tableOptions = ref<string[]>([])
+const importingRows = ref(false)
+const loadingTables = ref(false)
 let predictionRequestGeneration = 0
 let batchRequestGeneration = 0
 let csvReadGeneration = 0
@@ -161,6 +279,35 @@ const canPredict = computed(() => Boolean(selectedModelId.value && featureJson.v
 const canBatchPredict = computed(() => Boolean(selectedModelId.value && batchRows.value.length > 0))
 const selectedModel = computed(() => models.value.find((model) => model.model_id === selectedModelId.value) ?? null)
 const isRegressionModel = computed(() => selectedModel.value?.problem_type === 'regression')
+const hasExportableResults = computed(() => Boolean(predictionResult.value || batchResult.value))
+const exportRows = computed<PredictionExportRow[]>(() => {
+  if (exportScope.value === 'batch' && batchResult.value) {
+    return batchResult.value.rows.map((row) => ({
+      index: row.index,
+      features: row.features,
+      prediction: row.prediction,
+      encoded_prediction: row.encoded_prediction,
+      probability: row.probability,
+      diagnostics: row.diagnostics,
+    }))
+  }
+  if (predictionResult.value) {
+    const result = predictionResult.value
+    return [{
+      index: 0,
+      features: result.input_features,
+      prediction: result.prediction,
+      encoded_prediction: result.encoded_prediction,
+      probability: result.probability,
+      diagnostics: result.diagnostics,
+    }]
+  }
+  return []
+})
+const canExport = computed(
+  () => exportRows.value.length > 0 && (exportTarget.value === 'file' || Boolean(exportConnectionId.value)),
+)
+const canImportRows = computed(() => Boolean(batchConnectionId.value && batchTableName.value))
 
 async function loadModels() {
   loadingModels.value = true
@@ -275,6 +422,84 @@ function formatMetric(value: number | null | undefined) {
   return typeof value === 'number' ? value.toFixed(4) : '-'
 }
 
+async function loadConnections() {
+  if (connections.value.length) return
+  loadingConnections.value = true
+  try {
+    const payload = await databaseApi.listConnections()
+    connections.value = payload.connections.filter((connection) => connection.is_active)
+    const activeId = payload.active_connection?.id ?? connections.value[0]?.id ?? ''
+    if (!exportConnectionId.value) exportConnectionId.value = activeId
+    if (!batchConnectionId.value) batchConnectionId.value = activeId
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '数据库连接列表加载失败'
+  } finally {
+    loadingConnections.value = false
+  }
+}
+
+async function loadTableOptions() {
+  tableOptions.value = []
+  batchTableName.value = ''
+  if (!batchConnectionId.value) return
+  loadingTables.value = true
+  try {
+    const schema = await databaseApi.getSchema(batchConnectionId.value, 1)
+    tableOptions.value = schema.tables.map((table) => table.name)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '数据表列表加载失败'
+  } finally {
+    loadingTables.value = false
+  }
+}
+
+async function importBatchRowsFromDatabase() {
+  if (!canImportRows.value) return
+  importingRows.value = true
+  errorMessage.value = ''
+  batchRows.value = []
+  invalidateBatchResult()
+  try {
+    const payload = await databaseApi.getTableRows(batchConnectionId.value, batchTableName.value, batchImportLimit.value)
+    batchRows.value = payload.rows
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '数据库表数据导入失败'
+  } finally {
+    importingRows.value = false
+  }
+}
+
+function describeExportSuccess(result: PredictionExportResponse) {
+  if (result.target === 'file') return `已导出 ${result.row_count} 行到 ${result.path}`
+  const created = result.table_created ? '（表不存在，已自动创建）' : '（追加写入已有表）'
+  return `已导出 ${result.row_count} 行到数据库表 ${result.table_name}${created}`
+}
+
+async function runExport() {
+  const rows = exportRows.value
+  if (!rows.length) return
+  exporting.value = true
+  exportNotice.value = null
+  errorMessage.value = ''
+  try {
+    const result = await modelsApi.exportPredictions({
+      model_id: selectedModelId.value,
+      target: exportTarget.value,
+      rows,
+      output_dir: exportTarget.value === 'file' ? (exportDir.value.trim() || undefined) : undefined,
+      connection_id: exportTarget.value === 'database' ? exportConnectionId.value : undefined,
+      table_name: exportTarget.value === 'database' ? (exportTableName.value.trim() || undefined) : undefined,
+    })
+    exportNotice.value = result.exported
+      ? { type: 'success', text: describeExportSuccess(result) }
+      : { type: 'warning', text: result.warnings.join('；') || '导出未完成' }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '导出失败'
+  } finally {
+    exporting.value = false
+  }
+}
+
 function hasDiagnostics(diagnostics: PredictionDiagnostics | null | undefined) {
   return Boolean(diagnostics?.unknown_input_keys.length || diagnostics?.missing_columns_imputed.length)
 }
@@ -286,6 +511,7 @@ function clearResults() {
   batchResult.value = null
   predicting.value = false
   batchPredicting.value = false
+  exportNotice.value = null
 }
 
 function invalidateSingleResult() {
@@ -302,6 +528,20 @@ function invalidateBatchResult() {
 
 watch(selectedModelId, clearResults)
 watch(featureJson, invalidateSingleResult)
+watch([predictionResult, batchResult], () => {
+  exportNotice.value = null
+  if (exportScope.value === 'batch' && !batchResult.value) exportScope.value = 'single'
+  if (exportScope.value === 'single' && !predictionResult.value) exportScope.value = 'batch'
+})
+watch(exportTarget, (target) => {
+  if (target === 'database') void loadConnections()
+})
+watch(batchSource, (source) => {
+  if (source === 'database') void loadConnections()
+})
+watch(batchConnectionId, () => {
+  void loadTableOptions()
+})
 
 onMounted(loadModels)
 </script>
@@ -385,6 +625,15 @@ onMounted(loadModels)
   gap: 12px;
   color: #64748b;
   font-size: 13px;
+}
+
+.import-controls {
+  justify-content: flex-start;
+  margin-bottom: 14px;
+}
+
+.import-controls :deep(.el-input-number) {
+  width: 150px;
 }
 
 .result-card {

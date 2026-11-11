@@ -33,6 +33,7 @@ from backend.api.analysis import router as analysis_router
 from backend.api.database import router as database_router
 from backend.api.llm import router as llm_router
 from backend.api.models import router as models_router
+from backend.api.prediction_exports import router as prediction_exports_router
 from backend.api.training import router as training_router
 from backend.api.intent import router as intent_router
 from backend.api.automl import prune_automl_runtime, recover_interrupted_automl_jobs
@@ -207,6 +208,7 @@ app.include_router(automl_router)
 app.include_router(analysis_router)
 app.include_router(llm_router)
 app.include_router(models_router)
+app.include_router(prediction_exports_router)
 app.include_router(database_router)
 app.include_router(training_router)
 app.include_router(intent_router)
