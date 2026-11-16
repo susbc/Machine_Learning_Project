@@ -68,7 +68,7 @@ vi.mock('@/api/workflow', () => ({
 vi.mock('@/api/mlops', () => ({
   mlopsApi: {
     getModelHealth: vi.fn(async () => ({
-      models: [{ 模型: 'task_1234abcd', AUC: 0.61, 健康度: '需优化', 调用次数: 12 }],
+      models: [{ 模型: 'task_1234abcd', 最佳指标: 0.61, 指标名: 'roc_auc', 健康度: '漂移告警', 调用次数: 12 }],
     })),
   },
 }))
@@ -180,7 +180,8 @@ describe('frontend interaction regressions', () => {
     await wrapper.vm.$nextTick()
 
     const vm = wrapper.vm as unknown as { trainingJson: string }
-    expect(vm.trainingJson).toContain('"val_auc": 0.61')
+    expect(vm.trainingJson).toContain('"best_value": 0.61')
+    expect(vm.trainingJson).toContain('"best_metric": "roc_auc"')
     expect(vm.trainingJson).toContain('"source": "mlops_health"')
   })
 })

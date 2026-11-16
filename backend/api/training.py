@@ -18,10 +18,12 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from pathlib import Path
 from pydantic import BaseModel, Field
 
 from ._common import validate_entity_id
 from backend.runtime_state import TaskQueueFullError, background_tasks, runtime_state
+from backend.services.mlops_monitoring import write_baseline_for_saved_model
 from backend.services.datasets import (
     calibrate_binary_threshold,
     compute_classification_metrics,
@@ -340,11 +342,113 @@ def _job_snapshot(job: TrainingJob) -> Dict[str, Any]:
     }
 
 
+def _outlier_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """IQR 1.5 倍法则的异常值统计（与旧版 Streamlit EDA 同语义）。"""
+    rows: List[Dict[str, Any]] = []
+    for col in df.select_dtypes(include=[np.number]).columns:
+        series = df[col].replace([np.inf, -np.inf], np.nan).dropna()
+        if len(series) < 8:
+            continue
+        q1, q3 = series.quantile(0.25), series.quantile(0.75)
+        iqr = q3 - q1
+        if pd.isna(iqr) or iqr == 0:
+            continue
+        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        count = int(((series < lower) | (series > upper)).sum())
+        rows.append(
+            {
+                "field": str(col),
+                "count": count,
+                "rate": round(count / max(len(series), 1), 6),
+                "lower": round(float(lower), 4),
+                "upper": round(float(upper), 4),
+            }
+        )
+    return rows
+
+
+def _finite(value: float) -> Optional[float]:
+    return round(float(value), 6) if np.isfinite(value) else None
+
+
+def _significance_rows(df: pd.DataFrame, target_col: str, problem_type: str) -> List[Dict[str, Any]]:
+    """字段与目标的关联性检验：分类目标用卡方/ANOVA F，回归目标用 Pearson/ANOVA F。"""
+    from scipy import stats as scipy_stats
+    from sklearn.feature_selection import f_classif
+
+    rows: List[Dict[str, Any]] = []
+    target = df[target_col]
+    is_classification = problem_type != "regression"
+    for col in df.drop(columns=[target_col], errors="ignore").columns:
+        pair = pd.DataFrame({"x": df[col], "y": target}).dropna()
+        if len(pair) < 8 or pair["x"].nunique() < 2 or pair["y"].nunique() < 2:
+            continue
+        numeric_x = pd.api.types.is_numeric_dtype(df[col])
+        statistic: float
+        p_value: float
+        method: str
+        association: Optional[float] = None
+        try:
+            if is_classification:
+                if numeric_x:
+                    f_stat, f_p = f_classif(pair[["x"]], pair["y"])
+                    method, statistic, p_value = "ANOVA F", float(f_stat[0]), float(f_p[0])
+                else:
+                    table = pd.crosstab(pair["x"], pair["y"])
+                    if table.shape[0] < 2 or table.shape[1] < 2:
+                        continue
+                    chi2, chi_p, _, _ = scipy_stats.chi2_contingency(table)
+                    n = int(table.values.sum())
+                    method, statistic, p_value = "卡方", float(chi2), float(chi_p)
+                    denominator = n * min(table.shape[0] - 1, table.shape[1] - 1)
+                    association = float(np.sqrt(chi2 / denominator)) if denominator > 0 else None
+            elif numeric_x:
+                r, p = scipy_stats.pearsonr(pair["x"], pair["y"])
+                method, statistic, p_value, association = "Pearson", float(r), float(p), float(r)
+            else:
+                groups = [group["y"].to_numpy() for _, group in pair.groupby("x")]
+                if len(groups) < 2 or any(len(item) < 2 for item in groups):
+                    continue
+                f_stat, f_p = scipy_stats.f_oneway(*groups)
+                method, statistic, p_value = "ANOVA F", float(f_stat), float(f_p)
+        except (ValueError, ZeroDivisionError):
+            continue
+        rows.append(
+            {
+                "field": str(col),
+                "method": method,
+                "statistic": _finite(statistic),
+                "p_value": _finite(p_value),
+                "target_association": None if association is None else round(association, 4),
+            }
+        )
+    return sorted(rows, key=lambda row: row["p_value"] if row["p_value"] is not None else 1.0)[:50]
+
+
+def _high_correlation_pairs(corr: pd.DataFrame) -> List[Dict[str, Any]]:
+    pairs: List[Dict[str, Any]] = []
+    columns = list(corr.columns)
+    for i in range(len(columns)):
+        for j in range(i + 1, len(columns)):
+            value = corr.iloc[i, j]
+            if pd.notna(value) and abs(value) > 0.7:
+                pairs.append(
+                    {
+                        "field_a": str(columns[i]),
+                        "field_b": str(columns[j]),
+                        "correlation": round(float(value), 4),
+                    }
+                )
+    return sorted(pairs, key=lambda pair: abs(pair["correlation"]), reverse=True)[:50]
+
+
 def _eda_summary(dataset: TrainingDataset) -> Dict[str, Any]:
     df = dataset.df
     feature_df = df.drop(columns=[dataset.target_col], errors="ignore")
     numeric = feature_df.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan)
     quality = dataframe_quality_report(df, dataset.target_col)
+    correlations = numeric.corr(numeric_only=True).round(4).fillna(0) if len(numeric.columns) else pd.DataFrame()
+    problem_type = str((dataset.problem_spec or {}).get("resolved_type", ""))
     return {
         "dataset_id": dataset.dataset_id,
         "summary": {
@@ -358,7 +462,10 @@ def _eda_summary(dataset: TrainingDataset) -> Dict[str, Any]:
         },
         "columns": dataset.fields,
         "quality": quality,
-        "correlations": numeric.corr(numeric_only=True).round(4).fillna(0).to_dict() if len(numeric.columns) else {},
+        "correlations": correlations.to_dict() if len(correlations.columns) else {},
+        "outliers": _outlier_rows(df),
+        "significance": _significance_rows(df, dataset.target_col, problem_type),
+        "high_correlation_pairs": _high_correlation_pairs(correlations) if len(correlations.columns) else [],
     }
 
 
@@ -652,7 +759,23 @@ async def save_training_result(job_id: str):
         job.artifact_path = relative_path
         job.updated_at = _now()
     _persist_job(job)
+    _write_training_baseline(job, relative_path)
     return {"status": "saved", "job_id": job_id, "artifact_path": relative_path}
+
+
+def _write_training_baseline(job: "TrainingJob", relative_path: str) -> None:
+    """保存模型后写入 MLOps 漂移监控基线（失败不影响保存结果）。"""
+    try:
+        dataset = _get_dataset(job.dataset_id)
+        model_id = f"manual:{Path(relative_path).stem}"
+        key_cols = [
+            item.get("field_name")
+            for item in dataset.fields
+            if isinstance(item, dict) and item.get("field_type") == "key"
+        ]
+        write_baseline_for_saved_model(model_id, dataset.df, dataset.target_col, [c for c in key_cols if c])
+    except Exception as exc:
+        logger.warning("训练监控基线写入失败 job=%s：%s", job.job_id, exc)
 
 
 @router.get("/jobs/{job_id:path}")

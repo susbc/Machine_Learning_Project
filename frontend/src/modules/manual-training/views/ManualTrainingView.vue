@@ -2,7 +2,6 @@
   <section class="workspace-theme training-workspace">
     <div class="section-heading training-heading">
       <div>
-        <p class="eyebrow">Phase 4</p>
         <h2>手动训练</h2>
         <p>按步骤完成数据上传、字段配置检查、EDA、单模型训练、指标查看和模型保存。</p>
       </div>
@@ -28,31 +27,75 @@
       <section class="panel">
         <div class="panel-title">
           <h3>1. 数据上传</h3>
-          <span>{{ datasetFile?.name ?? dataset?.filename ?? '未选择数据' }}</span>
+          <span>{{ dataSourceLabel }}</span>
         </div>
-        <el-upload
-          drag
-          accept=".csv,.xlsx,.xls"
-          :auto-upload="false"
-          :limit="1"
-          :on-change="handleFileChange"
-          :on-remove="handleFileRemove"
-        >
-          <div class="upload-copy">
-            <strong>选择训练数据</strong>
-            <span>支持 CSV / Excel，目标列可留空自动识别</span>
-          </div>
-        </el-upload>
-        <input
-          data-testid="manual-training-file-input"
-          class="native-file-input"
-          type="file"
-          accept=".csv,.xlsx,.xls"
-          @change="handleNativeFileChange"
-        />
+        <label class="source-row">
+          <span>数据来源</span>
+          <el-radio-group v-model="dataSource" aria-label="手动训练数据来源">
+            <el-radio-button value="file">CSV / Excel 文件</el-radio-button>
+            <el-radio-button value="database">数据库表</el-radio-button>
+          </el-radio-group>
+        </label>
+        <template v-if="dataSource === 'file'">
+          <el-upload
+            drag
+            accept=".csv,.xlsx,.xls"
+            :auto-upload="false"
+            :limit="1"
+            :on-change="handleFileChange"
+            :on-remove="handleFileRemove"
+          >
+            <div class="upload-copy">
+              <strong>选择训练数据</strong>
+              <span>支持 CSV / Excel，目标列可留空自动识别</span>
+            </div>
+          </el-upload>
+          <input
+            data-testid="manual-training-file-input"
+            class="native-file-input"
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            @change="handleNativeFileChange"
+          />
+        </template>
+        <div v-else class="db-form">
+          <label class="field">
+            <span>数据库连接（默认使用激活连接）</span>
+            <el-select
+              v-model="connectionId"
+              aria-label="手动训练数据库连接"
+              filterable
+              placeholder="选择数据库连接"
+              :loading="loadingConnections"
+            >
+              <el-option
+                v-for="connection in connections"
+                :key="connection.id"
+                :label="`${connection.name}（${connection.db_type}）`"
+                :value="connection.id"
+              />
+            </el-select>
+          </label>
+          <label class="field">
+            <span>数据表</span>
+            <el-select
+              v-model="tableName"
+              aria-label="手动训练数据表"
+              filterable
+              placeholder="选择数据表"
+              :loading="loadingTables"
+            >
+              <el-option v-for="table in tableOptions" :key="table" :label="table" :value="table" />
+            </el-select>
+          </label>
+          <label class="field field--limit">
+            <span>导入行数上限</span>
+            <el-input-number v-model="importLimit" aria-label="导入行数上限" :min="1" :max="10000" :step="100" controls-position="right" />
+          </label>
+        </div>
         <div class="inline-form">
           <el-input v-model="targetCol" placeholder="目标列，例如 label" clearable />
-          <el-button type="primary" :loading="uploading" :disabled="!datasetFile || explicitActionsBlocked" @click="uploadDataset">上传</el-button>
+          <el-button type="primary" :loading="uploading" :disabled="!canSubmitData || explicitActionsBlocked" @click="uploadDataset">上传</el-button>
         </div>
 
         <div v-if="dataset" class="dataset-summary">
@@ -90,6 +133,38 @@
             <template #default="{ row }">{{ percentLabel(row.missing_rate) }}</template>
           </el-table-column>
         </el-table>
+        <template v-if="eda">
+          <h4 class="eda-subtitle">字段显著性检验（vs 目标）</h4>
+          <el-table :data="eda.significance ?? []" height="220" empty-text="暂无可检验字段">
+            <el-table-column prop="field" label="字段" min-width="140" show-overflow-tooltip />
+            <el-table-column prop="method" label="方法" width="100" />
+            <el-table-column label="统计量" width="120">
+              <template #default="{ row }">{{ formatStat(row.statistic) }}</template>
+            </el-table-column>
+            <el-table-column label="P 值" width="120">
+              <template #default="{ row }">{{ formatStat(row.p_value) }}</template>
+            </el-table-column>
+            <el-table-column label="与目标关联系数" width="130">
+              <template #default="{ row }">{{ formatStat(row.target_association, 4) }}</template>
+            </el-table-column>
+          </el-table>
+          <h4 class="eda-subtitle">异常值校验（IQR 1.5 倍）</h4>
+          <el-table :data="eda.outliers ?? []" height="200" empty-text="无数值字段异常值">
+            <el-table-column prop="field" label="字段" min-width="140" show-overflow-tooltip />
+            <el-table-column prop="count" label="异常值数" width="100" />
+            <el-table-column label="比例" width="100">
+              <template #default="{ row }">{{ percentLabel(row.rate) }}</template>
+            </el-table-column>
+            <el-table-column prop="lower" label="下界" width="110" />
+            <el-table-column prop="upper" label="上界" width="110" />
+          </el-table>
+          <h4 class="eda-subtitle">高相关字段对（|r| &gt; 0.7）</h4>
+          <el-table :data="eda.high_correlation_pairs ?? []" height="180" empty-text="无高相关字段对">
+            <el-table-column prop="field_a" label="字段 1" min-width="140" show-overflow-tooltip />
+            <el-table-column prop="field_b" label="字段 2" min-width="140" show-overflow-tooltip />
+            <el-table-column prop="correlation" label="相关系数" width="120" />
+          </el-table>
+        </template>
       </section>
     </div>
 
@@ -217,7 +292,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { UploadFile } from 'element-plus'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 
@@ -232,10 +307,29 @@ import {
   type TrainingStatus,
 } from '@/api/training'
 import type { ProblemCapabilitiesResponse, ProblemSpec, ProblemType } from '@/api/problem'
+import { useDatabaseTableSource } from '@/shared/composables/useDatabaseTableSource'
 
 const datasetFile = ref<File | null>(null)
 const uploadedDatasetFile = ref<File | null>(null)
 const targetCol = ref('')
+const dataSource = ref<'file' | 'database'>('file')
+const {
+  connections,
+  connectionId,
+  tableName,
+  tableOptions,
+  importLimit,
+  loadingConnections,
+  loadingTables,
+  canImportTable,
+  loadConnections,
+  importTableAsFile,
+} = useDatabaseTableSource()
+const canSubmitData = computed(() => Boolean(datasetFile.value) || (dataSource.value === 'database' && canImportTable.value))
+const dataSourceLabel = computed(() => {
+  if (dataSource.value === 'database') return tableName.value ? `${tableName.value}（数据库表）` : '未选择数据表'
+  return datasetFile.value?.name ?? dataset.value?.filename ?? '未选择数据'
+})
 const dataset = ref<TrainingDataset | null>(null)
 const fields = ref<TrainingField[]>([])
 const eda = ref<TrainingEda | null>(null)
@@ -446,6 +540,16 @@ async function loadCapabilities() {
 }
 
 async function uploadDataset() {
+  if (explicitActionsBlocked.value) return
+  if (dataSource.value === 'database' && !datasetFile.value) {
+    const imported = await importTableAsFile()
+    if (imported.error) {
+      errorMessage.value = imported.error
+      return
+    }
+    if (!imported.file) return
+    datasetFile.value = imported.file
+  }
   if (!datasetFile.value || explicitActionsBlocked.value) return
   const file = datasetFile.value
   const generation = datasetGeneration
@@ -477,6 +581,12 @@ async function uploadDataset() {
     if (isCurrentFileContext(generation, file)) uploading.value = false
   }
 }
+
+watch(dataSource, async (value) => {
+  if (value !== 'database') return
+  const message = await loadConnections()
+  if (message) errorMessage.value = message
+})
 
 async function runEda() {
   if (!dataset.value || uploadedDatasetFile.value !== datasetFile.value) return
@@ -663,6 +773,10 @@ function percentLabel(value: unknown): string {
   return `${(numeric * 100).toFixed(2)}%`
 }
 
+function formatStat(value: number | null | undefined, digits = 6): string {
+  return typeof value === 'number' ? value.toFixed(digits) : '-'
+}
+
 function statusLabel(status: TrainingStatus): string {
   const labels: Record<TrainingStatus, string> = {
     queued: '排队中',
@@ -689,6 +803,48 @@ function algorithmLabel(value: TrainingAlgorithm): string {
 </script>
 
 <style scoped>
+.eda-subtitle {
+  margin: 16px 0 8px;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.source-row,
+.field {
+  display: grid;
+  gap: 6px;
+}
+
+.source-row {
+  margin-bottom: 14px;
+}
+
+.source-row > span,
+.field > span {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.db-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 150px;
+  gap: 14px 16px;
+  align-items: end;
+  margin-bottom: 14px;
+}
+
+.field :deep(.el-select),
+.field :deep(.el-input-number) {
+  width: 100%;
+}
+
+@media (max-width: 1100px) {
+  .db-form {
+    grid-template-columns: 1fr;
+  }
+}
+
 .training-workspace {
   display: flex;
   flex-direction: column;

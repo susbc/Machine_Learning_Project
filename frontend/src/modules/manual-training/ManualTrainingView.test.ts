@@ -36,6 +36,24 @@ vi.mock('@/api/training', () => ({
   },
 }))
 
+const dbMocks = vi.hoisted(() => ({
+  listConnections: vi.fn(),
+  getSchema: vi.fn(),
+  getTableRows: vi.fn(),
+}))
+
+vi.mock('@/api/database', () => ({
+  databaseApi: dbMocks,
+}))
+
+const sqliteConnection = {
+  id: 'conn1',
+  name: '本地 SQLite',
+  db_type: 'sqlite',
+  is_active: true,
+  config: { db_type: 'sqlite', database: 'local.db' },
+} as const
+
 const regressionSpec = {
   schema_version: 1,
   requested_type: 'regression',
@@ -166,6 +184,13 @@ async function chooseFile(wrapper: ReturnType<typeof mount>, filename = 'train.c
   await wrapper.get('[data-testid="manual-training-file-input"]').trigger('change')
 }
 
+async function chooseRadio(wrapper: ReturnType<typeof mount>, groupLabel: string, value: string) {
+  const input = wrapper.get(`[aria-label="${groupLabel}"] input[value="${value}"]`)
+  ;(input.element as HTMLInputElement).checked = true
+  await input.trigger('change')
+  await flushPromises()
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void
   const promise = new Promise<T>((resolvePromise) => {
@@ -185,6 +210,22 @@ describe('ManualTrainingView', () => {
     trainingMocks.getResult.mockReset()
     trainingMocks.saveResult.mockReset()
     trainingMocks.cancelJob.mockReset()
+    dbMocks.listConnections.mockReset()
+    dbMocks.getSchema.mockReset()
+    dbMocks.getTableRows.mockReset()
+    dbMocks.listConnections.mockResolvedValue({ connections: [sqliteConnection], active_connection: sqliteConnection })
+    dbMocks.getSchema.mockResolvedValue({
+      connection: sqliteConnection,
+      tables: [{ name: 'customers', columns: [], sample: { columns: [], rows: [], row_count: 0 } }],
+    })
+    dbMocks.getTableRows.mockResolvedValue({
+      columns: ['age', 'income', 'label'],
+      rows: [
+        { age: 30, income: 100, label: 0 },
+        { age: 70, income: 200, label: 1 },
+      ],
+      row_count: 2,
+    })
     trainingMocks.getCapabilities.mockResolvedValue(capabilities)
     trainingMocks.getFieldConfig.mockResolvedValue({ dataset_id: 'dataset_cls', fields: [] })
     trainingMocks.runEda.mockResolvedValue({
@@ -192,6 +233,12 @@ describe('ManualTrainingView', () => {
       summary: { missing_rate: 0, numeric_features: 1, categorical_features: 0, target_unique: 2 },
       columns: [],
       correlations: {},
+      significance: [
+        { field: 'city', method: '卡方', statistic: 12.34, p_value: 0.002, target_association: 0.31 },
+        { field: 'score', method: 'ANOVA F', statistic: 8.5, p_value: 0.004, target_association: null },
+      ],
+      outliers: [{ field: 'age', count: 3, rate: 0.03, lower: -1.5, upper: 9.5 }],
+      high_correlation_pairs: [{ field_a: 'income', field_b: 'balance', correlation: 0.86 }],
     })
     trainingMocks.saveResult.mockResolvedValue({
       status: 'saved', job_id: 'job_cls', artifact_path: 'saved/manual_old.pkl',
@@ -529,6 +576,49 @@ describe('ManualTrainingView', () => {
 
     expect(wrapper.text()).toContain('待上传')
     expect(wrapper.text()).not.toContain('0.91000')
+    wrapper.unmount()
+  })
+
+  it('imports a database table as training data through the active connection', async () => {
+    trainingMocks.uploadDataset.mockResolvedValue(classificationDataset)
+    const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await chooseRadio(wrapper, '手动训练数据来源', 'database')
+    await flushPromises()
+    expect(dbMocks.getSchema).toHaveBeenCalledWith('conn1', 1)
+
+    await selectOption(wrapper, '手动训练数据表', 'customers')
+    await actionButton(wrapper, '上传').trigger('click')
+    await flushPromises()
+
+    expect(dbMocks.getTableRows).toHaveBeenCalledWith('conn1', 'customers', 1000)
+    expect(trainingMocks.uploadDataset).toHaveBeenCalledWith(
+      expect.objectContaining({ file: expect.objectContaining({ name: 'customers.csv' }) }),
+    )
+    wrapper.unmount()
+  })
+
+  it('renders significance, outlier and correlation tables from EDA', async () => {
+    trainingMocks.uploadDataset.mockResolvedValue(classificationDataset)
+    const wrapper = mount(ManualTrainingView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    await chooseFile(wrapper)
+    await actionButton(wrapper, '上传').trigger('click')
+    await flushPromises()
+    await actionButton(wrapper, '运行 EDA').trigger('click')
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain('字段显著性检验（vs 目标）')
+    expect(text).toContain('卡方')
+    expect(text).toContain('0.002000')
+    expect(text).toContain('0.3100')
+    expect(text).toContain('异常值校验（IQR 1.5 倍）')
+    expect(text).toContain('3.00%')
+    expect(text).toContain('高相关字段对（|r| > 0.7）')
+    expect(text).toContain('0.86')
     wrapper.unmount()
   })
 })

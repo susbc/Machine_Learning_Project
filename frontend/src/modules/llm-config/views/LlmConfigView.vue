@@ -2,7 +2,6 @@
   <section class="workspace-theme llm-workspace">
     <div class="section-heading llm-heading">
       <div>
-        <p class="eyebrow">Phase 5</p>
         <h2>大模型配置</h2>
         <p>管理 LLM Provider、连接测试、启用停用和当前激活模型；API Key 仅写入，不回显明文。</p>
       </div>

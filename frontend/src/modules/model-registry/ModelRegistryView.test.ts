@@ -6,11 +6,62 @@ import ModelRegistryView from './views/ModelRegistryView.vue'
 
 const registryMocks = vi.hoisted(() => ({
   listModels: vi.fn(),
+  getModelWeights: vi.fn(),
+  deleteModel: vi.fn(),
 }))
 
-vi.mock('@/api/models', () => ({
-  modelsApi: { listModels: registryMocks.listModels },
+const messageBoxMocks = vi.hoisted(() => ({
+  confirm: vi.fn(),
 }))
+
+const routeHolder = vi.hoisted(() => ({
+  route: null as { query: Record<string, string> } | null,
+}))
+
+const routerMock = vi.hoisted(() => ({
+  push: vi.fn(),
+}))
+
+const chartMocks = vi.hoisted(() => {
+  const instance = {
+    setOption: vi.fn(),
+    dispose: vi.fn(),
+    resize: vi.fn(),
+    isDisposed: vi.fn(() => false),
+    getDom: vi.fn(() => null as unknown),
+  }
+  const init = vi.fn((element: unknown) => {
+    instance.getDom.mockReturnValue(element)
+    return instance
+  })
+  return { instance, init }
+})
+
+vi.mock('@/api/models', () => ({
+  modelsApi: registryMocks,
+}))
+
+vi.mock('@/shared/charts/echarts', () => ({
+  init: chartMocks.init,
+}))
+
+vi.mock('element-plus/es/components/message-box/index.mjs', () => ({
+  ElMessageBox: messageBoxMocks,
+}))
+
+vi.mock('vue-router', async () => {
+  const { reactive } = await import('vue')
+  routeHolder.route = reactive({ query: {} }) as { query: Record<string, string> }
+  return {
+    useRoute: () => routeHolder.route,
+    useRouter: () => routerMock,
+  }
+})
+
+function setQuery(query: Record<string, string>) {
+  if (!routeHolder.route) throw new Error('route mock not initialized')
+  routeHolder.route.query = query
+}
 
 const regressionSpec = {
   schema_version: 1,
@@ -118,7 +169,21 @@ function tableRows(wrapper: VueWrapper, tableIndex: number) {
 describe('ModelRegistryView', () => {
   beforeEach(() => {
     registryMocks.listModels.mockReset()
+    registryMocks.getModelWeights.mockReset()
+    registryMocks.deleteModel.mockReset()
+    messageBoxMocks.confirm.mockReset()
+    routerMock.push.mockReset()
+    chartMocks.instance.setOption.mockReset()
+    chartMocks.instance.dispose.mockReset()
+    chartMocks.init.mockReset()
+    setQuery({})
     registryMocks.listModels.mockResolvedValue({ models: records })
+    registryMocks.getModelWeights.mockResolvedValue({
+      model_id: 'manual:reg',
+      kind: 'coefficients',
+      weights: [{ feature: 'x', importance: 0.75 }],
+    })
+    registryMocks.deleteModel.mockResolvedValue({ status: 'deleted', model_id: 'manual:reg' })
   })
 
   it('uses task-aware primary metrics and shows all regression comparison metrics', async () => {
@@ -189,6 +254,111 @@ describe('ModelRegistryView', () => {
 
     expect(wrapper.text()).not.toContain('注册表暂不可用')
     expect(wrapper.text()).toContain('manual:reg')
+    wrapper.unmount()
+  })
+
+  it('navigates to the model detail view when a model name is clicked', async () => {
+    const wrapper = mount(ModelRegistryView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    const links = wrapper.findAll('.model-link')
+    await links[1]!.trigger('click')
+    await flushPromises()
+
+    expect(routerMock.push).toHaveBeenCalledWith({ query: { model: 'automl:classifier' } })
+    wrapper.unmount()
+  })
+
+  it('renders the detail view from the route query with weights and back navigation', async () => {
+    setQuery({ model: 'manual:reg' })
+    const wrapper = mount(ModelRegistryView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('模型详情 · manual:reg')
+    expect(wrapper.get('.detail-panel').text()).toContain('manual:reg')
+    expect(registryMocks.getModelWeights).toHaveBeenCalledWith('manual:reg')
+    expect(wrapper.text()).toContain('线性模型系数（绝对值）')
+    expect(wrapper.text()).toContain('0.7500')
+    expect(wrapper.text()).toContain('100.00%')
+    expect(wrapper.text()).toContain('评估指标')
+    expect(wrapper.text()).toContain('0.9900')
+    expect(wrapper.text()).toContain('主指标')
+    expect(chartMocks.instance.setOption).toHaveBeenCalled()
+
+    const back = wrapper.findAll('button').find((candidate) => candidate.text().trim() === '返回列表')
+    if (!back) throw new Error('Expected 返回列表 action')
+    await back.trigger('click')
+    await flushPromises()
+    expect(routerMock.push).toHaveBeenCalledWith({ query: {} })
+    wrapper.unmount()
+  })
+
+  it('refreshes weights from the detail view', async () => {
+    setQuery({ model: 'manual:reg' })
+    const wrapper = mount(ModelRegistryView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+    expect(registryMocks.getModelWeights).toHaveBeenCalledTimes(1)
+
+    const refresh = wrapper.findAll('button').find((candidate) => candidate.text().trim() === '刷新权重')
+    if (!refresh) throw new Error('Expected 刷新权重 action')
+    await refresh.trigger('click')
+    await flushPromises()
+    expect(registryMocks.getModelWeights).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
+  })
+
+  it('deletes a model from the detail view after confirmation and returns to the list', async () => {
+    messageBoxMocks.confirm.mockResolvedValue('confirm')
+    setQuery({ model: 'manual:reg' })
+    const wrapper = mount(ModelRegistryView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    const deleteButton = wrapper.findAll('button').find((candidate) => candidate.text().trim() === '删除模型')
+    if (!deleteButton) throw new Error('Expected 删除模型 action')
+    await deleteButton.trigger('click')
+    await flushPromises()
+
+    expect(messageBoxMocks.confirm).toHaveBeenCalled()
+    expect(registryMocks.deleteModel).toHaveBeenCalledWith('manual:reg')
+    expect(registryMocks.listModels).toHaveBeenCalledTimes(2)
+    expect(routerMock.push).toHaveBeenCalledWith({ query: {} })
+    wrapper.unmount()
+  })
+
+  it('keeps the model when deletion is cancelled', async () => {
+    messageBoxMocks.confirm.mockRejectedValue(new Error('cancel'))
+    setQuery({ model: 'manual:reg' })
+    const wrapper = mount(ModelRegistryView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    const deleteButton = wrapper.findAll('button').find((candidate) => candidate.text().trim() === '删除模型')
+    if (!deleteButton) throw new Error('Expected 删除模型 action')
+    await deleteButton.trigger('click')
+    await flushPromises()
+
+    expect(registryMocks.deleteModel).not.toHaveBeenCalled()
+    expect(registryMocks.listModels).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
+  it('rebuilds the importance chart when re-entering the detail view', async () => {
+    setQuery({ model: 'manual:reg' })
+    const wrapper = mount(ModelRegistryView, { global: { plugins: [ElementPlus] } })
+    await flushPromises()
+
+    expect(chartMocks.init).toHaveBeenCalledTimes(1)
+    const firstElement = chartMocks.init.mock.calls[0]![0]
+
+    setQuery({})
+    await flushPromises()
+    expect(chartMocks.instance.dispose).toHaveBeenCalled()
+
+    setQuery({ model: 'manual:reg' })
+    await flushPromises()
+
+    expect(chartMocks.init).toHaveBeenCalledTimes(2)
+    expect(chartMocks.init.mock.calls[1]![0]).not.toBe(firstElement)
+    expect(chartMocks.instance.setOption).toHaveBeenCalled()
     wrapper.unmount()
   })
 })

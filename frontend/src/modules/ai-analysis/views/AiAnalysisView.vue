@@ -2,7 +2,6 @@
   <section class="workspace-theme analysis-workspace">
     <div class="section-heading analysis-heading">
       <div>
-        <p class="eyebrow">Phase 2</p>
         <h2>AI 智能分析</h2>
         <p>汇总数据、训练、预测、MLOps 和 LLM 上下文，形成可追踪的模型诊断与综合报告。</p>
       </div>
@@ -224,12 +223,13 @@ const primaryModelId = computed(() => modelRecords.value[0]?.task_id ?? '暂无�
 const primaryHealth = computed(() => healthRows.value[0] ?? null)
 const primaryHealthText = computed(() => {
   if (!primaryHealth.value) return '暂无健康数据'
-  const auc = typeof primaryHealth.value.AUC === 'number' ? primaryHealth.value.AUC.toFixed(4) : '-'
-  return `${primaryHealth.value.模型 ?? '未知模型'} / AUC ${auc} / ${primaryHealth.value.健康度 ?? '未评级'}`
+  const metric = typeof primaryHealth.value.最佳指标 === 'number' ? primaryHealth.value.最佳指标.toFixed(4) : '-'
+  const metricName = primaryHealth.value.指标名 ?? '指标'
+  return `${primaryHealth.value.模型 ?? '未知模型'} / ${metricName} ${metric} / ${primaryHealth.value.健康度 ?? '未评级'}`
 })
 const latestReportSummary = computed(() => reports.value[0]?.summary || '暂无历史报告')
 const contextRiskText = computed(() => {
-  if (healthRows.value.some((row) => row.健康度 === '异常' || row.健康度 === '需优化')) return '需关注'
+  if (healthRows.value.some((row) => row.健康度 === '需重训' || row.健康度 === '漂移告警')) return '需关注'
   if (modelRecords.value.length === 0) return '待接入'
   return '已接入'
 })
@@ -337,7 +337,8 @@ function importHealthForTraining() {
   trainingJson.value = JSON.stringify(
     {
       metrics: {
-        val_auc: Number(row.AUC ?? 0),
+        best_metric: row.指标名 ?? null,
+        best_value: Number(row.最佳指标 ?? 0),
         prediction_latency_ms: row['预测延迟 (ms)'] ?? null,
         call_count: row.调用次数 ?? 0,
       },

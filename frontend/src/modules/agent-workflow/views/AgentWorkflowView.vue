@@ -2,7 +2,6 @@
   <section class="workspace-theme workflow-workspace">
     <div class="section-heading workflow-heading">
       <div>
-        <p class="eyebrow">Phase 6</p>
         <h2>Agent 工作流</h2>
         <p>按步骤执行自然语言取数、特征策略生成、AutoML 训练和在线预测，后续步骤会受前置状态约束。</p>
       </div>
@@ -158,8 +157,28 @@
               <el-option label="回归" value="regression" />
             </el-select>
           </label>
-          <el-input-number v-model="trainConfig.nTrials" :min="10" :max="100" controls-position="right" :disabled="training" />
-          <el-input-number v-model="trainConfig.cvFolds" :min="3" :max="10" controls-position="right" :disabled="training" />
+          <label class="train-field">
+            <span>Trial 数</span>
+            <el-input-number
+              v-model="trainConfig.nTrials"
+              aria-label="Trial 数"
+              :min="10"
+              :max="100"
+              controls-position="right"
+              :disabled="training"
+            />
+          </label>
+          <label class="train-field">
+            <span>CV 折数</span>
+            <el-input-number
+              v-model="trainConfig.cvFolds"
+              aria-label="CV 折数"
+              :min="3"
+              :max="10"
+              controls-position="right"
+              :disabled="training"
+            />
+          </label>
           <el-button type="warning" :loading="training" :disabled="!canTrain" @click="startTraining">开始训练</el-button>
         </div>
         <el-progress :percentage="trainingProgress" :status="trainingProgress === 100 ? 'success' : undefined" />
@@ -699,18 +718,24 @@ watch([() => predictForm.model_version, predictFeatureJson], invalidatePredictio
 
 .train-controls {
   flex-wrap: wrap;
+  align-items: flex-end;
   margin-bottom: 14px;
 }
 
 .train-field {
   display: grid;
-  min-width: 160px;
+  min-width: 150px;
   gap: 4px;
 }
 
 .train-field > span {
   color: #64748b;
   font-size: 12px;
+}
+
+.train-field :deep(.el-select),
+.train-field :deep(.el-input-number) {
+  width: 100%;
 }
 
 .problem-spec-summary,

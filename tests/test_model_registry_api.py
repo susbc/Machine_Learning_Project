@@ -11,6 +11,7 @@ from sklearn.linear_model import LinearRegression, LogisticRegression
 from backend.services.datasets import prepare_train_pipeline
 from backend.main import app
 import backend.api.models as model_registry
+from backend.services import mlops_monitoring as monitoring
 from core.automl.problem_spec import ProblemSpec, resolve_problem_spec
 
 
@@ -24,7 +25,20 @@ def _complete_v3_metadata(spec: ProblemSpec | dict):
     }
 
 
-def test_model_registry_lists_saved_models_with_sources():
+def test_model_registry_lists_saved_models_with_sources(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    spec = resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression").to_dict()
+    model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+    automl_dir = tmp_path / "saved" / "automl"
+    automl_dir.mkdir(parents=True)
+    joblib.dump(
+        {**_complete_v3_metadata(spec), "model": model, "metrics": {"rmse": 0.2}},
+        automl_dir / "a1.joblib",
+    )
+    manual_dir = tmp_path / "saved" / "manual_training"
+    manual_dir.mkdir(parents=True)
+    joblib.dump({"model": model, "metrics": {"accuracy": 0.8}}, manual_dir / "m1.joblib")
+
     response = TestClient(app).get("/api/models")
 
     assert response.status_code == 200
@@ -40,7 +54,8 @@ def test_model_registry_lists_saved_models_with_sources():
         "optimization_metric",
         "best_metric",
     }.issubset(payload["models"][0])
-    assert any(item["source"] in {"automl", "manual_training", "agent_workflow", "legacy"} for item in payload["models"])
+    sources = {record["source"] for record in payload["models"]}
+    assert {"automl", "manual_training"} <= sources
 
 
 def test_registry_exposes_only_persisted_metric_identity(tmp_path, monkeypatch):
@@ -520,3 +535,63 @@ def test_training_to_registry_end_to_end_string_labels():
     payload = predict_response.json()
     assert payload["prediction"] in {"正常", "违约"}
     assert 0.0 <= payload["probability"] <= 1.0
+
+
+def test_model_weights_returns_coefficients(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    spec = resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression").to_dict()
+    model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+    artifact_dir = tmp_path / "saved" / "manual_training"
+    artifact_dir.mkdir(parents=True)
+    joblib.dump(
+        {**_complete_v3_metadata(spec), "model": model, "metrics": {"r2": 0.99}, "feature_columns": ["x"]},
+        artifact_dir / "wm.joblib",
+    )
+
+    response = TestClient(app).get("/api/models/manual:wm/weights")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "coefficients"
+    assert payload["weights"][0]["feature"] == "x"
+    assert payload["weights"][0]["importance"] > 0
+
+
+def test_delete_model_removes_artifact_and_baseline(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(monitoring, "SAVED_DIR", tmp_path / "saved")
+    spec = resolve_problem_spec(pd.Series([1.5, 3.5, 5.5]), "target", "regression").to_dict()
+    model = LinearRegression().fit([[0], [1], [2]], [1.5, 3.5, 5.5])
+    artifact_dir = tmp_path / "saved" / "manual_training"
+    artifact_dir.mkdir(parents=True)
+    joblib.dump({**_complete_v3_metadata(spec), "model": model, "metrics": {"r2": 0.99}}, artifact_dir / "del.joblib")
+    baseline = tmp_path / "saved" / "baseline_manual_del.json"
+    baseline.write_text("{}", encoding="utf-8")
+    client = TestClient(app)
+
+    response = client.delete("/api/models/manual:del")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "deleted", "model_id": "manual:del"}
+    assert not (artifact_dir / "del.joblib").exists()
+    assert not baseline.exists()
+    assert client.delete("/api/models/manual:del").status_code == 404
+
+
+def test_delete_rejects_workflow_models(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_registry, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        model_registry,
+        "list_model_records",
+        lambda: [
+            {
+                "model_id": "workflow:task_x",
+                "source": "agent_workflow",
+                "artifact_path": "saved/model_task_x.pkl",
+            }
+        ],
+    )
+
+    response = TestClient(app).delete("/api/models/workflow:task_x")
+
+    assert response.status_code == 400

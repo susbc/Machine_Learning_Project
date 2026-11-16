@@ -21,9 +21,11 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
+from pathlib import Path
 
 from ._common import validate_entity_id
 from backend.runtime_state import TaskQueueFullError, background_tasks, runtime_state
+from backend.services.mlops_monitoring import write_baseline_for_saved_model
 from backend.services.datasets import (
     calibrate_binary_threshold,
     compute_classification_metrics,
@@ -124,6 +126,7 @@ def _persist_job(job: AutoMLJob) -> None:
             "current_trial": job.current_trial,
             "error": job.error,
             "artifact_path": job.artifact_path,
+            "best_model": job.result.get("best_model") if isinstance(job.result, dict) else None,
             "events": job.events,
             "has_result": has_result,
         },
@@ -136,6 +139,8 @@ def _restore_job(job_id: str) -> Optional[AutoMLJob]:
         return None
     restored_payload = dict(payload)
     has_result = bool(restored_payload.pop("has_result", False))
+    # best_model 仅服务于总览聚合，不属于作业对象字段
+    restored_payload.pop("best_model", None)
     result = None
     if has_result:
         try:
@@ -877,7 +882,18 @@ async def save_automl_result(job_id: str):
         job.artifact_path = relative_path
         job.updated_at = _now()
     _persist_job(job)
+    _write_automl_baseline(job, relative_path)
     return {"status": "saved", "job_id": job_id, "artifact_path": relative_path}
+
+
+def _write_automl_baseline(job: "AutoMLJob", relative_path: str) -> None:
+    """保存模型后写入 MLOps 漂移监控基线（失败不影响保存结果）。"""
+    try:
+        frame = runtime_state.load_blob(INPUT_BLOB_NAMESPACE, job.job_id)
+        model_id = f"automl:{Path(relative_path).stem}"
+        write_baseline_for_saved_model(model_id, frame, job.target_col)
+    except Exception as exc:
+        logger.warning("AutoML 监控基线写入失败 job=%s：%s", job.job_id, exc)
 
 
 @router.get("/jobs/{job_id:path}")

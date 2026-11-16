@@ -10,3 +10,4 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_ROOT = Path(os.getenv("ML_ARTIFACT_ROOT", PROJECT_ROOT)).expanduser().resolve()
 SAVED_DIR = ARTIFACT_ROOT / "saved"
 OUTPUT_DIR = ARTIFACT_ROOT / "output"
+LOGS_DIR = ARTIFACT_ROOT / "logs"

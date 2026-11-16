@@ -11,10 +11,24 @@ const automlMocks = vi.hoisted(() => ({
 }))
 const trainingApiMocks = vi.hoisted(() => ({ getCapabilities: vi.fn() }))
 const chartMocks = vi.hoisted(() => ({ setOption: vi.fn(), resize: vi.fn(), dispose: vi.fn() }))
+const dbMocks = vi.hoisted(() => ({
+  listConnections: vi.fn(),
+  getSchema: vi.fn(),
+  getTableRows: vi.fn(),
+}))
 
 vi.mock('@/api/automl', () => ({ automlApi: automlMocks }))
 vi.mock('@/api/training', () => ({ trainingApi: trainingApiMocks }))
 vi.mock('@/shared/charts/echarts', () => ({ init: vi.fn(() => chartMocks) }))
+vi.mock('@/api/database', () => ({ databaseApi: dbMocks }))
+
+const sqliteConnection = {
+  id: 'conn1',
+  name: '本地 SQLite',
+  db_type: 'sqlite',
+  is_active: true,
+  config: { db_type: 'sqlite', database: 'local.db' },
+} as const
 
 const regressionSpec = {
   schema_version: 1, requested_type: 'auto', resolved_type: 'regression', source: 'auto_inferred',
@@ -57,6 +71,7 @@ const regressionResult: AutoMLResult = {
   best_value: 0.1, metrics: { rmse: 0.1, mae: 0.08, r2: 0.99 },
   trial_history: [{ event: 'trial', trial_number: 0, value: 0.1, best_value: 0.1, model_type: 'linear_regression', params: {} }],
   decision_summary: {}, feature_columns: ['x'], problem_spec: regressionSpec,
+  feature_importance: [{ feature: 'x', importance: 1.0 }],
 }
 const classificationResult: AutoMLResult = {
   job_id: 'job_cls', status: 'completed', best_model: 'logistic_regression', best_params: { model_type: 'logistic_regression' },
@@ -91,12 +106,35 @@ async function start(wrapper: ReturnType<typeof mount>) {
   await flushPromises()
 }
 
+async function chooseRadio(wrapper: ReturnType<typeof mount>, groupLabel: string, value: string) {
+  const input = wrapper.get(`[aria-label="${groupLabel}"] input[value="${value}"]`)
+  ;(input.element as HTMLInputElement).checked = true
+  await input.trigger('change')
+  await flushPromises()
+}
+
 describe('AutoMLView', () => {
   beforeEach(() => {
     localStorage.clear()
     Object.values(automlMocks).forEach((mock) => mock.mockReset())
     trainingApiMocks.getCapabilities.mockReset()
     chartMocks.setOption.mockReset()
+    dbMocks.listConnections.mockReset()
+    dbMocks.getSchema.mockReset()
+    dbMocks.getTableRows.mockReset()
+    dbMocks.listConnections.mockResolvedValue({ connections: [sqliteConnection], active_connection: sqliteConnection })
+    dbMocks.getSchema.mockResolvedValue({
+      connection: sqliteConnection,
+      tables: [{ name: 'customers', columns: [], sample: { columns: [], rows: [], row_count: 0 } }],
+    })
+    dbMocks.getTableRows.mockResolvedValue({
+      columns: ['age', 'income', 'label'],
+      rows: [
+        { age: 30, income: 100, label: 0 },
+        { age: 70, income: 200, label: 1 },
+      ],
+      row_count: 2,
+    })
     trainingApiMocks.getCapabilities.mockResolvedValue(capabilities)
     automlMocks.streamJob.mockImplementation((_jobId, _onEvent, signal) => new Promise<void>((resolve) => {
       signal?.addEventListener('abort', () => resolve(), { once: true })
@@ -139,6 +177,8 @@ describe('AutoMLView', () => {
     expect(wrapper.text()).toContain('MAE：0.08000')
     expect(wrapper.text()).toContain('R²：0.99000')
     expect(wrapper.text()).not.toContain('ROC-AUC：')
+    expect(wrapper.text()).toContain('模型权重（特征重要性）')
+    expect(wrapper.text()).toContain('1.00000')
     expect(chartMocks.setOption).toHaveBeenLastCalledWith(expect.objectContaining({
       yAxis: expect.objectContaining({ name: 'RMSE（越小越好）' }),
     }))
@@ -278,6 +318,25 @@ describe('AutoMLView', () => {
 
     expect(automlMocks.getJob).toHaveBeenCalledWith('job_reg')
     expect(wrapper.text()).toContain('已取消')
+    wrapper.unmount()
+  })
+
+  it('starts an AutoML job from an imported database table', async () => {
+    automlMocks.createJob.mockResolvedValue(queuedRegressionJob)
+    const wrapper = mountView()
+    await flushPromises()
+
+    await chooseRadio(wrapper, 'AutoML 数据来源', 'database')
+    await flushPromises()
+    expect(dbMocks.getSchema).toHaveBeenCalledWith('conn1', 1)
+
+    await selectOption(wrapper, 'AutoML 数据表', 'customers')
+    await start(wrapper)
+
+    expect(dbMocks.getTableRows).toHaveBeenCalledWith('conn1', 'customers', 1000)
+    expect(automlMocks.createJob).toHaveBeenCalledWith(
+      expect.objectContaining({ file: expect.objectContaining({ name: 'customers.csv' }) }),
+    )
     wrapper.unmount()
   })
 })

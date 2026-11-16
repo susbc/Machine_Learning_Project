@@ -14,7 +14,13 @@ from pydantic import BaseModel, Field
 from core.automl.problem_spec import ProblemType
 
 from ._common import validate_entity_id
-from backend.services.datasets import parse_artifact_problem_metadata, predict_with_artifact, resolve_artifact_problem_type
+from backend.services.datasets import (
+    feature_importance_rows,
+    parse_artifact_problem_metadata,
+    predict_with_artifact,
+    resolve_artifact_problem_type,
+)
+from backend.services.mlops_monitoring import append_predictions, baseline_path
 from backend.storage.workflow_artifacts import (
     artifact_transaction_lock,
     iter_visible_workflow_artifacts,
@@ -235,6 +241,7 @@ async def predict_with_model(model_id: str, payload: ModelPredictionRequest):
     record = _find_record(model_id)
     artifact = _load_artifact(record)
     result = predict_with_artifact(artifact, [payload.features])[0]
+    append_predictions(record["model_id"], [payload.features])
     return {
         "model_id": record["model_id"],
         "source": record["source"],
@@ -259,12 +266,48 @@ async def batch_predict_with_model(model_id: str, payload: ModelBatchPredictionR
         }
         for index, (features, prediction) in enumerate(zip(payload.rows, predictions))
     ]
+    append_predictions(record["model_id"], payload.rows)
     return {
         "model_id": record["model_id"],
         "source": record["source"],
         "summary": _summarize_predictions(rows, _n_classes_of(artifact), problem_type),
         "rows": rows,
     }
+
+
+@router.get("/{model_id:path}/weights")
+async def get_model_weights(model_id: str):
+    """返回模型字段权重：树模型取 feature_importances_，线性模型取 coef_。"""
+    record = _find_record(model_id)
+    artifact = _load_artifact(record)
+    model = artifact.get("model")
+    feature_columns = artifact.get("feature_columns") or []
+    if model is None or not feature_columns:
+        raise HTTPException(status_code=400, detail="该模型产物不含权重信息（缺少模型对象或特征列）")
+    if hasattr(model, "feature_importances_"):
+        kind = "feature_importances"
+    elif hasattr(model, "coef_"):
+        kind = "coefficients"
+    else:
+        raise HTTPException(status_code=400, detail="该模型不支持导出字段权重")
+    weights = feature_importance_rows(model, list(feature_columns), top_n=100)
+    return {"model_id": record["model_id"], "kind": kind, "weights": weights}
+
+
+@router.delete("/{model_id:path}")
+async def delete_model(model_id: str):
+    """删除模型产物与监控基线；Agent 工作流模型由工作流状态管理，不允许直接删除。"""
+    record = _find_record(model_id)
+    if record["source"] == "agent_workflow":
+        raise HTTPException(status_code=400, detail="Agent 工作流模型由工作流状态管理，请在工作流目录中清理")
+    path = (PROJECT_ROOT / record["artifact_path"]).resolve()
+    root = PROJECT_ROOT.resolve()
+    if root not in path.parents and path != root:
+        raise HTTPException(status_code=400, detail="模型路径不在项目目录内")
+    path.unlink(missing_ok=True)
+    baseline_path(record["model_id"]).unlink(missing_ok=True)
+    logger.info("模型已删除 model_id=%s artifact=%s", record["model_id"], record["artifact_path"])
+    return {"status": "deleted", "model_id": record["model_id"]}
 
 
 @router.get("/{model_id:path}")

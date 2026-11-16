@@ -7,16 +7,16 @@ describe('module routes', () => {
     const paths = moduleRoutes.map((route) => route.path)
     expect(paths).toEqual([
       '/',
-      '/automl',
-      '/ai-analysis',
-      '/mlops',
       '/data-management',
+      '/automl',
       '/manual-training',
-      '/llm-config',
-      '/database',
       '/agent-workflow',
       '/model-registry',
       '/prediction-lab',
+      '/mlops',
+      '/ai-analysis',
+      '/database',
+      '/llm-config',
     ])
   })
 

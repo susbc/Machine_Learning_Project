@@ -47,6 +47,31 @@ export interface TrainingEda {
   columns: TrainingField[]
   quality?: DataQualitySummary
   correlations: Record<string, Record<string, number>>
+  outliers?: EdaOutlierRow[]
+  significance?: EdaSignificanceRow[]
+  high_correlation_pairs?: EdaCorrelationPair[]
+}
+
+export interface EdaOutlierRow {
+  field: string
+  count: number
+  rate: number
+  lower: number
+  upper: number
+}
+
+export interface EdaSignificanceRow {
+  field: string
+  method: string
+  statistic: number | null
+  p_value: number | null
+  target_association: number | null
+}
+
+export interface EdaCorrelationPair {
+  field_a: string
+  field_b: string
+  correlation: number
 }
 
 export interface TrainingJob {

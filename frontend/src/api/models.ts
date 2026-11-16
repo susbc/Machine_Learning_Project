@@ -99,6 +99,17 @@ export interface PredictionExportResponse {
   table_created: boolean | null
 }
 
+export interface ModelWeightsResponse {
+  model_id: string
+  kind: 'feature_importances' | 'coefficients' | string
+  weights: Array<{ feature: string; importance: number }>
+}
+
+export interface DeleteModelResponse {
+  status: string
+  model_id: string
+}
+
 interface ModelsApiOptions {
   baseUrl: string
   fetcher?: typeof fetch
@@ -152,6 +163,10 @@ export function createModelsApi(options: ModelsApiOptions) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
       }),
+    getModelWeights: (modelId: string) =>
+      requestJson<ModelWeightsResponse>(`/api/models/${encodeURIComponent(modelId)}/weights`, { method: 'GET' }),
+    deleteModel: (modelId: string) =>
+      requestJson<DeleteModelResponse>(`/api/models/${encodeURIComponent(modelId)}`, { method: 'DELETE' }),
   }
 }
 

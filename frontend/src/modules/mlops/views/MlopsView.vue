@@ -2,7 +2,6 @@
   <section class="workspace-theme mlops-workspace">
     <div class="section-heading mlops-heading">
       <div>
-        <p class="eyebrow">Phase 3</p>
         <h2>MLOps 监控</h2>
         <p>展示调度器状态、PSI 漂移报告、模型健康、巡检日志，并支持触发重训任务。</p>
       </div>
@@ -37,9 +36,64 @@
           <span>{{ driftReport?.message ?? 'model_version 查询' }}</span>
         </div>
         <div class="inline-form">
-          <el-input v-model="modelVersion" placeholder="模型版本 / task_id" />
+          <el-input
+            v-model="modelVersion"
+            placeholder="模型 ID（留空巡检全部模型）"
+            aria-label="巡检模型版本"
+            clearable
+          />
           <el-button plain @click="loadDrift">查询</el-button>
+          <el-button type="primary" plain :loading="inspecting" @click="runInspect">立即巡检</el-button>
           <el-button type="warning" plain :loading="retraining" @click="triggerRetrain">触发重训</el-button>
+        </div>
+        <div class="inline-form bind-form">
+          <el-select
+            v-model="connectionId"
+            aria-label="巡检源连接"
+            filterable
+            placeholder="巡检源连接（启用）"
+            :loading="loadingConnections"
+          >
+            <el-option
+              v-for="connection in connections"
+              :key="connection.id"
+              :label="`${connection.name}（${connection.db_type}）`"
+              :value="connection.id"
+            />
+          </el-select>
+          <el-select
+            v-model="tableName"
+            aria-label="巡检源表"
+            filterable
+            placeholder="巡检源表"
+            :loading="loadingTables"
+          >
+            <el-option v-for="table in tableOptions" :key="table" :label="table" :value="table" />
+          </el-select>
+          <el-input v-model="bindTimeColumn" placeholder="时间列（可选）" aria-label="巡检源时间列" clearable />
+          <el-button plain :disabled="!canBindSource" @click="bindSource">绑定为巡检源</el-button>
+          <el-button plain :disabled="!modelVersion.trim()" @click="unbindSource">解除绑定</el-button>
+        </div>
+        <p class="bind-hint">当前模型巡检源：{{ currentBindingLabel }}</p>
+        <div class="inline-form threshold-form">
+          <span class="threshold-label">PSI 阈值（轻微 / 严重）</span>
+          <el-input-number
+            v-model="thresholdLow"
+            aria-label="轻微漂移阈值"
+            :min="0.01"
+            :max="0.99"
+            :step="0.05"
+            :precision="2"
+          />
+          <el-input-number
+            v-model="thresholdHigh"
+            aria-label="严重漂移阈值"
+            :min="0.02"
+            :max="5"
+            :step="0.05"
+            :precision="2"
+          />
+          <el-button plain @click="saveThresholds">保存阈值</el-button>
         </div>
         <div class="summary-grid">
           <span>特征 {{ driftReport?.summary.total_features ?? 0 }}</span>
@@ -65,10 +119,19 @@
           <span>{{ healthRows.length }} 个模型</span>
         </div>
         <el-table :data="healthRows" height="386">
-          <el-table-column prop="模型" label="模型" />
-          <el-table-column prop="AUC" label="AUC" width="100" />
-          <el-table-column prop="健康度" label="健康度" width="120" />
-          <el-table-column prop="调用次数" label="调用次数" width="120" />
+          <el-table-column label="模型" min-width="120">
+            <template #default="{ row }">
+              <span class="cell-ellipsis" :title="row.模型">{{ row.模型 }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="最佳指标" width="110">
+            <template #default="{ row }">
+              <span class="metric-value">{{ row.最佳指标 ?? '-' }}</span>
+              <small v-if="row.指标名" class="metric-name">{{ row.指标名 }}</small>
+            </template>
+          </el-table-column>
+          <el-table-column prop="健康度" label="健康度" width="90" />
+          <el-table-column prop="调用次数" label="调用次数" width="80" />
         </el-table>
       </section>
     </div>
@@ -99,7 +162,16 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus/es/components/message/index.mjs'
 
-import { mlopsApi, type DriftReport, type InspectionLogRow, type MlopsStatus, type ModelHealthRow } from '@/api/mlops'
+import {
+  mlopsApi,
+  type DriftReport,
+  type InspectionLogRow,
+  type MlopsSettings,
+  type MlopsStatus,
+  type ModelHealthRow,
+  type OnlineSourceBinding,
+} from '@/api/mlops'
+import { useDatabaseTableSource } from '@/shared/composables/useDatabaseTableSource'
 
 interface PsiRow {
   feature: string
@@ -108,13 +180,38 @@ interface PsiRow {
 
 const loading = ref(false)
 const retraining = ref(false)
+const inspecting = ref(false)
 const errorMessage = ref('')
-const modelVersion = ref('default')
+const modelVersion = ref('')
 const logDays = ref(7)
 const status = ref<MlopsStatus | null>(null)
 const driftReport = ref<DriftReport | null>(null)
 const healthRows = ref<ModelHealthRow[]>([])
 const logs = ref<InspectionLogRow[]>([])
+const onlineSources = ref<Record<string, OnlineSourceBinding>>({})
+const bindTimeColumn = ref('')
+const settings = ref<MlopsSettings | null>(null)
+const thresholdLow = ref(0.1)
+const thresholdHigh = ref(0.2)
+const {
+  connections,
+  connectionId,
+  tableName,
+  tableOptions,
+  loadingConnections,
+  loadingTables,
+  canImportTable,
+  loadConnections,
+} = useDatabaseTableSource()
+
+const canBindSource = computed(() => Boolean(modelVersion.value.trim()) && canImportTable.value)
+const currentBindingLabel = computed(() => {
+  const model = modelVersion.value.trim()
+  const binding = model ? onlineSources.value[model] : undefined
+  if (!binding) return '未绑定（使用预测日志）'
+  const timePart = binding.time_column ? `，时间列 ${binding.time_column}` : ''
+  return `${binding.table_name}（连接 ${binding.connection_id}${timePart}）`
+})
 
 const nextRunLabel = computed(() => {
   const value = status.value?.next_run
@@ -135,11 +232,74 @@ async function loadAll() {
   loading.value = true
   errorMessage.value = ''
   try {
-    await Promise.all([loadStatus(), loadDrift(), loadHealth(), loadLogs()])
+    await Promise.all([loadStatus(), loadDrift(), loadHealth(), loadLogs(), loadOnlineSources(), loadSettings()])
+    const message = await loadConnections()
+    if (message) errorMessage.value = message
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : 'MLOps 数据加载失败'
   } finally {
     loading.value = false
+  }
+}
+
+async function loadSettings() {
+  try {
+    settings.value = await mlopsApi.getSettings()
+    thresholdLow.value = settings.value.psi_threshold_low
+    thresholdHigh.value = settings.value.psi_threshold_high
+  } catch {
+    settings.value = null
+  }
+}
+
+async function saveThresholds() {
+  errorMessage.value = ''
+  try {
+    settings.value = await mlopsApi.updateSettings({
+      psi_threshold_low: thresholdLow.value,
+      psi_threshold_high: thresholdHigh.value,
+    })
+    ElMessage.success('PSI 阈值已更新，下次巡检生效')
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '阈值保存失败'
+  }
+}
+
+async function loadOnlineSources() {
+  try {
+    onlineSources.value = (await mlopsApi.getOnlineSources()).sources
+  } catch {
+    onlineSources.value = {}
+  }
+}
+
+async function bindSource() {
+  const model = modelVersion.value.trim()
+  if (!model || !canImportTable.value) return
+  errorMessage.value = ''
+  try {
+    await mlopsApi.bindOnlineSource(model, {
+      connection_id: connectionId.value,
+      table_name: tableName.value,
+      ...(bindTimeColumn.value.trim() ? { time_column: bindTimeColumn.value.trim() } : {}),
+    })
+    await loadOnlineSources()
+    ElMessage.success(`已绑定 ${tableName.value} 为 ${model} 的巡检源`)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '绑定巡检源失败'
+  }
+}
+
+async function unbindSource() {
+  const model = modelVersion.value.trim()
+  if (!model) return
+  errorMessage.value = ''
+  try {
+    await mlopsApi.unbindOnlineSource(model)
+    await loadOnlineSources()
+    ElMessage.success(`已解除 ${model} 的巡检源绑定`)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '解除绑定失败'
   }
 }
 
@@ -172,15 +332,44 @@ async function triggerRetrain() {
   }
 }
 
+async function runInspect() {
+  inspecting.value = true
+  errorMessage.value = ''
+  try {
+    const requested = modelVersion.value.trim()
+    const input = requested ? { model_id: requested, days: logDays.value } : { days: logDays.value }
+    const response = await mlopsApi.runInspect(input)
+    if (response.reports > 0) {
+      ElMessage.success(`巡检 ${response.inspected} 个模型，产出 ${response.reports} 份报告`)
+    }
+    const skipped = response.results.filter((item) => item.status !== 'ok')
+    if (skipped.length) {
+      ElMessage.warning(skipped.map((item) => `${item.model_id}：${item.message}`).join('；'))
+    }
+    if (!response.reports && !skipped.length) {
+      ElMessage.info('暂无可巡检模型')
+    }
+    await Promise.all([loadDrift(), loadHealth(), loadLogs()])
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '巡检失败'
+  } finally {
+    inspecting.value = false
+  }
+}
+
 function psiStatus(value: number): string {
-  if (value >= 0.2) return '严重漂移'
-  if (value >= 0.1) return '轻微漂移'
+  const high = settings.value?.psi_threshold_high ?? 0.2
+  const low = settings.value?.psi_threshold_low ?? 0.1
+  if (value >= high) return '严重漂移'
+  if (value >= low) return '轻微漂移'
   return '稳定'
 }
 
 function psiTagType(value: number) {
-  if (value >= 0.2) return 'danger'
-  if (value >= 0.1) return 'warning'
+  const high = settings.value?.psi_threshold_high ?? 0.2
+  const low = settings.value?.psi_threshold_low ?? 0.1
+  if (value >= high) return 'danger'
+  if (value >= low) return 'warning'
   return 'success'
 }
 
@@ -270,6 +459,48 @@ onMounted(loadAll)
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.bind-form {
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.bind-form :deep(.el-select) {
+  min-width: 170px;
+}
+
+.bind-hint {
+  margin: 8px 0 0;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.threshold-form {
+  margin-top: 10px;
+}
+
+.threshold-label {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.cell-ellipsis {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-value {
+  display: block;
+}
+
+.metric-name {
+  display: block;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .summary-grid {

@@ -54,6 +54,10 @@ config/saved_connections.json
 config/.db_config_secret
 config/llm_providers.json
 
+# MLOps 运行时配置（巡检源绑定 / PSI 阈值，属本机状态）
+config/mlops_online_sources.json
+config/mlops_settings.json
+
 # 运行时生成的分析报告
 model_code/analysis_reports/
 

@@ -2,7 +2,6 @@
   <section class="workspace-theme prediction-workspace">
     <div class="section-heading prediction-heading">
       <div>
-        <p class="eyebrow">Phase 8</p>
         <h2>预测实验室</h2>
         <p>选择已保存模型进行单条 JSON 预测，支持 CSV 批量预测和结果导出。</p>
       </div>

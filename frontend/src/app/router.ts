@@ -15,46 +15,22 @@ export const moduleRoutes: RouteRecordRaw[] = [
     meta: { label: '总览', navGroup: 'core' },
   },
   {
-    path: '/automl',
-    name: 'automl',
-    component: AutoMLView,
-    meta: { label: 'AutoML 训练', navGroup: 'core' },
-  },
-  {
-    path: '/ai-analysis',
-    name: 'ai-analysis',
-    component: () => import('@/modules/ai-analysis/views/AiAnalysisView.vue'),
-    meta: { label: 'AI 智能分析', navGroup: 'core' },
-  },
-  {
-    path: '/mlops',
-    name: 'mlops',
-    component: () => import('@/modules/mlops/views/MlopsView.vue'),
-    meta: { label: 'MLOps 监控', navGroup: 'core' },
-  },
-  {
     path: '/data-management',
     name: 'data-management',
     component: () => import('@/modules/data-management/views/DataManagementView.vue'),
     meta: { label: '数据管理', navGroup: 'training' },
   },
   {
+    path: '/automl',
+    name: 'automl',
+    component: AutoMLView,
+    meta: { label: 'AutoML 训练', navGroup: 'core' },
+  },
+  {
     path: '/manual-training',
     name: 'manual-training',
     component: () => import('@/modules/manual-training/views/ManualTrainingView.vue'),
     meta: { label: '手动训练', navGroup: 'training' },
-  },
-  {
-    path: '/llm-config',
-    name: 'llm-config',
-    component: () => import('@/modules/llm-config/views/LlmConfigView.vue'),
-    meta: { label: '大模型配置', navGroup: 'settings' },
-  },
-  {
-    path: '/database',
-    name: 'database',
-    component: () => import('@/modules/database/views/DatabaseView.vue'),
-    meta: { label: '数据库连接', navGroup: 'settings' },
   },
   {
     path: '/agent-workflow',
@@ -73,6 +49,30 @@ export const moduleRoutes: RouteRecordRaw[] = [
     name: 'prediction-lab',
     component: () => import('@/modules/prediction-lab/views/PredictionLabView.vue'),
     meta: { label: '预测实验室', navGroup: 'models' },
+  },
+  {
+    path: '/mlops',
+    name: 'mlops',
+    component: () => import('@/modules/mlops/views/MlopsView.vue'),
+    meta: { label: 'MLOps 监控', navGroup: 'core' },
+  },
+  {
+    path: '/ai-analysis',
+    name: 'ai-analysis',
+    component: () => import('@/modules/ai-analysis/views/AiAnalysisView.vue'),
+    meta: { label: 'AI 智能分析', navGroup: 'core' },
+  },
+  {
+    path: '/database',
+    name: 'database',
+    component: () => import('@/modules/database/views/DatabaseView.vue'),
+    meta: { label: '数据库连接', navGroup: 'settings' },
+  },
+  {
+    path: '/llm-config',
+    name: 'llm-config',
+    component: () => import('@/modules/llm-config/views/LlmConfigView.vue'),
+    meta: { label: '大模型配置', navGroup: 'settings' },
   },
 ]
 

@@ -92,6 +92,7 @@ export interface AutoMLResult {
   decision_summary: AutoMLDecisionSummary
   feature_columns: string[]
   problem_spec: ProblemSpec
+  feature_importance?: Array<{ feature: string; importance: number }>
   early_stopped?: boolean
   feature_selection?: AutoMLFeatureSelectionInfo | null
   sampling?: AutoMLSamplingInfo | null

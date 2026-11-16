@@ -2,7 +2,6 @@
   <section class="workspace-theme database-workspace">
     <div class="section-heading database-heading">
       <div>
-        <p class="eyebrow">Phase 5</p>
         <h2>数据库连接</h2>
         <p>管理数据库连接、浏览 Schema、查看样本数据，并通过只读 SQL 预览数据。</p>
       </div>

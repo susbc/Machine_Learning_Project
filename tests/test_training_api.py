@@ -295,7 +295,6 @@ def test_manual_training_full_lifecycle_and_save():
     eda_response = client.post("/api/training/eda", json={"dataset_id": dataset["dataset_id"]})
     assert eda_response.status_code == 200
     assert eda_response.json()["summary"]["rows"] == 80
-
     job_response = client.post(
         "/api/training/jobs",
         json={
@@ -499,3 +498,46 @@ def test_training_result_feature_importance_uses_pipeline_names():
     assert names, "feature_importance 不应为空"
     assert any(name.startswith("num__") for name in names)
     assert any(name.startswith("cat__city_") for name in names)
+
+
+def test_eda_reports_outliers_significance_and_correlation_pairs():
+    client = TestClient(app)
+    file_name, file_body, content_type = _training_csv(rows=120)
+    upload = client.post(
+        "/api/training/datasets",
+        files={"file": (file_name, file_body, content_type)},
+        data={"target_col": "label"},
+    )
+    assert upload.status_code == 201
+    dataset_id = upload.json()["dataset_id"]
+
+    eda = client.post("/api/training/eda", json={"dataset_id": dataset_id}).json()
+
+    methods = {row["field"]: row["method"] for row in eda["significance"]}
+    assert methods.get("city") == "卡方"
+    assert methods.get("score") == "ANOVA F"
+    chi_row = next(row for row in eda["significance"] if row["field"] == "city")
+    assert chi_row["statistic"] is not None
+    assert chi_row["p_value"] is not None and 0 <= chi_row["p_value"] <= 1
+    assert chi_row["target_association"] is not None  # Cramér's V
+
+    outlier_fields = {row["field"] for row in eda["outliers"]}
+    assert {"age", "score"} <= outlier_fields
+    for row in eda["outliers"]:
+        assert row["lower"] < row["upper"]
+        assert 0 <= row["rate"] <= 1
+
+    assert all(abs(pair["correlation"]) > 0.7 for pair in eda["high_correlation_pairs"])
+    assert "score" in eda["correlations"]
+
+
+def test_eda_significance_uses_pearson_for_regression_target():
+    client = TestClient(app)
+    dataset_id = _upload_regression_dataset(client)
+
+    eda = client.post("/api/training/eda", json={"dataset_id": dataset_id}).json()
+
+    row = next(item for item in eda["significance"] if item["field"] == "x")
+    assert row["method"] == "Pearson"
+    assert row["p_value"] is not None and row["p_value"] < 0.01
+    assert row["target_association"] > 0.9

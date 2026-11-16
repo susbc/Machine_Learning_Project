@@ -2,7 +2,6 @@
   <section class="automl-workspace">
     <div class="section-heading automl-heading">
       <div>
-        <p class="eyebrow">Phase 1</p>
         <h2>AutoML 训练</h2>
         <p>上传数据后自动完成目标识别、模型推荐、Optuna 参数搜索、评估和模型保存。</p>
       </div>
@@ -15,39 +14,84 @@
       <section class="setup-panel">
         <div class="panel-title">
           <h3><Folder class="panel-title-icon" :size="17" :stroke-width="1.9" />训练输入</h3>
-          <span>{{ datasetFile?.name ?? '未选择数据集' }}</span>
+          <span>{{ dataSourceLabel }}</span>
         </div>
 
-        <el-upload
-          class="dataset-upload"
-          drag
-          accept=".csv,.xlsx,.xls"
-          :auto-upload="false"
-          :limit="1"
-          :on-change="handleFileChange"
-          :on-remove="handleFileRemove"
-        >
-          <div class="upload-copy">
-            <CloudUpload class="upload-icon" :size="44" :stroke-width="1.4" />
-            <strong>拖拽文件到此处，或 <em>点击上传</em></strong>
-            <span>支持 CSV / Excel 数据集</span>
-            <small>上传后将自动完成特征编码和目标检查</small>
+        <label class="source-row">
+          <span>数据来源</span>
+          <el-radio-group v-model="dataSource" aria-label="AutoML 数据来源">
+            <el-radio-button value="file">CSV / Excel 文件</el-radio-button>
+            <el-radio-button value="database">数据库表</el-radio-button>
+          </el-radio-group>
+        </label>
+
+        <template v-if="dataSource === 'file'">
+          <el-upload
+            class="dataset-upload"
+            drag
+            accept=".csv,.xlsx,.xls"
+            :auto-upload="false"
+            :limit="1"
+            :on-change="handleFileChange"
+            :on-remove="handleFileRemove"
+          >
+            <div class="upload-copy">
+              <CloudUpload class="upload-icon" :size="44" :stroke-width="1.4" />
+              <strong>拖拽文件到此处，或 <em>点击上传</em></strong>
+              <span>支持 CSV / Excel 数据集</span>
+              <small>上传后将自动完成特征编码和目标检查</small>
+            </div>
+          </el-upload>
+          <div class="file-bar">
+            <el-button class="file-bar-button" plain @click="triggerFilePicker">
+              <Folder :size="15" :stroke-width="1.9" />选择文件
+            </el-button>
+            <span class="file-bar-name">{{ datasetFile?.name ?? '未选择任何文件' }}</span>
           </div>
-        </el-upload>
-        <div class="file-bar">
-          <el-button class="file-bar-button" plain @click="triggerFilePicker">
-            <Folder :size="15" :stroke-width="1.9" />选择文件
-          </el-button>
-          <span class="file-bar-name">{{ datasetFile?.name ?? '未选择任何文件' }}</span>
+          <input
+            ref="nativeFileInput"
+            data-testid="automl-file-input"
+            class="native-file-input native-file-input--hidden"
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            @change="handleNativeFileChange"
+          />
+        </template>
+        <div v-else class="db-form">
+          <label class="field">
+            <span>数据库连接（默认使用激活连接）</span>
+            <el-select
+              v-model="connectionId"
+              aria-label="AutoML 数据库连接"
+              filterable
+              placeholder="选择数据库连接"
+              :loading="loadingConnections"
+            >
+              <el-option
+                v-for="connection in connections"
+                :key="connection.id"
+                :label="`${connection.name}（${connection.db_type}）`"
+                :value="connection.id"
+              />
+            </el-select>
+          </label>
+          <label class="field">
+            <span>数据表</span>
+            <el-select
+              v-model="tableName"
+              aria-label="AutoML 数据表"
+              filterable
+              placeholder="选择数据表"
+              :loading="loadingTables"
+            >
+              <el-option v-for="table in tableOptions" :key="table" :label="table" :value="table" />
+            </el-select>
+          </label>
+          <label class="field field--limit">
+            <span>导入行数上限</span>
+            <el-input-number v-model="importLimit" aria-label="导入行数上限" :min="1" :max="10000" :step="100" controls-position="right" />
+          </label>
         </div>
-        <input
-          ref="nativeFileInput"
-          data-testid="automl-file-input"
-          class="native-file-input native-file-input--hidden"
-          type="file"
-          accept=".csv,.xlsx,.xls"
-          @change="handleNativeFileChange"
-        />
 
         <div v-if="capabilityStatusMessage" class="capability-alert" role="alert">
           <span>{{ capabilityStatusMessage }}</span>
@@ -275,6 +319,13 @@
             </el-tag>
           </div>
           <pre>{{ JSON.stringify(result.best_params, null, 2) }}</pre>
+          <h4 class="weights-title">模型权重（特征重要性）</h4>
+          <el-table :data="result.feature_importance ?? []" height="240" empty-text="暂无特征权重">
+            <el-table-column prop="feature" label="特征" min-width="160" show-overflow-tooltip />
+            <el-table-column label="权重" width="140">
+              <template #default="{ row }">{{ row.importance.toFixed(5) }}</template>
+            </el-table-column>
+          </el-table>
           <el-alert
             v-if="savedArtifactPath"
             type="success"
@@ -377,6 +428,7 @@ import {
   Zap,
 } from 'lucide-vue-next'
 import { init, type ECharts } from '@/shared/charts/echarts'
+import { useDatabaseTableSource } from '@/shared/composables/useDatabaseTableSource'
 
 import {
   automlApi,
@@ -393,6 +445,23 @@ import type { MetricDirection, ProblemCapabilities, ProblemCapabilitiesResponse,
 const STORAGE_KEY = 'agentic-automl.currentJobId'
 
 const datasetFile = ref<File | null>(null)
+const dataSource = ref<'file' | 'database'>('file')
+const {
+  connections,
+  connectionId,
+  tableName,
+  tableOptions,
+  importLimit,
+  loadingConnections,
+  loadingTables,
+  canImportTable,
+  loadConnections,
+  importTableAsFile,
+} = useDatabaseTableSource()
+const dataSourceLabel = computed(() => {
+  if (dataSource.value === 'database') return tableName.value ? `${tableName.value}（数据库表）` : '未选择数据表'
+  return datasetFile.value?.name ?? '未选择数据集'
+})
 const targetCol = ref('')
 const problemType = ref<ProblemType>('auto')
 const optimizationMetric = ref<AutoMLMetric>('auto')
@@ -472,7 +541,13 @@ const resolvedMetricDirection = computed<MetricDirection | null>(() => {
     ?? null
 })
 const chartMetricLabel = computed(() => metricOptionLabel(resolvedMetric.value, resolvedMetricDirection.value))
-const canStart = computed(() => Boolean(datasetFile.value) && !creatingJob.value && !isRunningStatus(job.value?.status) && !explicitActionsBlocked.value)
+const canStart = computed(
+  () =>
+    (Boolean(datasetFile.value) || (dataSource.value === 'database' && canImportTable.value))
+    && !creatingJob.value
+    && !isRunningStatus(job.value?.status)
+    && !explicitActionsBlocked.value,
+)
 const canCancel = computed(() => Boolean(job.value && (job.value.status === 'queued' || job.value.status === 'running') && !cancellingRequest.value))
 const statusLabel = computed(() => statusText(job.value?.status))
 const statusTagType = computed(() => {
@@ -679,6 +754,16 @@ function handleFileRemove() {
 }
 
 async function startJob() {
+  if (explicitActionsBlocked.value) return
+  if (dataSource.value === 'database' && !datasetFile.value) {
+    const imported = await importTableAsFile()
+    if (imported.error) {
+      errorMessage.value = imported.error
+      return
+    }
+    if (!imported.file) return
+    datasetFile.value = imported.file
+  }
   if (!datasetFile.value || explicitActionsBlocked.value) return
   creatingJob.value = true
   errorMessage.value = ''
@@ -892,6 +977,11 @@ function percentLabel(value: number): string {
 }
 
 watch([trialHistory, chartMetricLabel], updateChart, { deep: true })
+watch(dataSource, async (value) => {
+  if (value !== 'database') return
+  const message = await loadConnections()
+  if (message) errorMessage.value = message
+})
 
 const resizeChart = () => chartInstance?.resize()
 
@@ -912,6 +1002,41 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.source-row,
+.field {
+  display: grid;
+  gap: 6px;
+}
+
+.source-row {
+  margin-bottom: 14px;
+}
+
+.source-row > span,
+.field > span {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.db-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 150px;
+  gap: 14px 16px;
+  align-items: end;
+  margin-bottom: 14px;
+}
+
+.field :deep(.el-select),
+.field :deep(.el-input-number) {
+  width: 100%;
+}
+
+@media (max-width: 1100px) {
+  .db-form {
+    grid-template-columns: 1fr;
+  }
+}
+
 .automl-workspace {
   display: flex;
   flex-direction: column;
@@ -927,17 +1052,6 @@ onBeforeUnmount(() => {
   max-width: none;
   width: 100%;
   padding-left: 15px;
-}
-
-.automl-heading .eyebrow {
-  display: table;
-  border-radius: 999px;
-  background: #c7e7ff;
-  color: #075cf2;
-  padding: 1px 9px;
-  font-size: 11px;
-  line-height: 18px;
-  margin-bottom: 2px;
 }
 
 .automl-grid {
@@ -1240,6 +1354,13 @@ label,
 }
 .advanced-options .form-grid :deep(.el-input__inner) { font-size: 12px; }
 
+.weights-title {
+  margin: 14px 0 8px;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .enhancement-summary {
   display: flex;
   flex-wrap: wrap;
@@ -1261,7 +1382,14 @@ label,
 }
 
 .metric {
-  display: block;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  grid-template-areas:
+    "icon label"
+    "value value";
+  align-items: start;
+  column-gap: 10px;
+  row-gap: 2px;
   min-width: 0;
   min-height: 101px;
   border: 1px solid #bfd8ff;
@@ -1291,8 +1419,8 @@ label,
 }
 
 .metric-icon {
+  grid-area: icon;
   display: inline-flex;
-  vertical-align: middle;
   align-items: center;
   width: 30px;
   height: 27px;
@@ -1314,9 +1442,13 @@ label,
   color: #5a7dff;
 }
 
-.metric-body { display: inline; }
+.metric-body {
+  display: contents;
+}
 
 .metric-body span {
+  grid-area: label;
+  align-self: center;
   display: inline;
   color: #415684;
   font-size: 14px;
@@ -1324,15 +1456,18 @@ label,
 }
 
 .metric-body strong {
+  grid-area: value;
   display: block;
-  margin: 2px 0 0 40px;
+  margin: 2px 0 0;
   color: #071747;
-  font-size: 28px;
-  line-height: 1.1;
+  font-size: 24px;
+  line-height: 1.15;
+  text-align: center;
+  overflow-wrap: anywhere;
 }
 
 .metric-model {
-  font-size: 22px !important;
+  font-size: 20px !important;
 }
 
 .progress-row {
@@ -1501,6 +1636,21 @@ pre {
   border-radius: 8px;
   background: linear-gradient(90deg, #3b82f6, #2563eb);
   font-weight: 600;
+}
+
+@media (min-width: 1251px) and (max-width: 1600px) {
+  /* 保持一行四卡：该区间右栏半宽、卡片窄，压缩排版确保数值单行居中 */
+  .metric {
+    padding: 12px 10px 8px;
+    min-height: 92px;
+    column-gap: 6px;
+  }
+
+  .metric-body span { font-size: 12px; }
+
+  .metric-body strong { font-size: 16px; }
+
+  .metric-model { font-size: 14px !important; }
 }
 
 @media (max-width: 1250px) {
